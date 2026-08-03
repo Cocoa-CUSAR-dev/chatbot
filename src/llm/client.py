@@ -8,18 +8,14 @@ Both go through this one client so the provider/model is swappable in one
 place (ADR 0004).
 """
 
-from typing import TypeVar
-
 import litellm
 from pydantic import BaseModel
 
 from src.llm.config import llm_settings
 from src.llm.exceptions import LLMUnavailable
 
-SchemaT = TypeVar("SchemaT", bound=BaseModel)
 
-
-async def extract_slots(text: str, schema: type[SchemaT]) -> SchemaT:
+async def extract_slots[SchemaT: BaseModel](text: str, schema: type[SchemaT]) -> SchemaT:
     """Extract whatever `schema`'s fields can be found in `text`.
 
     Fields the model can't find should come back unset (None) on the schema,

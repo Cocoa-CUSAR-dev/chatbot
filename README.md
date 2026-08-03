@@ -8,9 +8,11 @@ This service sits on the **seam** between the new work and the two existing back
 
 - Reads form structure from Kotlin's existing `GET /forms/{formId}` (`src/forms`)
 - Writes farmer answers via Go's existing `POST /tasks` (`src/tasks`)
-- Owns its **own** new database schemas directly (`chat.*`, `auth.line_identity`, `auth.line_link_code`, `notify.*`) — see the `database` repo for the actual Flyway migrations; this service never runs migrations itself
+- Owns its **own** new database schemas directly (`chat.*`, `notify.*`, and whatever identity-linking lands on) — see the `database` repo for the actual Flyway migrations; this service never runs migrations itself
 
-Full reasoning: [ADR 0001](../cocoa-docs/docs/adr/0001-old-new-integration-seam.md) (the seam), [ADR 0002](../cocoa-docs/docs/adr/0002-line-identity-linking.md) (identity linking), [ADR 0003](../cocoa-docs/docs/adr/0003-chatbot-service-stack.md) (this stack), [ADR 0004](../cocoa-docs/docs/adr/0004-llm-extraction-approach.md) (LLM approach), [ADR 0006](../cocoa-docs/docs/adr/0006-reminder-delivery.md) (reminders). Diagrams: `cocoa-docs`'s [Target Architecture](../cocoa-docs/docs/architecture/target-architecture.md) page.
+Full reasoning: [ADR 0001](../cocoa-docs/docs/adr/0001-old-new-integration-seam.md) (the seam), [ADR 0003](../cocoa-docs/docs/adr/0003-chatbot-service-stack.md) (this stack), [ADR 0004](../cocoa-docs/docs/adr/0004-llm-extraction-approach.md) (LLM approach), [ADR 0006](../cocoa-docs/docs/adr/0006-reminder-delivery.md) (reminders). Diagrams: `cocoa-docs`'s [Target Architecture](../cocoa-docs/docs/architecture/target-architecture.md) page.
+
+**ADR 0002 (identity linking) is reopened, still being decided by the team.** There is deliberately no `src/identity` (or equivalent) module yet — the pairing-code approach it originally described was scaffolded and then removed once the ADR reopened, rather than left in place as stale code implying a decision that isn't final. Whatever mechanism the team lands on gets a fresh module once it's settled, not a revival of the old one.
 
 ## Tech stack
 
@@ -27,8 +29,7 @@ Domain-driven, one folder per capability under `src/` — not by file type. Each
 
 ```
 src/
-├── line/          # webhook signature verification, reply/push sending
-├── identity/       # pairing-code linking (ADR 0002)
+├── line/          # webhook signature verification, reply/push sending -- ALL direct LINE API/SDK usage lives here
 ├── conversation/    # the state machine / slot-filling engine (target-architecture.md #4)
 ├── llm/              # LiteLLM wrapper -- extraction AND follow-up question generation
 ├── forms/             # read-only proxy -> Kotlin GET /forms/{formId}
@@ -71,7 +72,6 @@ This is a **structure-first** pass, verified to actually import and run (all tes
 
 - `src/line`: webhook signature verification and reply/push sending are real and tested. The event dispatcher just echoes back the message text — it doesn't call `src/conversation` yet.
 - `src/conversation`: the state-transition *rules* are real and tested (`state_machine.py`) — matches the corrected two-loop model from `target-architecture.md`. The orchestration that actually drives a conversation turn-by-turn isn't wired up yet.
-- `src/identity`: the pairing-code verify/link flow is real, not a stub.
 - `src/forms` / `src/tasks`: real HTTP clients against the shapes ADR 0001 describes — untested against the real Kotlin/Go endpoints yet.
 - `src/reminders`: the scheduler wiring is real; the job body is a stub (`jobs.py`).
 

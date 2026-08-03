@@ -30,7 +30,9 @@ class ConversationAnswer(Base):
     __table_args__ = {"schema": "chat"}
 
     conversation_answer_id: Mapped[uuid.UUID] = uuid_pk()
-    conversation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("chat.conversation.conversation_id"))
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("chat.conversation.conversation_id")
+    )
     question_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("form.question.question_id"))
     answer: Mapped[dict[str, Any]] = mapped_column(JSONB)
     source: Mapped[str] = mapped_column(String)

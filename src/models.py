@@ -15,8 +15,12 @@ def uuid_pk() -> Mapped[uuid.UUID]:
     attribute in each model rather than using a mixin, since the column name
     itself varies per table.
     """
-    return mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    return mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
 
 
 class TimestampMixin:
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )

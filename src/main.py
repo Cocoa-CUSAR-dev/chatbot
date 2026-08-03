@@ -7,7 +7,6 @@ from fastapi.responses import JSONResponse
 
 from src.config import settings
 from src.exceptions import ServiceException
-from src.identity.router import router as identity_router
 from src.line.router import router as line_router
 from src.reminders.scheduler import configure_jobs, scheduler
 
@@ -46,4 +45,3 @@ async def health() -> dict[str, str]:
 
 
 app.include_router(line_router)
-app.include_router(identity_router)
