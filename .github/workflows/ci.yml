@@ -1,0 +1,54 @@
+name: CI
+
+# Runs on every push, not just PRs, and the test job always runs the FULL
+# suite under tests/ -- not path-filtered, not limited to what changed.
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: ruff check src tests
+      - run: ruff format --check src tests
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: mypy src
+
+  test:
+    runs-on: ubuntu-latest
+    env:
+      # Dummy values -- these tests don't hit a real DB/LINE/LLM, they only
+      # need Settings() to construct without error at import time.
+      DATABASE_URL: postgresql+asyncpg://test:test@localhost/test
+      KOTLIN_BACKEND_URL: http://localhost:3001/api/v1
+      GO_BACKEND_URL: http://localhost:8080
+      LINE_CHANNEL_SECRET: test-secret
+      LINE_CHANNEL_ACCESS_TOKEN: test-token
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: pytest tests/ -v
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck, test]
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t cocoa-chatbot:${{ github.sha }} .
