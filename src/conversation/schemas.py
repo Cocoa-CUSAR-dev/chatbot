@@ -36,7 +36,13 @@ class ConfirmRequest(BaseModel):
     task_form_id: UUID
 
 
+class ChoiceResponse(BaseModel):
+    id: str
+    label: str
+
+
 class ConversationReplyResponse(BaseModel):
     conversation_id: UUID
     substate: str
     text: str
+    choices: list[ChoiceResponse] | None = None

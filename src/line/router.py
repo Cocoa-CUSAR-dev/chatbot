@@ -20,11 +20,34 @@ from src.conversation.exceptions import ConversationNotFound
 from src.conversation.models import Conversation
 from src.database import async_session_maker
 from src.forms.client import get_form
+from src.line import temp_task_picker
 from src.line.dependencies import parse_line_events
-from src.line.service import reply_text
+from src.line.schemas import QuickReplyOption
+from src.line.service import reply_task_choices, reply_text
 
 router = APIRouter(prefix="/line", tags=["line"])
 logger = logging.getLogger(__name__)
+
+_QUICK_REPLY_LIMIT = 13  # LINE's own cap on Quick Reply items per message
+
+
+async def _reply(reply_token: str, reply: service.ConversationReply) -> None:
+    """Sends a ConversationReply back -- as Quick Reply buttons when the
+    current question is OPTION-type (reply.choices is set), plain text
+    otherwise. Farmers pick by label, same MessageAction mechanism as
+    QuickReplyOption already uses elsewhere -- handle_answer resolves the
+    tapped label against the question's own choice list either way, so
+    typing the exact label instead of tapping works identically.
+    """
+    if not reply.choices:
+        await reply_text(reply_token, reply.text)
+        return
+
+    quick_reply = [
+        QuickReplyOption(label=c.label[:20], text=c.label)
+        for c in reply.choices[:_QUICK_REPLY_LIMIT]
+    ]
+    await reply_text(reply_token, reply.text, quick_reply=quick_reply)
 
 
 async def _resolve_user_id(line_user_id: str) -> UUID | None:
@@ -93,10 +116,20 @@ async def _handle_message(event: MessageEvent) -> None:
             )
             conversation = result.scalars().first()
             if conversation is None:
-                # No task-picker UX exists yet (out of scope for this task) --
-                # a farmer with no active conversation has no way to start
-                # one from a bare text message.
-                await reply_text(event.reply_token, "กรุณาเลือกงานที่ต้องการทำก่อนเริ่มสนทนา")
+                # TEMPORARY (see src/line/temp_task_picker.py): Boom's real
+                # LIFF to-do list is Sprint 5, ~2 months out as of when this
+                # was written. Until then, a keyword lists pending tasks as
+                # Quick Reply buttons instead of leaving the farmer stuck.
+                if message.text.strip().lower() in temp_task_picker.START_KEYWORDS:
+                    tasks = await temp_task_picker.list_pending_tasks(session, user_id)
+                    if not tasks:
+                        await reply_text(event.reply_token, "ไม่มีงานที่ต้องทำในตอนนี้")
+                        return
+                    await reply_task_choices(event.reply_token, "เลือกงานที่ต้องการทำ:", tasks)
+                    return
+
+                keyword = next(iter(temp_task_picker.START_KEYWORDS))
+                await reply_text(event.reply_token, f"พิมพ์ \"{keyword}\" เพื่อดูงานที่ต้องทำ")
                 return
 
             form = await get_form(str(conversation.task_form_id))
@@ -111,7 +144,7 @@ async def _handle_message(event: MessageEvent) -> None:
                 await reply_text(event.reply_token, "ไม่พบบทสนทนานี้แล้ว")
                 return
 
-        await reply_text(event.reply_token, reply.text)
+        await _reply(event.reply_token, reply)
     elif isinstance(message, LocationMessageContent):
         # TODO: hand off to src.conversation -- this is the direct LINE
         # equivalent of a GEODATA question (see the database review's
@@ -143,7 +176,7 @@ async def _handle_postback(event: PostbackEvent) -> None:
                 task_form_id=UUID(task_form_id),
                 form=form,
             )
-        await reply_text(event.reply_token, reply.text)
+        await _reply(event.reply_token, reply)
     elif action == "confirm":
         (conversation_id,) = args
         async with async_session_maker() as session:
@@ -155,7 +188,7 @@ async def _handle_postback(event: PostbackEvent) -> None:
             reply = await service.confirm_conversation(
                 session, conversation_id=conversation.conversation_id, form=form
             )
-        await reply_text(event.reply_token, reply.text)
+        await _reply(event.reply_token, reply)
     else:
         logger.info("postback event, data=%s", event.postback.data)
 

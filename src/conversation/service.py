@@ -7,10 +7,22 @@ Deliberately takes the form's question script (`FormDetail`) as a parameter
 rather than fetching it itself -- lets the same logic run against either
 `forms.client.get_form()` (real Kotlin call, production) or a direct DB query
 (this sprint's test router, see src/conversation/router.py) without this
-module knowing or caring which. See forms/schemas.py's own docstring: the
-real Kotlin response shape isn't pinned down yet, so the `sections` parsing
-below (question_id/label/field_name/is_mandatory/sort_order per question)
-needs confirming against a real response before it's trusted end-to-end.
+module knowing or caring which. Confirmed against Kotlin's actual DTOs
+(web-backend's FormRepository/Question.kt): each question dict carries
+question_id/label/field_name/is_mandatory/sort_order, and OPTION-type
+questions additionally carry choices: [{id, name}].
+
+OPTION-question answers: a farmer picks by the choice's label (matches a
+LINE Quick Reply MessageAction, which sends its own label back as the
+message text -- see src/line/service.py's QuickReplyOption). handle_answer
+resolves that label against the open question's own choice list and stores
+the resolved id as answer["value"] (falling back to answer["text"] alone for
+non-OPTION questions, which have no choices to resolve against). If the
+farmer's text doesn't match any listed choice, the question is re-asked
+rather than silently accepting text that can't be stored as a real domain
+value -- this is exactly what caused a real failed submission before choices
+existed here (see this task's own history: guided-flow text answers for
+OPTION questions failed with `invalid input syntax for type uuid`).
 """
 
 import logging
@@ -33,12 +45,30 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
+class Choice:
+    id: str
+    label: str
+
+
+# BOOLEAN questions target a real `boolean` column (e.g.
+# agriculture.farm_pest_disease_record.is_quality_damage) -- free text like
+# "ไม่"/"aaa" fails with `invalid input syntax for type boolean`, the exact
+# same failure OPTION questions had before choices existed. Kotlin never
+# sends a `choices` list for BOOLEAN (its own filter is INPUT_TYPE ==
+# OPTION only), so these two are synthesized here instead of looked up --
+# same choices/resolution/re-ask mechanism either way, just a fixed pair
+# instead of a database-backed list.
+_BOOLEAN_CHOICES = [Choice(id="true", label="ใช่"), Choice(id="false", label="ไม่")]
+
+
+@dataclass(frozen=True)
 class Question:
     question_id: UUID
     label: str
     field_name: str
     is_mandatory: bool
     sort_order: int
+    choices: list[Choice] | None = None
 
 
 @dataclass(frozen=True)
@@ -46,6 +76,15 @@ class ConversationReply:
     conversation_id: UUID
     substate: ActiveSubstate
     text: str
+    choices: list[Choice] | None = None
+
+
+def _choices_for(q: dict[str, Any]) -> list[Choice] | None:
+    if q.get("choices"):
+        return [Choice(id=str(c["id"]), label=str(c.get("name") or "")) for c in q["choices"]]
+    if q.get("input_type") == "BOOLEAN":
+        return _BOOLEAN_CHOICES
+    return None
 
 
 def questions_from_form(form: FormDetail) -> list[Question]:
@@ -57,6 +96,7 @@ def questions_from_form(form: FormDetail) -> list[Question]:
             field_name=str(q.get("field_name") or ""),
             is_mandatory=bool(q.get("is_mandatory", False)),
             sort_order=int(q.get("sort_order", 0)),
+            choices=_choices_for(q),
         )
         for section in form.sections
         for q in section.get("questions", [])
@@ -75,13 +115,32 @@ def _all_required_answered(questions: list[Question], answered: set[UUID]) -> bo
     return _next_unanswered_required(questions, answered) is None
 
 
-async def _answered_question_ids(session: AsyncSession, conversation_id: UUID) -> set[UUID]:
+async def _answered_rows(session: AsyncSession, conversation_id: UUID) -> list[ConversationAnswer]:
     result = await session.execute(
-        select(ConversationAnswer.question_id).where(
-            ConversationAnswer.conversation_id == conversation_id
-        )
+        select(ConversationAnswer).where(ConversationAnswer.conversation_id == conversation_id)
     )
-    return set(result.scalars().all())
+    return list(result.scalars().all())
+
+
+def _format_confirmation_summary(
+    questions: list[Question], answers: list[ConversationAnswer]
+) -> str:
+    label_by_id = {q.question_id: q.label for q in questions}
+    sort_order_by_id = {q.question_id: q.sort_order for q in questions}
+    ordered = sorted(answers, key=lambda a: sort_order_by_id.get(a.question_id, 0))
+    # Always the human-readable text, even for resolved OPTION answers --
+    # farmers review labels ("พ่นยา"), not the underlying UUID.
+    lines = [f"- {label_by_id.get(a.question_id, '?')}: {a.answer.get('text')}" for a in ordered]
+    return "สรุปคำตอบของคุณ:\n" + "\n".join(lines) + "\n\nยืนยันการส่งข้อมูลหรือไม่?"
+
+
+def _reply_for_question(conversation_id: UUID, question: Question) -> ConversationReply:
+    return ConversationReply(
+        conversation_id=conversation_id,
+        substate=ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION,
+        text=question.label,
+        choices=question.choices,
+    )
 
 
 async def start_conversation(
@@ -117,11 +176,7 @@ async def start_conversation(
             text="ไม่มีคำถามที่จำเป็นต้องตอบ ยืนยันการส่งข้อมูลหรือไม่?",
         )
 
-    return ConversationReply(
-        conversation_id=conversation.conversation_id,
-        substate=ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION,
-        text=first_question.label,
-    )
+    return _reply_for_question(conversation.conversation_id, first_question)
 
 
 async def handle_answer(
@@ -137,18 +192,38 @@ async def handle_answer(
     if conversation.current_question_id is None:
         raise ConversationNotFound("Conversation has no open question to answer")
 
+    questions = questions_from_form(form)
+    question_by_id = {q.question_id: q for q in questions}
+    current_question = question_by_id.get(conversation.current_question_id)
+
+    resolved_value: str | None = None
+    if current_question is not None and current_question.choices:
+        matched = next(
+            (c for c in current_question.choices if c.label == raw_text), None
+        )
+        if matched is None:
+            # Doesn't match any listed choice -- re-ask rather than store
+            # text that can't resolve to a real domain value later. Keeps
+            # the same question open, same choices offered again.
+            return _reply_for_question(conversation_id, current_question)
+        resolved_value = matched.id
+
+    answer: dict[str, Any] = {"text": raw_text}
+    if resolved_value is not None:
+        answer["value"] = resolved_value
+
     session.add(
         ConversationAnswer(
             conversation_id=conversation_id,
             question_id=conversation.current_question_id,
-            answer={"text": raw_text},
+            answer=answer,
             source=AnswerSource.GUIDED_FLOW,
         )
     )
     await session.flush()
 
-    questions = questions_from_form(form)
-    answered = await _answered_question_ids(session, conversation_id)
+    answer_rows = await _answered_rows(session, conversation_id)
+    answered = {row.question_id for row in answer_rows}
     transition = on_guided_answer(all_slots_filled=_all_required_answered(questions, answered))
 
     if transition.next_state == ActiveSubstate.AWAITING_CONFIRMATION:
@@ -157,7 +232,7 @@ async def handle_answer(
         return ConversationReply(
             conversation_id=conversation_id,
             substate=ActiveSubstate.AWAITING_CONFIRMATION,
-            text="ได้รับข้อมูลครบแล้ว ยืนยันการส่งข้อมูลหรือไม่?",
+            text=_format_confirmation_summary(questions, answer_rows),
         )
 
     next_question = _next_unanswered_required(questions, answered)
@@ -173,11 +248,7 @@ async def handle_answer(
 
     conversation.current_question_id = next_question.question_id
     await session.commit()
-    return ConversationReply(
-        conversation_id=conversation_id,
-        substate=ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION,
-        text=next_question.label,
-    )
+    return _reply_for_question(conversation_id, next_question)
 
 
 async def confirm_conversation(
@@ -188,23 +259,32 @@ async def confirm_conversation(
         raise ConversationNotFound()
 
     field_name_by_question_id = {q.question_id: q.field_name for q in questions_from_form(form)}
-    result = await session.execute(
-        select(ConversationAnswer).where(ConversationAnswer.conversation_id == conversation_id)
-    )
+    answer_rows = await _answered_rows(session, conversation_id)
     answer_payload: dict[str, Any] = {
-        field_name_by_question_id.get(row.question_id, str(row.question_id)): row.answer.get(
-            "text"
+        field_name_by_question_id.get(row.question_id, str(row.question_id)): (
+            row.answer.get("value") or row.answer.get("text")
         )
-        for row in result.scalars().all()
+        for row in answer_rows
     }
 
     try:
-        await submit_task(TaskSubmission(task_id=str(conversation.task_id), answer=answer_payload))
+        await submit_task(
+            TaskSubmission(
+                user_id=str(conversation.user_id),
+                task_id=str(conversation.task_id),
+                answer=answer_payload,
+            )
+        )
     except Exception:
+        # Go's dissection logic is real now (not a stub -- see tasks/client.py's
+        # docstring), so a failure here means an actual problem worth reading
+        # the exception message for (bad service key, no matching
+        # chat.conversation, unsupported handler, etc.) -- not an expected gap.
+        # Still swallowed rather than raised: the chatbot's own side (this
+        # conversation, its answers) is already durably saved regardless of
+        # whether Go's write succeeded, so there's nothing to roll back.
         logger.exception(
-            "submit_task failed for conversation_id=%s -- note Go's SubmitTask "
-            "dissection logic is still a stub (ADR 0001), so even a 200 here "
-            "would not create a real domain row yet",
+            "submit_task failed for conversation_id=%s -- chatbot-side data is still saved",
             conversation_id,
         )
 

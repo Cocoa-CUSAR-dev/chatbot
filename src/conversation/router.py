@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.conversation import dev_queries, service
 from src.conversation.schemas import (
+    ChoiceResponse,
     ConfirmRequest,
     ConversationReplyResponse,
     FormSummary,
@@ -26,6 +27,19 @@ from src.database import get_session
 router = APIRouter(prefix="/conversation/test", tags=["conversation-test"])
 
 _TEMPLATE_PATH = Path(__file__).parent / "templates" / "chat_test.html"
+
+
+def _to_response(reply: service.ConversationReply) -> ConversationReplyResponse:
+    return ConversationReplyResponse(
+        conversation_id=reply.conversation_id,
+        substate=reply.substate.value,
+        text=reply.text,
+        choices=(
+            [ChoiceResponse(id=c.id, label=c.label) for c in reply.choices]
+            if reply.choices
+            else None
+        ),
+    )
 
 
 @router.get("/forms", response_model=list[FormSummary])
@@ -46,9 +60,7 @@ async def start(
         task_form_id=body.task_form_id,
         form=form,
     )
-    return ConversationReplyResponse(
-        conversation_id=reply.conversation_id, substate=reply.substate.value, text=reply.text
-    )
+    return _to_response(reply)
 
 
 @router.post("/message", response_model=ConversationReplyResponse)
@@ -59,9 +71,7 @@ async def message(
     reply = await service.handle_answer(
         session, conversation_id=body.conversation_id, raw_text=body.text, form=form
     )
-    return ConversationReplyResponse(
-        conversation_id=reply.conversation_id, substate=reply.substate.value, text=reply.text
-    )
+    return _to_response(reply)
 
 
 @router.post("/confirm", response_model=ConversationReplyResponse)
@@ -72,9 +82,7 @@ async def confirm(
     reply = await service.confirm_conversation(
         session, conversation_id=body.conversation_id, form=form
     )
-    return ConversationReplyResponse(
-        conversation_id=reply.conversation_id, substate=reply.substate.value, text=reply.text
-    )
+    return _to_response(reply)
 
 
 @router.get("/ui", response_class=HTMLResponse)

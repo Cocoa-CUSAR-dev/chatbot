@@ -16,6 +16,8 @@ handlers (task-dissection-design.md) and reuses the existing `farmer01`
 account (role=farmer) as the test conversation owner.
 """
 
+import logging
+import re
 from uuid import UUID
 
 from sqlalchemy import text
@@ -26,6 +28,8 @@ from src.conversation.schemas import FormSummary
 from src.forms.exceptions import FormNotFound
 from src.forms.schemas import FormDetail
 
+logger = logging.getLogger(__name__)
+
 TEST_USERNAME = "farmer01"  # existing farmer-role account in the dev DB
 
 # The 4 "standalone" handlers (task-dissection-design.md) -- own generated
@@ -35,6 +39,13 @@ TEST_USERNAME = "farmer01"  # existing farmer-role account in the dev DB
 # standalone `batch`), which need a parent-ID resolution that's still an
 # open product question.
 TESTABLE_HANDLERS = ("harvest", "farm_activity", "farm_pest_disease_record", "processing_record")
+
+# Strict allowlist before this field_name gets interpolated into a table/
+# column identifier below -- form.question.field_name is researcher-set
+# (via Kotlin's form builder), not farmer-controlled, but not code either.
+_FIELD_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*_id$")
+
+_CHOICE_LIMIT = 13  # LINE's own Quick Reply cap -- see src/line/temp_task_picker.py
 
 
 async def list_testable_forms(session: AsyncSession) -> list[FormSummary]:
@@ -59,15 +70,49 @@ async def list_testable_forms(session: AsyncSession) -> list[FormSummary]:
     return [FormSummary(**dict(row._mapping)) for row in rows]
 
 
+async def _load_choices(session: AsyncSession, field_name: str) -> list[dict[str, str]]:
+    """Mirrors Kotlin's real fetchRefChoices naming convention (confirmed by
+    reading web-backend's FormRepository.kt directly, not guessed): strip
+    "_id", append "_constant" for the table name; the id column is
+    field_name itself; the label column is "<field_name minus _id>_name".
+
+    Verified against every OPTION field this sprint's 4 forms actually use
+    (farm_id, plot_id, farm_activity_type_id, pest_disease_id,
+    processing_activity_type_id) -- all 5 follow this pattern for real,
+    including a DB trigger keeping ref.farm_constant in sync with the real
+    agriculture.farm table, so this isn't a guess-and-hope convention.
+    """
+    if not _FIELD_NAME_RE.match(field_name):
+        logger.warning(
+            "field_name %r doesn't match the expected '..._id' shape -- skipping choices",
+            field_name,
+        )
+        return []
+
+    base = field_name.removesuffix("_id")
+    table = f"{base}_constant"
+    name_col = f"{base}_name"
+
+    rows = await session.execute(
+        text(
+            f'SELECT "{field_name}" AS id, "{name_col}" AS name '
+            f'FROM ref."{table}" ORDER BY "{name_col}" LIMIT :limit'
+        ),
+        {"limit": _CHOICE_LIMIT},
+    )
+    return [{"id": str(row.id), "name": row.name} for row in rows]
+
+
 async def load_form_detail(session: AsyncSession, task_form_id: UUID) -> FormDetail:
     """Direct-query counterpart to forms.client.get_form() -- builds the same
     FormDetail shape service.py expects, from the local `form.*` tables
-    instead of a real Kotlin call.
+    instead of a real Kotlin call. OPTION-type questions get a real
+    `choices` list attached, same shape Kotlin's own response uses.
     """
     rows = await session.execute(
         text(
             """
-            SELECT q.question_id, q.label, q.field_name, q.is_mandatory, q.sort_order
+            SELECT q.question_id, q.label, q.field_name, q.input_type, q.is_mandatory, q.sort_order
             FROM form.question q
             JOIN form.section s ON s.section_id = q.section_id
             WHERE s.form_id = :task_form_id
@@ -79,6 +124,11 @@ async def load_form_detail(session: AsyncSession, task_form_id: UUID) -> FormDet
     questions = [dict(row._mapping) for row in rows]
     if not questions:
         raise FormNotFound(f"No questions found for task_form_id={task_form_id}")
+
+    for question in questions:
+        if question["input_type"] == "OPTION" and question.get("field_name"):
+            question["choices"] = await _load_choices(session, question["field_name"])
+
     return FormDetail(task_form_id=str(task_form_id), sections=[{"questions": questions}])
 
 

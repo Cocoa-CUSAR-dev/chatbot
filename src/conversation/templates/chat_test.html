@@ -8,8 +8,6 @@
   h1 { font-size: 1.1rem; color: #555; }
   #layout { display: flex; gap: 1.5rem; align-items: flex-start; }
   #main { flex: 1; min-width: 0; }
-  #forms button { display: block; width: 100%; text-align: left; margin: 0.4rem 0; padding: 0.6rem; }
-  #chat { display: none; }
   #log { border: 1px solid #ccc; border-radius: 6px; padding: 0.8rem; min-height: 200px; margin-bottom: 0.6rem; }
   .msg { margin: 0.3rem 0; }
   .bot { color: #0a5; }
@@ -17,6 +15,19 @@
   .typing { opacity: 0.6; font-style: italic; }
   .typing::after { content: ''; animation: dots 1.2s steps(4, end) infinite; }
   @keyframes dots { 0% { content: ''; } 25% { content: '.'; } 50% { content: '..'; } 75% { content: '...'; } }
+
+  /* Quick Reply chips -- visually mirrors LINE's own Quick Reply row (a
+     strip of tappable pill buttons right under the message that offered
+     them, gone once one is picked). Real LINE Quick Reply is a device
+     platform feature, not HTML -- this is a visual approximation for
+     testing purposes only, not a pixel-accurate recreation. */
+  .quick-reply-row { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.3rem 0 0.6rem; }
+  .quick-reply-chip {
+    border: 1px solid #0a5; color: #0a5; background: #fff; border-radius: 999px;
+    padding: 0.35rem 0.9rem; font-size: 0.85rem; cursor: pointer;
+  }
+  .quick-reply-chip:hover { background: #eafaf1; }
+
   #inputRow { display: flex; gap: 0.4rem; }
   #inputRow input { flex: 1; padding: 0.5rem; }
   #confirmRow { display: none; }
@@ -41,21 +52,16 @@
 
 <div id="layout">
   <div id="main">
-    <div id="forms">
-      <p>Pick a mock form to start a conversation:</p>
-      <div id="formList">Loading...</div>
-    </div>
-
     <div id="chat">
       <div id="log"></div>
-      <div id="inputRow">
+      <div id="inputRow" style="display: none;">
         <input id="answerText" type="text" placeholder="type an answer..." />
         <button id="send">Send</button>
       </div>
       <div id="confirmRow">
         <button id="confirmBtn">Confirm &amp; Submit</button>
       </div>
-      <button id="restart">&larr; pick a different form</button>
+      <button id="restart">&larr; pick a different task</button>
     </div>
   </div>
 
@@ -136,19 +142,6 @@ function setState(id) {
   if (id) document.getElementById(id)?.classList.add('active');
 }
 
-async function loadForms() {
-  const res = await fetch('/conversation/test/forms');
-  const forms = await res.json();
-  const list = document.getElementById('formList');
-  list.innerHTML = '';
-  for (const f of forms) {
-    const btn = document.createElement('button');
-    btn.textContent = `${f.title} (${f.handler})`;
-    btn.onclick = () => startConversation(f.task_id, f.task_form_id);
-    list.appendChild(btn);
-  }
-}
-
 function appendMsg(text, who) {
   const log = document.getElementById('log');
   const div = document.createElement('div');
@@ -156,6 +149,45 @@ function appendMsg(text, who) {
   div.textContent = (who === 'bot' ? '\u{1F916} ' : '\u{1F9D1} ') + text;
   log.appendChild(div);
   log.scrollTop = log.scrollHeight;
+  return div;
+}
+
+// Renders a bot message immediately followed by a row of tappable
+// quick-reply-style chips -- visually approximating what a real LINE Quick
+// Reply looks like (see src/line/service.py's reply_task_choices, the real
+// equivalent). Tapping a chip removes the whole row (quick replies vanish
+// once used) and appends the choice as a "me" message, same as LINE's
+// displayText behavior on a PostbackAction.
+function appendQuickReplyChoices(promptText, choices) {
+  appendMsg(promptText, 'bot');
+  const log = document.getElementById('log');
+  const row = document.createElement('div');
+  row.className = 'quick-reply-row';
+  for (const choice of choices) {
+    const chip = document.createElement('button');
+    chip.className = 'quick-reply-chip';
+    chip.textContent = choice.label;
+    chip.onclick = () => {
+      row.remove();
+      appendMsg(choice.label, 'me');
+      choice.onSelect();
+    };
+    row.appendChild(chip);
+  }
+  log.appendChild(row);
+  log.scrollTop = log.scrollHeight;
+}
+
+async function loadTaskPicker() {
+  const res = await fetch('/conversation/test/forms');
+  const forms = await res.json();
+  appendQuickReplyChoices(
+    'เลือกงานที่ต้องการทำ:',
+    forms.map((f) => ({
+      label: `${f.title} (${f.handler})`,
+      onSelect: () => startConversation(f.task_id, f.task_form_id),
+    }))
+  );
 }
 
 function showTyping() {
@@ -174,7 +206,20 @@ function hideTyping() {
 
 function showReply(reply) {
   hideTyping();
-  appendMsg(reply.text, 'bot');
+  if (reply.choices && reply.choices.length > 0) {
+    // OPTION-type question -- render as quick-reply chips instead of a
+    // plain message, same as the real LINE Quick Reply this approximates.
+    // The input box stays available too (real LINE never hides the
+    // keyboard just because Quick Reply is showing) -- typing the exact
+    // choice label works the same as tapping it, since handle_answer
+    // resolves either one against the question's own choice list.
+    appendQuickReplyChoices(
+      reply.text,
+      reply.choices.map((c) => ({ label: c.label, onSelect: () => submitAnswer(c.label) }))
+    );
+  } else {
+    appendMsg(reply.text, 'bot');
+  }
   const awaitingConfirm = reply.substate === 'awaiting_confirmation';
   document.getElementById('inputRow').style.display = (awaitingConfirm || done) ? 'none' : 'flex';
   document.getElementById('confirmRow').style.display = (awaitingConfirm && !done) ? 'block' : 'none';
@@ -194,9 +239,6 @@ function showReply(reply) {
 
 async function startConversation(taskId, formId) {
   taskFormId = formId;
-  document.getElementById('forms').style.display = 'none';
-  document.getElementById('chat').style.display = 'block';
-  document.getElementById('log').innerHTML = '';
   done = false;
   setState('state-awaiting-input');
   showTyping();
@@ -210,12 +252,11 @@ async function startConversation(taskId, formId) {
   showReply(reply);
 }
 
-async function sendAnswer() {
-  const input = document.getElementById('answerText');
-  const text = input.value.trim();
-  if (!text) return;
-  appendMsg(text, 'me');
-  input.value = '';
+// Shared by both the manual text box and quick-reply chip taps. Does NOT
+// append the "me" message itself -- callers do that (the chip's own onclick
+// already does, generically, for any quick-reply use; sendAnswer does it
+// for the manual-typing path where there's no chip involved).
+async function submitAnswer(text) {
   setState('state-guided-asking');
   showTyping();
   const res = await fetch('/conversation/test/message', {
@@ -224,6 +265,15 @@ async function sendAnswer() {
     body: JSON.stringify({ conversation_id: conversationId, task_form_id: taskFormId, text }),
   });
   showReply(await res.json());
+}
+
+async function sendAnswer() {
+  const input = document.getElementById('answerText');
+  const text = input.value.trim();
+  if (!text) return;
+  appendMsg(text, 'me');
+  input.value = '';
+  await submitAnswer(text);
 }
 
 async function confirm() {
@@ -244,14 +294,16 @@ document.getElementById('answerText').addEventListener('keydown', (e) => {
 });
 document.getElementById('confirmBtn').onclick = confirm;
 document.getElementById('restart').onclick = () => {
-  document.getElementById('chat').style.display = 'none';
-  document.getElementById('forms').style.display = 'block';
+  document.getElementById('log').innerHTML = '';
+  document.getElementById('inputRow').style.display = 'none';
+  document.getElementById('confirmRow').style.display = 'none';
   conversationId = null;
   taskFormId = null;
   setState(null);
+  loadTaskPicker();
 };
 
-loadForms();
+loadTaskPicker();
 </script>
 </body>
 </html>
