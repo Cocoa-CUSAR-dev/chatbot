@@ -20,7 +20,7 @@ from src.conversation.exceptions import ConversationNotFound
 from src.conversation.models import Conversation
 from src.database import async_session_maker
 from src.forms.client import get_form
-from src.line import temp_task_picker
+from src.line import identity, temp_task_picker
 from src.line.dependencies import parse_line_events
 from src.line.schemas import QuickReplyOption
 from src.line.service import reply_task_choices, reply_text
@@ -51,20 +51,23 @@ async def _reply(reply_token: str, reply: service.ConversationReply) -> None:
 
 
 async def _resolve_user_id(line_user_id: str) -> UUID | None:
-    """LINE user_id -> auth.user_account.user_id.
+    """LINE user_id -> auth.user_account.user_id, via auth.line_identity.
 
-    Stubbed on purpose: ADR 0002 (LINE identity linking) is still open per
-    the team's own discussion, and auth.line_identity has no ORM model or
-    lookup helper in this repo yet. Returning None here (rather than
-    guessing at a mapping) is deliberate -- callers must handle it, not
-    assume identity resolution always succeeds.
+    Only the lookup half is implemented (src/line/identity.py) -- HOW a row
+    gets into auth.line_identity in the first place (pairing code, OAuth,
+    something else) is ADR 0002, still reopened/undecided by the team. A
+    farmer with no linked row yet correctly gets None here; callers must
+    handle that, not assume resolution always succeeds.
     """
-    logger.warning(
-        "identity resolution not implemented yet (ADR 0002 pending) -- "
-        "line_user_id=%s cannot be mapped to a user_id",
-        line_user_id,
-    )
-    return None
+    async with async_session_maker() as session:
+        user_id = await identity.lookup_user_id(session, line_user_id)
+
+    if user_id is None:
+        logger.warning(
+            "no auth.line_identity row for line_user_id=%s -- not linked yet",
+            line_user_id,
+        )
+    return user_id
 
 
 def _parse_postback_data(data: str) -> tuple[str, list[str]]:
@@ -104,7 +107,7 @@ async def _handle_message(event: MessageEvent) -> None:
     if isinstance(message, TextMessageContent):
         user_id = await _resolve_user_id(event.source.user_id)
         if user_id is None:
-            await reply_text(event.reply_token, "ยังไม่รองรับการเชื่อมบัญชี LINE ในตอนนี้")
+            await reply_text(event.reply_token, "บัญชี LINE นี้ยังไม่ได้เชื่อมกับบัญชีในระบบ")
             return
 
         async with async_session_maker() as session:
@@ -164,7 +167,7 @@ async def _handle_postback(event: PostbackEvent) -> None:
         task_id, task_form_id = args
         user_id = await _resolve_user_id(event.source.user_id)
         if user_id is None:
-            await reply_text(event.reply_token, "ยังไม่รองรับการเชื่อมบัญชี LINE ในตอนนี้")
+            await reply_text(event.reply_token, "บัญชี LINE นี้ยังไม่ได้เชื่อมกับบัญชีในระบบ")
             return
 
         form = await get_form(task_form_id)
