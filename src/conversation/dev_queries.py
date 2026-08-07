@@ -1,0 +1,95 @@
+"""All the direct-database reads used only by the dev test router
+(src/conversation/router.py) -- kept in one file on purpose, so anyone
+auditing "does this service touch form.*/auth.* directly anywhere" only
+has to check here, not hunt through router.py's request handlers too.
+
+This is a deliberate, dev-only exception to src/database.py's "never
+touches form.* directly" rule -- that rule is about the production
+read/write paths, which correctly go through Kotlin/Go (ADR 0001). None of
+the functions below are used by the real LINE webhook path.
+
+The dev DB (chatbot/.env's DATABASE_URL) turned out to already have real-
+shaped form/user data (84 form.task_form rows, 35 auth.user_account rows) --
+not empty as first assumed, so database/seed/mock_forms.sql's rows are NOT
+used here. Instead this filters the picker down to the 4 "standalone"
+handlers (task-dissection-design.md) and reuses the existing `farmer01`
+account (role=farmer) as the test conversation owner.
+"""
+
+from uuid import UUID
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.conversation.exceptions import ConversationNotFound
+from src.conversation.schemas import FormSummary
+from src.forms.exceptions import FormNotFound
+from src.forms.schemas import FormDetail
+
+TEST_USERNAME = "farmer01"  # existing farmer-role account in the dev DB
+
+# The 4 "standalone" handlers (task-dissection-design.md) -- own generated
+# PK, no parent-row dependency. Deliberately excludes the 5 "blocked"
+# handlers (farm_activity_fertilizer, farm_activity_chemical,
+# harvest_grade_detail, fermentation_batch, drying_batch, plus the 5th
+# standalone `batch`), which need a parent-ID resolution that's still an
+# open product question.
+TESTABLE_HANDLERS = ("harvest", "farm_activity", "farm_pest_disease_record", "processing_record")
+
+
+async def list_testable_forms(session: AsyncSession) -> list[FormSummary]:
+    """Uses form.task.title, not form.task_form.title -- the task_form title
+    is a generic template name shared by every recurring instance of a task
+    (e.g. every "farm_activity" row says the same thing), while form.task's
+    own title is the real per-instance one (e.g. "... (20/04/2026)"). Using
+    the wrong one made the picker show a wall of identical-looking buttons.
+    """
+    rows = await session.execute(
+        text(
+            """
+            SELECT tf.task_id, tf.form_id AS task_form_id, t.title, tf.handler
+            FROM form.task_form tf
+            JOIN form.task t ON t.task_id = tf.task_id
+            WHERE tf.handler = ANY(:handlers)
+            ORDER BY tf.handler, t.open_at
+            """
+        ),
+        {"handlers": list(TESTABLE_HANDLERS)},
+    )
+    return [FormSummary(**dict(row._mapping)) for row in rows]
+
+
+async def load_form_detail(session: AsyncSession, task_form_id: UUID) -> FormDetail:
+    """Direct-query counterpart to forms.client.get_form() -- builds the same
+    FormDetail shape service.py expects, from the local `form.*` tables
+    instead of a real Kotlin call.
+    """
+    rows = await session.execute(
+        text(
+            """
+            SELECT q.question_id, q.label, q.field_name, q.is_mandatory, q.sort_order
+            FROM form.question q
+            JOIN form.section s ON s.section_id = q.section_id
+            WHERE s.form_id = :task_form_id
+            ORDER BY q.sort_order
+            """
+        ),
+        {"task_form_id": str(task_form_id)},
+    )
+    questions = [dict(row._mapping) for row in rows]
+    if not questions:
+        raise FormNotFound(f"No questions found for task_form_id={task_form_id}")
+    return FormDetail(task_form_id=str(task_form_id), sections=[{"questions": questions}])
+
+
+async def resolve_test_user_id(session: AsyncSession) -> UUID:
+    result = await session.execute(
+        text("SELECT user_id FROM auth.user_account WHERE username = :username"),
+        {"username": TEST_USERNAME},
+    )
+    user_id = result.scalar_one_or_none()
+    if user_id is None:
+        raise ConversationNotFound(
+            f"Seed user '{TEST_USERNAME}' not found -- run database/seed/mock_forms.sql first"
+        )
+    return user_id
