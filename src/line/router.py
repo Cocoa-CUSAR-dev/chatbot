@@ -15,7 +15,7 @@ from linebot.v3.webhooks import (
 from sqlalchemy import select
 
 from src.conversation import service
-from src.conversation.constants import ConversationStatus
+from src.conversation.constants import ActiveSubstate, ConversationStatus
 from src.conversation.exceptions import ConversationNotFound
 from src.conversation.models import Conversation
 from src.database import async_session_maker
@@ -23,7 +23,7 @@ from src.forms.client import get_form
 from src.line import identity, temp_task_picker
 from src.line.dependencies import parse_line_events
 from src.line.schemas import QuickReplyOption
-from src.line.service import reply_task_choices, reply_text
+from src.line.service import reply_confirm_prompt, reply_task_choices, reply_text
 
 router = APIRouter(prefix="/line", tags=["line"])
 logger = logging.getLogger(__name__)
@@ -32,13 +32,23 @@ _QUICK_REPLY_LIMIT = 13  # LINE's own cap on Quick Reply items per message
 
 
 async def _reply(reply_token: str, reply: service.ConversationReply) -> None:
-    """Sends a ConversationReply back -- as Quick Reply buttons when the
-    current question is OPTION-type (reply.choices is set), plain text
-    otherwise. Farmers pick by label, same MessageAction mechanism as
-    QuickReplyOption already uses elsewhere -- handle_answer resolves the
-    tapped label against the question's own choice list either way, so
-    typing the exact label instead of tapping works identically.
+    """Sends a ConversationReply back:
+      - AWAITING_CONFIRMATION -> a single "confirm" Postback button, since
+        there's no open question left to answer against (see
+        reply_confirm_prompt's docstring for why this is required, not
+        cosmetic).
+      - current question is OPTION-type (reply.choices is set) -> Quick
+        Reply buttons. Farmers pick by label, same MessageAction mechanism
+        as QuickReplyOption already uses elsewhere -- handle_answer
+        resolves the tapped label against the question's own choice list
+        either way, so typing the exact label instead of tapping works
+        identically.
+      - otherwise -> plain text.
     """
+    if reply.substate == ActiveSubstate.AWAITING_CONFIRMATION:
+        await reply_confirm_prompt(reply_token, reply.text, reply.conversation_id)
+        return
+
     if not reply.choices:
         await reply_text(reply_token, reply.text)
         return

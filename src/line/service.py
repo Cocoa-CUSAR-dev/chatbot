@@ -1,4 +1,5 @@
 from typing import TYPE_CHECKING, Any
+from uuid import UUID
 
 from linebot.v3.messaging import (
     AsyncApiClient,
@@ -68,6 +69,34 @@ async def reply_task_choices(reply_token: str, text: str, tasks: list["PendingTa
                 )
             )
             for task in tasks
+        ]
+    )
+    message = TextMessage(text=text, quickReply=quick_reply)
+    async with AsyncApiClient(_configuration) as client:
+        await AsyncMessagingApi(client).reply_message(
+            ReplyMessageRequest(replyToken=reply_token, messages=[message])
+        )
+
+
+async def reply_confirm_prompt(reply_token: str, text: str, conversation_id: UUID) -> None:
+    """Single Quick Reply button that fires the "confirm" Postback.
+
+    Without this, AWAITING_CONFIRMATION has no way for a farmer to actually
+    confirm via real LINE -- typing free text at that point raises
+    ConversationNotFound in handle_answer (no open question left to answer
+    against). Same Postback convention reply_task_choices already
+    established for "start"; router.py's _handle_postback already knows
+    how to handle "confirm:<conversation_id>".
+    """
+    quick_reply = QuickReply(
+        items=[
+            QuickReplyItem(
+                action=PostbackAction(
+                    label="ยืนยัน",
+                    data=f"confirm:{conversation_id}",
+                    displayText="ยืนยัน",
+                )
+            )
         ]
     )
     message = TextMessage(text=text, quickReply=quick_reply)
