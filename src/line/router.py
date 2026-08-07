@@ -201,7 +201,12 @@ async def _handle_postback(event: PostbackEvent) -> None:
             reply = await service.confirm_conversation(
                 session, conversation_id=conversation.conversation_id, form=form
             )
-        await _reply(event.reply_token, reply)
+        # Not _reply(): confirm_conversation's reply still carries substate
+        # AWAITING_CONFIRMATION on its terminal "thanks" message (the
+        # conversation is COMPLETED by this point, not awaiting anything),
+        # so routing it through _reply() would attach a confirm button
+        # pointing at an already-completed conversation.
+        await reply_text(event.reply_token, reply.text)
     else:
         logger.info("postback event, data=%s", event.postback.data)
 
