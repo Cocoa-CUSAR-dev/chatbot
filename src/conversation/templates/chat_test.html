@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8" />
+<title>Chatbot GuidedFlow -- dev test UI</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 1040px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.1rem; color: #555; }
+  #layout { display: flex; gap: 1.5rem; align-items: flex-start; }
+  #main { flex: 1; min-width: 0; }
+  #forms button { display: block; width: 100%; text-align: left; margin: 0.4rem 0; padding: 0.6rem; }
+  #chat { display: none; }
+  #log { border: 1px solid #ccc; border-radius: 6px; padding: 0.8rem; min-height: 200px; margin-bottom: 0.6rem; }
+  .msg { margin: 0.3rem 0; }
+  .bot { color: #0a5; }
+  .me { color: #333; text-align: right; }
+  .typing { opacity: 0.6; font-style: italic; }
+  .typing::after { content: ''; animation: dots 1.2s steps(4, end) infinite; }
+  @keyframes dots { 0% { content: ''; } 25% { content: '.'; } 50% { content: '..'; } 75% { content: '...'; } }
+  #inputRow { display: flex; gap: 0.4rem; }
+  #inputRow input { flex: 1; padding: 0.5rem; }
+  #confirmRow { display: none; }
+  #restart { margin-top: 1rem; }
+
+  #stateDiagram { width: 320px; flex-shrink: 0; border: 1px solid #ddd; border-radius: 8px; padding: 0.8rem; }
+  #stateDiagram h2 { font-size: 0.85rem; color: #777; margin: 0 0 0.5rem; }
+  #stateDiagram svg { width: 100%; height: auto; }
+  .state-box rect { fill: #f4f4f4; stroke: #bbb; stroke-width: 1.5; transition: fill 0.25s, stroke 0.25s; }
+  .state-box text { fill: #444; font-size: 11px; font-family: system-ui, sans-serif; }
+  .state-box.future rect { fill: #fafafa; stroke: #ddd; stroke-dasharray: 4 3; }
+  .state-box.future text { fill: #bbb; }
+  .state-box.active rect { fill: #2e8b57; stroke: #1d5c39; }
+  .state-box.active text { fill: #fff; font-weight: 600; }
+  .flow-arrow { stroke: #bbb; stroke-width: 1.3; fill: none; marker-end: url(#arrowhead); }
+  .flow-arrow.future { stroke: #ddd; stroke-dasharray: 3 3; }
+  #legend { font-size: 10px; color: #999; margin-top: 0.4rem; }
+</style>
+</head>
+<body>
+<h1>GuidedFlow dev test UI -- not real LINE, no LLM (Sprint 1 scope)</h1>
+
+<div id="layout">
+  <div id="main">
+    <div id="forms">
+      <p>Pick a mock form to start a conversation:</p>
+      <div id="formList">Loading...</div>
+    </div>
+
+    <div id="chat">
+      <div id="log"></div>
+      <div id="inputRow">
+        <input id="answerText" type="text" placeholder="type an answer..." />
+        <button id="send">Send</button>
+      </div>
+      <div id="confirmRow">
+        <button id="confirmBtn">Confirm &amp; Submit</button>
+      </div>
+      <button id="restart">&larr; pick a different form</button>
+    </div>
+  </div>
+
+  <div id="stateDiagram">
+    <h2>Conversation state -- "the brain" (target-architecture.md #4)</h2>
+    <svg viewBox="0 0 300 480" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <marker id="arrowhead" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L6,3 L0,6 Z" fill="#bbb" />
+        </marker>
+      </defs>
+
+      <!-- AwaitingInput -->
+      <g class="state-box" id="state-awaiting-input">
+        <rect x="90" y="10" width="120" height="34" rx="6" />
+        <text x="150" y="31" text-anchor="middle">AwaitingInput</text>
+      </g>
+      <path class="flow-arrow" d="M150,44 L150,64" />
+
+      <!-- fork label -->
+      <path class="flow-arrow future" d="M140,64 C 90,80 60,95 60,110" />
+      <path class="flow-arrow" d="M160,64 C 210,80 220,95 220,110" />
+
+      <!-- LLMConversation (future) -->
+      <g class="state-box future" id="state-llm">
+        <rect x="5" y="110" width="110" height="70" rx="6" />
+        <text x="60" y="128" text-anchor="middle" font-weight="600">LLMConversation</text>
+        <text x="60" y="144" text-anchor="middle">Extracting</text>
+        <text x="60" y="160" text-anchor="middle">AskingFollowUp</text>
+        <text x="60" y="174" text-anchor="middle" font-style="italic">not built -- Sprint 4</text>
+      </g>
+
+      <!-- GuidedFlow group -->
+      <text x="220" y="102" text-anchor="middle" font-size="10" fill="#888">GuidedFlow</text>
+      <g class="state-box" id="state-guided-asking">
+        <rect x="160" y="110" width="120" height="34" rx="6" />
+        <text x="220" y="131" text-anchor="middle">AskingFixedQuestion</text>
+      </g>
+      <path class="flow-arrow" d="M280,127 C 300,127 300,165 280,165" />
+      <path class="flow-arrow" d="M160,165 C 140,165 140,127 160,127" />
+      <g class="state-box" id="state-guided-awaiting">
+        <rect x="160" y="150" width="120" height="34" rx="6" />
+        <text x="220" y="171" text-anchor="middle">AwaitingFixedAnswer</text>
+      </g>
+
+      <!-- both converge on AwaitingConfirmation -->
+      <path class="flow-arrow future" d="M60,180 C 60,220 150,230 150,240" />
+      <path class="flow-arrow" d="M220,184 C 220,220 180,230 165,240" />
+
+      <g class="state-box" id="state-awaiting-confirmation">
+        <rect x="80" y="240" width="140" height="34" rx="6" />
+        <text x="150" y="261" text-anchor="middle">AwaitingConfirmation</text>
+      </g>
+      <path class="flow-arrow" d="M150,274 L150,294" />
+
+      <g class="state-box" id="state-completed">
+        <rect x="90" y="294" width="120" height="34" rx="6" />
+        <text x="150" y="315" text-anchor="middle">Completed</text>
+      </g>
+
+      <path class="flow-arrow future" d="M115,180 C 115,260 130,300 90,311" />
+
+      <text x="10" y="360" font-size="10" fill="#999">bidirectional switch to/from</text>
+      <text x="10" y="373" font-size="10" fill="#999">LLMConversation -- also not</text>
+      <text x="10" y="386" font-size="10" fill="#999">built this sprint</text>
+    </svg>
+    <div id="legend">Solid/green = live this sprint. Dashed/gray = designed, built in a later sprint.</div>
+  </div>
+</div>
+
+<script>
+let conversationId = null;
+let taskFormId = null;
+let done = false;
+
+function setState(id) {
+  document.querySelectorAll('.state-box.active').forEach((el) => el.classList.remove('active'));
+  if (id) document.getElementById(id)?.classList.add('active');
+}
+
+async function loadForms() {
+  const res = await fetch('/conversation/test/forms');
+  const forms = await res.json();
+  const list = document.getElementById('formList');
+  list.innerHTML = '';
+  for (const f of forms) {
+    const btn = document.createElement('button');
+    btn.textContent = `${f.title} (${f.handler})`;
+    btn.onclick = () => startConversation(f.task_id, f.task_form_id);
+    list.appendChild(btn);
+  }
+}
+
+function appendMsg(text, who) {
+  const log = document.getElementById('log');
+  const div = document.createElement('div');
+  div.className = 'msg ' + who;
+  div.textContent = (who === 'bot' ? '\u{1F916} ' : '\u{1F9D1} ') + text;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+
+function showTyping() {
+  const log = document.getElementById('log');
+  const div = document.createElement('div');
+  div.className = 'msg bot typing';
+  div.id = 'typingIndicator';
+  div.textContent = '\u{1F916} typing';
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+
+function hideTyping() {
+  document.getElementById('typingIndicator')?.remove();
+}
+
+function showReply(reply) {
+  hideTyping();
+  appendMsg(reply.text, 'bot');
+  const awaitingConfirm = reply.substate === 'awaiting_confirmation';
+  document.getElementById('inputRow').style.display = (awaitingConfirm || done) ? 'none' : 'flex';
+  document.getElementById('confirmRow').style.display = (awaitingConfirm && !done) ? 'block' : 'none';
+
+  if (done) {
+    setState('state-completed');
+  } else if (awaitingConfirm) {
+    setState('state-awaiting-confirmation');
+  } else if (reply.substate === 'guided_asking_fixed_question') {
+    // The bot just asked a fixed question -- per the state diagram this
+    // transitions straight into AwaitingFixedAnswer (no LLM call in
+    // between), which is the state we're actually sitting in while the
+    // farmer types their reply.
+    setState('state-guided-awaiting');
+  }
+}
+
+async function startConversation(taskId, formId) {
+  taskFormId = formId;
+  document.getElementById('forms').style.display = 'none';
+  document.getElementById('chat').style.display = 'block';
+  document.getElementById('log').innerHTML = '';
+  done = false;
+  setState('state-awaiting-input');
+  showTyping();
+  const res = await fetch('/conversation/test/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ task_id: taskId, task_form_id: formId }),
+  });
+  const reply = await res.json();
+  conversationId = reply.conversation_id;
+  showReply(reply);
+}
+
+async function sendAnswer() {
+  const input = document.getElementById('answerText');
+  const text = input.value.trim();
+  if (!text) return;
+  appendMsg(text, 'me');
+  input.value = '';
+  setState('state-guided-asking');
+  showTyping();
+  const res = await fetch('/conversation/test/message', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ conversation_id: conversationId, task_form_id: taskFormId, text }),
+  });
+  showReply(await res.json());
+}
+
+async function confirm() {
+  document.getElementById('confirmRow').style.display = 'none';
+  showTyping();
+  const res = await fetch('/conversation/test/confirm', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ conversation_id: conversationId, task_form_id: taskFormId }),
+  });
+  done = true;
+  showReply(await res.json());
+}
+
+document.getElementById('send').onclick = sendAnswer;
+document.getElementById('answerText').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') sendAnswer();
+});
+document.getElementById('confirmBtn').onclick = confirm;
+document.getElementById('restart').onclick = () => {
+  document.getElementById('chat').style.display = 'none';
+  document.getElementById('forms').style.display = 'block';
+  conversationId = null;
+  taskFormId = null;
+  setState(null);
+};
+
+loadForms();
+</script>
+</body>
+</html>
