@@ -36,7 +36,7 @@ async def create_rich_menu(
     )
     async with AsyncApiClient(_configuration) as client:
         response = await AsyncMessagingApi(client).create_rich_menu(request)
-    return response.rich_menu_id
+    return str(response.rich_menu_id)
 
 
 async def upload_rich_menu_image(rich_menu_id: str, image_bytes: bytes, content_type: str) -> None:

@@ -2,8 +2,8 @@ import uuid
 from unittest.mock import AsyncMock, MagicMock
 
 from src.conversation import service
-from src.conversation.constants import ActiveSubstate, ConversationStatus
-from src.conversation.models import Conversation
+from src.conversation.constants import ActiveSubstate, AnswerSource, ConversationStatus
+from src.conversation.models import Conversation, ConversationAnswer
 from src.forms.schemas import FormDetail
 
 
@@ -22,7 +22,35 @@ def _form(*, mandatory_flags: list[bool]) -> tuple[FormDetail, list[uuid.UUID]]:
     return FormDetail(task_form_id="tf-1", sections=[{"questions": questions}]), question_ids
 
 
-def _mock_session(*, answered_ids: list[uuid.UUID]) -> MagicMock:
+def _boolean_form() -> tuple[FormDetail, uuid.UUID]:
+    """A single mandatory BOOLEAN question -- matches the real
+    farm_pest_disease_record.is_quality_damage shape that actually failed
+    with `invalid input syntax for type boolean` before this existed.
+    """
+    question_id = uuid.uuid4()
+    questions = [
+        {
+            "question_id": str(question_id),
+            "label": "ทำให้ผลโกโก้เสียคุณภาพหรือไม่",
+            "field_name": "is_quality_damage",
+            "input_type": "BOOLEAN",
+            "is_mandatory": True,
+            "sort_order": 0,
+        }
+    ]
+    return FormDetail(task_form_id="tf-bool", sections=[{"questions": questions}]), question_id
+
+
+def _answer(question_id: uuid.UUID, text: str = "some answer") -> ConversationAnswer:
+    return ConversationAnswer(
+        conversation_id=uuid.uuid4(),
+        question_id=question_id,
+        answer={"text": text},
+        source=AnswerSource.GUIDED_FLOW,
+    )
+
+
+def _mock_session(*, answers: list[ConversationAnswer]) -> MagicMock:
     """A DB session double -- no real Postgres, matching this repo's existing
     no-real-DB test convention (see tests/line/test_webhook.py).
     """
@@ -30,10 +58,12 @@ def _mock_session(*, answered_ids: list[uuid.UUID]) -> MagicMock:
     session.add = MagicMock()
     session.flush = AsyncMock()
     session.commit = AsyncMock()
-    session.refresh = AsyncMock(side_effect=lambda obj: setattr(obj, "conversation_id", uuid.uuid4()))
+    session.refresh = AsyncMock(
+        side_effect=lambda obj: setattr(obj, "conversation_id", uuid.uuid4())
+    )
 
     execute_result = MagicMock()
-    execute_result.scalars.return_value.all.return_value = answered_ids
+    execute_result.scalars.return_value.all.return_value = answers
     session.execute = AsyncMock(return_value=execute_result)
     return session
 
@@ -47,13 +77,32 @@ def test_questions_from_form_orders_by_sort_order() -> None:
     assert [q.question_id for q in questions] == question_ids
 
 
+def test_boolean_question_gets_synthesized_yes_no_choices() -> None:
+    """Kotlin never sends `choices` for BOOLEAN (its own filter is
+    INPUT_TYPE == OPTION only), so these have to be synthesized locally.
+    """
+    form, question_id = _boolean_form()
+
+    questions = service.questions_from_form(form)
+
+    assert len(questions) == 1
+    assert questions[0].choices == [
+        service.Choice(id="true", label="ใช่"),
+        service.Choice(id="false", label="ไม่"),
+    ]
+
+
 class TestStartConversation:
     async def test_asks_first_mandatory_question(self) -> None:
         form, (q1, q2, q3) = _form(mandatory_flags=[False, True, True])
-        session = _mock_session(answered_ids=[])
+        session = _mock_session(answers=[])
 
         reply = await service.start_conversation(
-            session, user_id=uuid.uuid4(), task_id=uuid.uuid4(), task_form_id=uuid.uuid4(), form=form
+            session,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            form=form,
         )
 
         assert reply.substate == ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION
@@ -64,10 +113,14 @@ class TestStartConversation:
         every question there is is_mandatory=false in the real data.
         """
         form, _ = _form(mandatory_flags=[False, False])
-        session = _mock_session(answered_ids=[])
+        session = _mock_session(answers=[])
 
         reply = await service.start_conversation(
-            session, user_id=uuid.uuid4(), task_id=uuid.uuid4(), task_form_id=uuid.uuid4(), form=form
+            session,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            form=form,
         )
 
         assert reply.substate == ActiveSubstate.AWAITING_CONFIRMATION
@@ -85,7 +138,7 @@ class TestHandleAnswer:
             status=ConversationStatus.ACTIVE,
             current_question_id=q1,
         )
-        session = _mock_session(answered_ids=[q1])  # q2 still unanswered
+        session = _mock_session(answers=[_answer(q1)])  # q2 still unanswered
         session.get = AsyncMock(return_value=conversation)
 
         reply = await service.handle_answer(
@@ -110,7 +163,7 @@ class TestHandleAnswer:
             status=ConversationStatus.ACTIVE,
             current_question_id=q1,
         )
-        session = _mock_session(answered_ids=[q1])
+        session = _mock_session(answers=[_answer(q1)])
         session.get = AsyncMock(return_value=conversation)
 
         reply = await service.handle_answer(
@@ -119,3 +172,93 @@ class TestHandleAnswer:
 
         assert reply.substate == ActiveSubstate.AWAITING_CONFIRMATION
         assert conversation.current_question_id is None
+
+    async def test_confirmation_summary_lists_every_answer(self) -> None:
+        """The actual "submission confirmation" deliverable -- a farmer
+        should see what they answered before confirming, not a generic
+        "ready?" line.
+        """
+        form, (q1, q2) = _form(mandatory_flags=[True, True])
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=q2,
+        )
+        session = _mock_session(
+            answers=[_answer(q1, text="คำตอบที่ 1"), _answer(q2, text="คำตอบที่ 2")]
+        )
+        session.get = AsyncMock(return_value=conversation)
+
+        reply = await service.handle_answer(
+            session, conversation_id=conversation_id, raw_text="คำตอบที่ 2", form=form
+        )
+
+        assert reply.substate == ActiveSubstate.AWAITING_CONFIRMATION
+        assert "question 0" in reply.text
+        assert "คำตอบที่ 1" in reply.text
+        assert "question 1" in reply.text
+        assert "คำตอบที่ 2" in reply.text
+        # question 0's label should appear before question 1's -- sort_order,
+        # not answer-insertion order.
+        assert reply.text.index("question 0") < reply.text.index("question 1")
+
+
+class TestHandleAnswerWithChoices:
+    """Covers the resolution logic BOOLEAN and OPTION questions both share --
+    real bug this closes: `agriculture.farm_pest_disease_record` rejected
+    free-text answers like "ไม่"/"aaa" for its real `boolean` column with
+    `invalid input syntax for type boolean` until this resolved a tapped/typed
+    label to a real "true"/"false" value first.
+    """
+
+    async def test_matching_choice_resolves_to_true_false_value(self) -> None:
+        form, question_id = _boolean_form()
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=question_id,
+        )
+        session = _mock_session(answers=[_answer(question_id, text="ใช่")])
+        session.get = AsyncMock(return_value=conversation)
+
+        reply = await service.handle_answer(
+            session, conversation_id=conversation_id, raw_text="ใช่", form=form
+        )
+
+        assert reply.substate == ActiveSubstate.AWAITING_CONFIRMATION
+        added_answer = session.add.call_args.args[0]
+        assert added_answer.answer == {"text": "ใช่", "value": "true"}
+
+    async def test_non_matching_answer_reasks_same_question(self) -> None:
+        form, question_id = _boolean_form()
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=question_id,
+        )
+        session = _mock_session(answers=[])
+        session.get = AsyncMock(return_value=conversation)
+
+        reply = await service.handle_answer(
+            session, conversation_id=conversation_id, raw_text="aaa", form=form
+        )
+
+        assert reply.substate == ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION
+        assert reply.choices == [
+            service.Choice(id="true", label="ใช่"),
+            service.Choice(id="false", label="ไม่"),
+        ]
+        session.add.assert_not_called()  # bad answer never gets persisted
+        assert conversation.current_question_id == question_id  # unchanged, still open

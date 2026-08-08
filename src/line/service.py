@@ -1,4 +1,5 @@
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from uuid import UUID
 
 from linebot.v3.messaging import (
     AsyncApiClient,
@@ -8,6 +9,7 @@ from linebot.v3.messaging import (
     FlexMessage,
     MessageAction,
     MulticastRequest,
+    PostbackAction,
     PushMessageRequest,
     QuickReply,
     QuickReplyItem,
@@ -18,14 +20,18 @@ from linebot.v3.messaging import (
 from src.line.config import line_settings
 from src.line.schemas import QuickReplyOption
 
+if TYPE_CHECKING:
+    from src.line.temp_task_picker import PendingTask
+
 _configuration = Configuration(access_token=line_settings.LINE_CHANNEL_ACCESS_TOKEN)
+
+_QUICK_REPLY_LABEL_MAX = 20  # LINE's own platform limit on a button's label
 
 
 def _build_quick_reply(options: list[QuickReplyOption]) -> QuickReply:
     return QuickReply(
         items=[
-            QuickReplyItem(action=MessageAction(label=opt.label, text=opt.text))
-            for opt in options
+            QuickReplyItem(action=MessageAction(label=opt.label, text=opt.text)) for opt in options
         ]
     )
 
@@ -38,6 +44,61 @@ async def reply_text(
         text=text,
         quickReply=_build_quick_reply(quick_reply) if quick_reply else None,
     )
+    async with AsyncApiClient(_configuration) as client:
+        await AsyncMessagingApi(client).reply_message(
+            ReplyMessageRequest(replyToken=reply_token, messages=[message])
+        )
+
+
+async def reply_task_choices(reply_token: str, text: str, tasks: list["PendingTask"]) -> None:
+    """Quick Reply where each tap fires a Postback instead of re-sending its
+    label as text -- used for the TEMPORARY task-picker keyword flow (see
+    src/line/temp_task_picker.py; Sprint 5's real LIFF to-do list replaces
+    this). Each button's data is "start:<task_id>:<task_form_id>", which
+    router.py's _handle_postback already knows how to handle -- this is the
+    only new piece, not a new postback convention.
+    """
+    quick_reply = QuickReply(
+        items=[
+            QuickReplyItem(
+                action=PostbackAction(
+                    label=task.title[:_QUICK_REPLY_LABEL_MAX],
+                    data=f"start:{task.task_id}:{task.task_form_id}",
+                    displayText=task.title,
+                )
+            )
+            for task in tasks
+        ]
+    )
+    message = TextMessage(text=text, quickReply=quick_reply)
+    async with AsyncApiClient(_configuration) as client:
+        await AsyncMessagingApi(client).reply_message(
+            ReplyMessageRequest(replyToken=reply_token, messages=[message])
+        )
+
+
+async def reply_confirm_prompt(reply_token: str, text: str, conversation_id: UUID) -> None:
+    """Single Quick Reply button that fires the "confirm" Postback.
+
+    Without this, AWAITING_CONFIRMATION has no way for a farmer to actually
+    confirm via real LINE -- typing free text at that point raises
+    ConversationNotFound in handle_answer (no open question left to answer
+    against). Same Postback convention reply_task_choices already
+    established for "start"; router.py's _handle_postback already knows
+    how to handle "confirm:<conversation_id>".
+    """
+    quick_reply = QuickReply(
+        items=[
+            QuickReplyItem(
+                action=PostbackAction(
+                    label="ยืนยัน",
+                    data=f"confirm:{conversation_id}",
+                    displayText="ยืนยัน",
+                )
+            )
+        ]
+    )
+    message = TextMessage(text=text, quickReply=quick_reply)
     async with AsyncApiClient(_configuration) as client:
         await AsyncMessagingApi(client).reply_message(
             ReplyMessageRequest(replyToken=reply_token, messages=[message])

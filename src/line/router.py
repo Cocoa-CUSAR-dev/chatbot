@@ -15,33 +15,69 @@ from linebot.v3.webhooks import (
 from sqlalchemy import select
 
 from src.conversation import service
-from src.conversation.constants import ConversationStatus
+from src.conversation.constants import ActiveSubstate, ConversationStatus
 from src.conversation.exceptions import ConversationNotFound
 from src.conversation.models import Conversation
 from src.database import async_session_maker
 from src.forms.client import get_form
+from src.line import identity, temp_task_picker
 from src.line.dependencies import parse_line_events
-from src.line.service import reply_text
+from src.line.schemas import QuickReplyOption
+from src.line.service import reply_confirm_prompt, reply_task_choices, reply_text
 
 router = APIRouter(prefix="/line", tags=["line"])
 logger = logging.getLogger(__name__)
 
+_QUICK_REPLY_LIMIT = 13  # LINE's own cap on Quick Reply items per message
+
+
+async def _reply(reply_token: str, reply: service.ConversationReply) -> None:
+    """Sends a ConversationReply back:
+    - AWAITING_CONFIRMATION -> a single "confirm" Postback button, since
+      there's no open question left to answer against (see
+      reply_confirm_prompt's docstring for why this is required, not
+      cosmetic).
+    - current question is OPTION-type (reply.choices is set) -> Quick
+      Reply buttons. Farmers pick by label, same MessageAction mechanism
+      as QuickReplyOption already uses elsewhere -- handle_answer
+      resolves the tapped label against the question's own choice list
+      either way, so typing the exact label instead of tapping works
+      identically.
+    - otherwise -> plain text.
+    """
+    if reply.substate == ActiveSubstate.AWAITING_CONFIRMATION:
+        await reply_confirm_prompt(reply_token, reply.text, reply.conversation_id)
+        return
+
+    if not reply.choices:
+        await reply_text(reply_token, reply.text)
+        return
+
+    quick_reply = [
+        QuickReplyOption(label=c.label[:20], text=c.label)
+        for c in reply.choices[:_QUICK_REPLY_LIMIT]
+    ]
+    await reply_text(reply_token, reply.text, quick_reply=quick_reply)
+
 
 async def _resolve_user_id(line_user_id: str) -> UUID | None:
-    """LINE user_id -> auth.user_account.user_id.
+    """LINE user_id -> auth.user_account.user_id, via auth.line_identity.
 
-    Stubbed on purpose: ADR 0002 (LINE identity linking) is still open per
-    the team's own discussion, and auth.line_identity has no ORM model or
-    lookup helper in this repo yet. Returning None here (rather than
-    guessing at a mapping) is deliberate -- callers must handle it, not
-    assume identity resolution always succeeds.
+    Only the lookup half is implemented (src/line/identity.py) -- HOW a row
+    gets into auth.line_identity in the first place (pairing code, OAuth,
+    something else) is ADR 0002, still reopened/undecided by the team. A
+    farmer with no linked row yet correctly gets None here; callers must
+    handle that, not assume resolution always succeeds.
     """
-    logger.warning(
-        "identity resolution not implemented yet (ADR 0002 pending) -- "
-        "line_user_id=%s cannot be mapped to a user_id",
-        line_user_id,
-    )
-    return None
+    async with async_session_maker() as session:
+        user_id = await identity.lookup_user_id(session, line_user_id)
+
+    if user_id is None:
+        logger.warning(
+            "no auth.line_identity row for line_user_id=%s -- not linked yet",
+            line_user_id,
+        )
+    return user_id
 
 
 def _parse_postback_data(data: str) -> tuple[str, list[str]]:
@@ -81,7 +117,7 @@ async def _handle_message(event: MessageEvent) -> None:
     if isinstance(message, TextMessageContent):
         user_id = await _resolve_user_id(event.source.user_id)
         if user_id is None:
-            await reply_text(event.reply_token, "ยังไม่รองรับการเชื่อมบัญชี LINE ในตอนนี้")
+            await reply_text(event.reply_token, "บัญชี LINE นี้ยังไม่ได้เชื่อมกับบัญชีในระบบ")
             return
 
         async with async_session_maker() as session:
@@ -93,10 +129,20 @@ async def _handle_message(event: MessageEvent) -> None:
             )
             conversation = result.scalars().first()
             if conversation is None:
-                # No task-picker UX exists yet (out of scope for this task) --
-                # a farmer with no active conversation has no way to start
-                # one from a bare text message.
-                await reply_text(event.reply_token, "กรุณาเลือกงานที่ต้องการทำก่อนเริ่มสนทนา")
+                # TEMPORARY (see src/line/temp_task_picker.py): Boom's real
+                # LIFF to-do list is Sprint 5, ~2 months out as of when this
+                # was written. Until then, a keyword lists pending tasks as
+                # Quick Reply buttons instead of leaving the farmer stuck.
+                if message.text.strip().lower() in temp_task_picker.START_KEYWORDS:
+                    tasks = await temp_task_picker.list_pending_tasks(session, user_id)
+                    if not tasks:
+                        await reply_text(event.reply_token, "ไม่มีงานที่ต้องทำในตอนนี้")
+                        return
+                    await reply_task_choices(event.reply_token, "เลือกงานที่ต้องการทำ:", tasks)
+                    return
+
+                keyword = next(iter(temp_task_picker.START_KEYWORDS))
+                await reply_text(event.reply_token, f'พิมพ์ "{keyword}" เพื่อดูงานที่ต้องทำ')
                 return
 
             form = await get_form(str(conversation.task_form_id))
@@ -111,7 +157,7 @@ async def _handle_message(event: MessageEvent) -> None:
                 await reply_text(event.reply_token, "ไม่พบบทสนทนานี้แล้ว")
                 return
 
-        await reply_text(event.reply_token, reply.text)
+        await _reply(event.reply_token, reply)
     elif isinstance(message, LocationMessageContent):
         # TODO: hand off to src.conversation -- this is the direct LINE
         # equivalent of a GEODATA question (see the database review's
@@ -131,7 +177,7 @@ async def _handle_postback(event: PostbackEvent) -> None:
         task_id, task_form_id = args
         user_id = await _resolve_user_id(event.source.user_id)
         if user_id is None:
-            await reply_text(event.reply_token, "ยังไม่รองรับการเชื่อมบัญชี LINE ในตอนนี้")
+            await reply_text(event.reply_token, "บัญชี LINE นี้ยังไม่ได้เชื่อมกับบัญชีในระบบ")
             return
 
         form = await get_form(task_form_id)
@@ -143,7 +189,7 @@ async def _handle_postback(event: PostbackEvent) -> None:
                 task_form_id=UUID(task_form_id),
                 form=form,
             )
-        await reply_text(event.reply_token, reply.text)
+        await _reply(event.reply_token, reply)
     elif action == "confirm":
         (conversation_id,) = args
         async with async_session_maker() as session:
@@ -155,6 +201,11 @@ async def _handle_postback(event: PostbackEvent) -> None:
             reply = await service.confirm_conversation(
                 session, conversation_id=conversation.conversation_id, form=form
             )
+        # Not _reply(): confirm_conversation's reply still carries substate
+        # AWAITING_CONFIRMATION on its terminal "thanks" message (the
+        # conversation is COMPLETED by this point, not awaiting anything),
+        # so routing it through _reply() would attach a confirm button
+        # pointing at an already-completed conversation.
         await reply_text(event.reply_token, reply.text)
     else:
         logger.info("postback event, data=%s", event.postback.data)

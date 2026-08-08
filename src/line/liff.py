@@ -6,7 +6,7 @@ That's a plain REST call to LINE's own OAuth2 verify endpoint, so this uses
 httpx directly, same as src/forms and src/tasks.
 """
 
-from typing import Any
+from typing import Any, cast
 
 import httpx
 from fastapi import status
@@ -36,4 +36,6 @@ async def verify_id_token(id_token: str, channel_id: str) -> dict[str, Any]:
     if response.status_code >= 400:
         raise UpstreamServiceError(f"LINE verify endpoint returned {response.status_code}")
 
-    return response.json()
+    # httpx's .json() is typed Any (JSON content can be anything) -- LINE's
+    # verify endpoint contract guarantees an object on 200, per its own docs.
+    return cast(dict[str, Any], response.json())
