@@ -18,6 +18,7 @@ account (role=farmer) as the test conversation owner.
 
 import logging
 import re
+from typing import cast
 from uuid import UUID
 
 from sqlalchemy import text
@@ -142,4 +143,6 @@ async def resolve_test_user_id(session: AsyncSession) -> UUID:
         raise ConversationNotFound(
             f"Seed user '{TEST_USERNAME}' not found -- run database/seed/mock_forms.sql first"
         )
-    return user_id
+    # A raw text() query loses static type info -- scalar_one_or_none() is
+    # Any here even though the column is a real uuid.
+    return cast(UUID, user_id)

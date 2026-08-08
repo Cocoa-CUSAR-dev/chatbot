@@ -33,17 +33,17 @@ _QUICK_REPLY_LIMIT = 13  # LINE's own cap on Quick Reply items per message
 
 async def _reply(reply_token: str, reply: service.ConversationReply) -> None:
     """Sends a ConversationReply back:
-      - AWAITING_CONFIRMATION -> a single "confirm" Postback button, since
-        there's no open question left to answer against (see
-        reply_confirm_prompt's docstring for why this is required, not
-        cosmetic).
-      - current question is OPTION-type (reply.choices is set) -> Quick
-        Reply buttons. Farmers pick by label, same MessageAction mechanism
-        as QuickReplyOption already uses elsewhere -- handle_answer
-        resolves the tapped label against the question's own choice list
-        either way, so typing the exact label instead of tapping works
-        identically.
-      - otherwise -> plain text.
+    - AWAITING_CONFIRMATION -> a single "confirm" Postback button, since
+      there's no open question left to answer against (see
+      reply_confirm_prompt's docstring for why this is required, not
+      cosmetic).
+    - current question is OPTION-type (reply.choices is set) -> Quick
+      Reply buttons. Farmers pick by label, same MessageAction mechanism
+      as QuickReplyOption already uses elsewhere -- handle_answer
+      resolves the tapped label against the question's own choice list
+      either way, so typing the exact label instead of tapping works
+      identically.
+    - otherwise -> plain text.
     """
     if reply.substate == ActiveSubstate.AWAITING_CONFIRMATION:
         await reply_confirm_prompt(reply_token, reply.text, reply.conversation_id)
@@ -142,7 +142,7 @@ async def _handle_message(event: MessageEvent) -> None:
                     return
 
                 keyword = next(iter(temp_task_picker.START_KEYWORDS))
-                await reply_text(event.reply_token, f"พิมพ์ \"{keyword}\" เพื่อดูงานที่ต้องทำ")
+                await reply_text(event.reply_token, f'พิมพ์ "{keyword}" เพื่อดูงานที่ต้องทำ')
                 return
 
             form = await get_form(str(conversation.task_form_id))

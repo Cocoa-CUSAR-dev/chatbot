@@ -31,8 +31,7 @@ _QUICK_REPLY_LABEL_MAX = 20  # LINE's own platform limit on a button's label
 def _build_quick_reply(options: list[QuickReplyOption]) -> QuickReply:
     return QuickReply(
         items=[
-            QuickReplyItem(action=MessageAction(label=opt.label, text=opt.text))
-            for opt in options
+            QuickReplyItem(action=MessageAction(label=opt.label, text=opt.text)) for opt in options
         ]
     )
 

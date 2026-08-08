@@ -8,6 +8,8 @@ Both go through this one client so the provider/model is swappable in one
 place (ADR 0004).
 """
 
+from typing import cast
+
 import litellm
 from pydantic import BaseModel
 
@@ -58,4 +60,6 @@ async def generate_follow_up(missing_field: str, context: str) -> str:
     except Exception as exc:  # noqa: BLE001
         raise LLMUnavailable from exc
 
-    return response.choices[0].message.content
+    # LiteLLM's response model isn't strictly typed here (Any) -- same trust
+    # in the provider's shape extract_slots above already relies on.
+    return cast(str, response.choices[0].message.content)

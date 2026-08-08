@@ -11,4 +11,4 @@ class LLMConfig(BaseSettings):
     LLM_API_KEY: str = ""
 
 
-llm_settings = LLMConfig()  # type: ignore[call-arg]
+llm_settings = LLMConfig()

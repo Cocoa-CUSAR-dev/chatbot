@@ -198,9 +198,7 @@ async def handle_answer(
 
     resolved_value: str | None = None
     if current_question is not None and current_question.choices:
-        matched = next(
-            (c for c in current_question.choices if c.label == raw_text), None
-        )
+        matched = next((c for c in current_question.choices if c.label == raw_text), None)
         if matched is None:
             # Doesn't match any listed choice -- re-ask rather than store
             # text that can't resolve to a real domain value later. Keeps
