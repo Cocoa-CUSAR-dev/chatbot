@@ -31,6 +31,7 @@ from typing import Any
 from uuid import UUID
 
 from sqlalchemy import select
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.conversation.constants import ActiveSubstate, AnswerSource, ConversationStatus
@@ -60,6 +61,20 @@ class Choice:
 # instead of a database-backed list.
 _BOOLEAN_CHOICES = [Choice(id="true", label="ใช่"), Choice(id="false", label="ไม่")]
 
+# Offered only on non-mandatory questions, always first when real choices
+# exist too -- elderly farmers are the primary users here, so "this one's
+# optional" needs to be visually obvious, not just implied by phrasing.
+# LINE Quick Reply buttons can't be recolored (all MessageAction pills share
+# one style), so an icon prefix is the actual lever available -- id "__skip__"
+# is a sentinel, never a real domain value.
+_SKIP_CHOICE_ID = "__skip__"
+_SKIP_CHOICE = Choice(id=_SKIP_CHOICE_ID, label="⏭️ ข้าม")
+
+# LINE's own hard cap on Quick Reply buttons per message -- some OPTION
+# questions already carry this many real choices, so prepending skip must
+# make room for it rather than pushing the last real choice off the list.
+_QUICK_REPLY_LIMIT = 13
+
 
 @dataclass(frozen=True)
 class Question:
@@ -69,6 +84,10 @@ class Question:
     is_mandatory: bool
     sort_order: int
     choices: list[Choice] | None = None
+    # True only for real constrained choices (OPTION/BOOLEAN) -- distinct
+    # from "has a skip button but is otherwise free text", which must still
+    # accept arbitrary typed text rather than re-asking on a non-match.
+    has_constrained_choices: bool = False
 
 
 @dataclass(frozen=True)
@@ -77,9 +96,13 @@ class ConversationReply:
     substate: ActiveSubstate
     text: str
     choices: list[Choice] | None = None
+    # True only when confirm_conversation's own submit_task call failed --
+    # lets the caller re-attach the confirm button for a retry instead of
+    # treating this as the terminal "saved" message.
+    submission_failed: bool = False
 
 
-def _choices_for(q: dict[str, Any]) -> list[Choice] | None:
+def _constrained_choices_for(q: dict[str, Any]) -> list[Choice] | None:
     if q.get("choices"):
         return [Choice(id=str(c["id"]), label=str(c.get("name") or "")) for c in q["choices"]]
     if q.get("input_type") == "BOOLEAN":
@@ -87,26 +110,72 @@ def _choices_for(q: dict[str, Any]) -> list[Choice] | None:
     return None
 
 
+def _choices_for(q: dict[str, Any], is_mandatory: bool) -> tuple[list[Choice] | None, bool]:
+    """Returns (choices to offer, whether they're a real constrained set).
+
+    Mandatory questions are unchanged -- exactly the underlying OPTION/
+    BOOLEAN choices, or None for free text. Non-mandatory questions always
+    get a skip button prepended (first, even ahead of real choices); a
+    non-mandatory free-text question gets a skip-only Quick Reply, but typing
+    real text is still accepted (has_constrained_choices stays False).
+    """
+    constrained = _constrained_choices_for(q)
+    if is_mandatory:
+        return constrained, constrained is not None
+    if constrained is not None:
+        room_for_real_choices = _QUICK_REPLY_LIMIT - 1
+        return [_SKIP_CHOICE, *constrained[:room_for_real_choices]], True
+    return [_SKIP_CHOICE], False
+
+
+# Only these are actually wired up in the chat flow today -- DATE, DATETIME,
+# GEODATA, FLOAT, and INT are explicitly deferred (next sprints / LLM), and
+# "upload" is a VARCHAR field_name convention (see form.question seed data)
+# for photo attachments, which have nowhere to go yet either. Filtered out
+# at the form level (not just skipped when picking the next question) so
+# they never show up in the guided flow OR the confirmation summary.
+_SUPPORTED_INPUT_TYPES = {"VARCHAR", "OPTION", "BOOLEAN"}
+
+
+def _is_supported(q: dict[str, Any]) -> bool:
+    if q.get("input_type") not in _SUPPORTED_INPUT_TYPES:
+        return False
+    return not (q.get("input_type") == "VARCHAR" and q.get("field_name") == "upload")
+
+
+def _question_from_dict(q: dict[str, Any]) -> Question:
+    is_mandatory = bool(q.get("is_mandatory", False))
+    choices, has_constrained_choices = _choices_for(q, is_mandatory)
+    return Question(
+        question_id=UUID(str(q["question_id"])),
+        label=str(q.get("label") or ""),
+        field_name=str(q.get("field_name") or ""),
+        is_mandatory=is_mandatory,
+        sort_order=int(q.get("sort_order", 0)),
+        choices=choices,
+        has_constrained_choices=has_constrained_choices,
+    )
+
+
 def questions_from_form(form: FormDetail) -> list[Question]:
     """Flattens a FormDetail's sections into a sort_order-ordered list."""
     questions = [
-        Question(
-            question_id=UUID(str(q["question_id"])),
-            label=str(q.get("label") or ""),
-            field_name=str(q.get("field_name") or ""),
-            is_mandatory=bool(q.get("is_mandatory", False)),
-            sort_order=int(q.get("sort_order", 0)),
-            choices=_choices_for(q),
-        )
+        _question_from_dict(q)
         for section in form.sections
         for q in section.get("questions", [])
+        if _is_supported(q)
     ]
     return sorted(questions, key=lambda q: q.sort_order)
 
 
 def _next_unanswered_required(questions: list[Question], answered: set[UUID]) -> Question | None:
+    # TEMP: ignoring is_mandatory entirely so every question gets asked, not
+    # just required ones -- for exercising the full flow while the dev DB's
+    # is_mandatory data is inconsistent across forms. Revert to
+    # `question.is_mandatory and question.question_id not in answered` once
+    # that's no longer needed.
     for question in questions:
-        if question.is_mandatory and question.question_id not in answered:
+        if question.question_id not in answered:
             return question
     return None
 
@@ -127,7 +196,10 @@ def _format_confirmation_summary(
 ) -> str:
     label_by_id = {q.question_id: q.label for q in questions}
     sort_order_by_id = {q.question_id: q.sort_order for q in questions}
-    ordered = sorted(answers, key=lambda a: sort_order_by_id.get(a.question_id, 0))
+    # Skipped fields were saved as nothing -- leave them out of the review
+    # entirely rather than showing a confusing "skipped" line.
+    answered = [a for a in answers if not a.answer.get("skipped")]
+    ordered = sorted(answered, key=lambda a: sort_order_by_id.get(a.question_id, 0))
     # Always the human-readable text, even for resolved OPTION answers --
     # farmers review labels ("พ่นยา"), not the underlying UUID.
     lines = [f"- {label_by_id.get(a.question_id, '?')}: {a.answer.get('text')}" for a in ordered]
@@ -185,8 +257,40 @@ async def handle_answer(
     conversation_id: UUID,
     raw_text: str,
     form: FormDetail,
-) -> ConversationReply:
-    conversation = await session.get(Conversation, conversation_id)
+) -> ConversationReply | None:
+    # Locks the conversation row for the rest of this function -- serializes
+    # concurrent webhook deliveries for the same conversation (LINE's own
+    # retry-on-slow-response, or a farmer double-tapping/double-texting can
+    # otherwise both read the same current_question_id and both write an
+    # answer for it before either commits; live-caught 2026-08-09 during the
+    # chatbot pathway audit). NOWAIT means a message that arrives while
+    # another is still being processed for this conversation is dropped
+    # immediately rather than queued -- first message wins, full stop.
+    # Reconciling two rapid, genuinely different answers (e.g. a farmer
+    # correcting a typo a second later) is deferred to the future LLM-driven
+    # flow, which can actually decide what the farmer meant; this guided
+    # flow doesn't try.
+    try:
+        conversation = (
+            await session.execute(
+                select(Conversation)
+                .where(Conversation.conversation_id == conversation_id)
+                .with_for_update(nowait=True)
+            )
+        ).scalar_one_or_none()
+    except DBAPIError as exc:
+        # 55P03 = lock_not_available (Postgres SQLSTATE) -- checked on the
+        # code rather than the wrapped exception type, since SQLAlchemy's
+        # asyncpg dialect re-wraps the driver error (AsyncAdapt_asyncpg_dbapi
+        # .Error, not asyncpg's own LockNotAvailableError) but still proxies
+        # .sqlstate through from the original.
+        if getattr(exc.orig, "sqlstate", None) != "55P03":
+            raise
+        logger.info(
+            "conversation_id=%s already has an answer in flight -- dropping this message",
+            conversation_id,
+        )
+        return None
     if conversation is None:
         raise ConversationNotFound()
     if conversation.current_question_id is None:
@@ -197,16 +301,26 @@ async def handle_answer(
     current_question = question_by_id.get(conversation.current_question_id)
 
     resolved_value: str | None = None
+    is_skip = False
     if current_question is not None and current_question.choices:
         matched = next((c for c in current_question.choices if c.label == raw_text), None)
-        if matched is None:
-            # Doesn't match any listed choice -- re-ask rather than store
-            # text that can't resolve to a real domain value later. Keeps
-            # the same question open, same choices offered again.
-            return _reply_for_question(conversation_id, current_question)
-        resolved_value = matched.id
+        if matched is not None and matched.id == _SKIP_CHOICE_ID:
+            is_skip = True
+        elif current_question.has_constrained_choices:
+            if matched is None:
+                # Doesn't match any listed choice -- re-ask rather than store
+                # text that can't resolve to a real domain value later. Keeps
+                # the same question open, same choices offered again.
+                return _reply_for_question(conversation_id, current_question)
+            resolved_value = matched.id
+        # else: non-mandatory free-text question offering only a skip button
+        # -- typed text that isn't the skip label is a real answer, not a
+        # mismatch, so it falls through to the normal free-text path below.
 
-    answer: dict[str, Any] = {"text": raw_text}
+    if is_skip:
+        answer: dict[str, Any] = {"skipped": True}
+    else:
+        answer = {"text": raw_text}
     if resolved_value is not None:
         answer["value"] = resolved_value
 
@@ -258,11 +372,14 @@ async def confirm_conversation(
 
     field_name_by_question_id = {q.question_id: q.field_name for q in questions_from_form(form)}
     answer_rows = await _answered_rows(session, conversation_id)
+    # Skipped fields are saved as nothing -- omitted from the payload
+    # entirely rather than sending an empty/null value for that column.
     answer_payload: dict[str, Any] = {
         field_name_by_question_id.get(row.question_id, str(row.question_id)): (
             row.answer.get("value") or row.answer.get("text")
         )
         for row in answer_rows
+        if not row.answer.get("skipped")
     }
 
     try:
@@ -278,12 +395,26 @@ async def confirm_conversation(
         # docstring), so a failure here means an actual problem worth reading
         # the exception message for (bad service key, no matching
         # chat.conversation, unsupported handler, etc.) -- not an expected gap.
-        # Still swallowed rather than raised: the chatbot's own side (this
-        # conversation, its answers) is already durably saved regardless of
-        # whether Go's write succeeded, so there's nothing to roll back.
+        #
+        # Deliberately NOT marking the conversation COMPLETED here, and NOT
+        # telling the farmer it saved -- it didn't. A prior version of this
+        # code swallowed the failure and reported success anyway, which meant
+        # total, undetectable data loss (confirmed live during the 2026-08-09
+        # pathway audit: Go rejected the write, zero rows landed anywhere, and
+        # the farmer was told "saved"). The conversation stays exactly where
+        # it was (still awaiting confirmation) so tapping the confirm button
+        # again just retries this same submit_task call.
         logger.exception(
-            "submit_task failed for conversation_id=%s -- chatbot-side data is still saved",
+            "submit_task failed for conversation_id=%s -- chatbot-side answers are still "
+            "saved, but nothing was written to Go/the domain table; conversation left "
+            "awaiting confirmation for retry",
             conversation_id,
+        )
+        return ConversationReply(
+            conversation_id=conversation_id,
+            substate=ActiveSubstate.AWAITING_CONFIRMATION,
+            text="เกิดข้อผิดพลาด ไม่สามารถบันทึกข้อมูลได้ กรุณาลองใหม่อีกครั้ง",
+            submission_failed=True,
         )
 
     conversation.status = ConversationStatus.COMPLETED

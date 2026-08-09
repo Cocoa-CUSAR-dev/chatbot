@@ -14,6 +14,7 @@ def _form(*, mandatory_flags: list[bool]) -> tuple[FormDetail, list[uuid.UUID]]:
             "question_id": str(qid),
             "label": f"question {i}",
             "field_name": f"field_{i}",
+            "input_type": "VARCHAR",
             "is_mandatory": mandatory,
             "sort_order": i,
         }
@@ -50,9 +51,16 @@ def _answer(question_id: uuid.UUID, text: str = "some answer") -> ConversationAn
     )
 
 
-def _mock_session(*, answers: list[ConversationAnswer]) -> MagicMock:
+def _mock_session(
+    *, answers: list[ConversationAnswer], conversation: Conversation | None = None
+) -> MagicMock:
     """A DB session double -- no real Postgres, matching this repo's existing
     no-real-DB test convention (see tests/line/test_webhook.py).
+
+    session.execute is used for two different queries in handle_answer: the
+    locked conversation lookup (.scalar_one_or_none()) and the answered-rows
+    lookup (.scalars().all()) -- both rigged on the same result double since
+    each call site only ever touches the method chain it cares about.
     """
     session = MagicMock()
     session.add = MagicMock()
@@ -64,6 +72,7 @@ def _mock_session(*, answers: list[ConversationAnswer]) -> MagicMock:
 
     execute_result = MagicMock()
     execute_result.scalars.return_value.all.return_value = answers
+    execute_result.scalar_one_or_none.return_value = conversation
     session.execute = AsyncMock(return_value=execute_result)
     return session
 
@@ -138,13 +147,14 @@ class TestHandleAnswer:
             status=ConversationStatus.ACTIVE,
             current_question_id=q1,
         )
-        session = _mock_session(answers=[_answer(q1)])  # q2 still unanswered
-        session.get = AsyncMock(return_value=conversation)
+        # q2 still unanswered
+        session = _mock_session(answers=[_answer(q1)], conversation=conversation)
 
         reply = await service.handle_answer(
             session, conversation_id=conversation_id, raw_text="answer 1", form=form
         )
 
+        assert reply is not None
         assert reply.substate == ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION
         assert conversation.current_question_id == q2
 
@@ -163,13 +173,13 @@ class TestHandleAnswer:
             status=ConversationStatus.ACTIVE,
             current_question_id=q1,
         )
-        session = _mock_session(answers=[_answer(q1)])
-        session.get = AsyncMock(return_value=conversation)
+        session = _mock_session(answers=[_answer(q1)], conversation=conversation)
 
         reply = await service.handle_answer(
             session, conversation_id=conversation_id, raw_text="answer 1", form=form
         )
 
+        assert reply is not None
         assert reply.substate == ActiveSubstate.AWAITING_CONFIRMATION
         assert conversation.current_question_id is None
 
@@ -189,14 +199,15 @@ class TestHandleAnswer:
             current_question_id=q2,
         )
         session = _mock_session(
-            answers=[_answer(q1, text="คำตอบที่ 1"), _answer(q2, text="คำตอบที่ 2")]
+            answers=[_answer(q1, text="คำตอบที่ 1"), _answer(q2, text="คำตอบที่ 2")],
+            conversation=conversation,
         )
-        session.get = AsyncMock(return_value=conversation)
 
         reply = await service.handle_answer(
             session, conversation_id=conversation_id, raw_text="คำตอบที่ 2", form=form
         )
 
+        assert reply is not None
         assert reply.substate == ActiveSubstate.AWAITING_CONFIRMATION
         assert "question 0" in reply.text
         assert "คำตอบที่ 1" in reply.text
@@ -226,13 +237,15 @@ class TestHandleAnswerWithChoices:
             status=ConversationStatus.ACTIVE,
             current_question_id=question_id,
         )
-        session = _mock_session(answers=[_answer(question_id, text="ใช่")])
-        session.get = AsyncMock(return_value=conversation)
+        session = _mock_session(
+            answers=[_answer(question_id, text="ใช่")], conversation=conversation
+        )
 
         reply = await service.handle_answer(
             session, conversation_id=conversation_id, raw_text="ใช่", form=form
         )
 
+        assert reply is not None
         assert reply.substate == ActiveSubstate.AWAITING_CONFIRMATION
         added_answer = session.add.call_args.args[0]
         assert added_answer.answer == {"text": "ใช่", "value": "true"}
@@ -248,13 +261,13 @@ class TestHandleAnswerWithChoices:
             status=ConversationStatus.ACTIVE,
             current_question_id=question_id,
         )
-        session = _mock_session(answers=[])
-        session.get = AsyncMock(return_value=conversation)
+        session = _mock_session(answers=[], conversation=conversation)
 
         reply = await service.handle_answer(
             session, conversation_id=conversation_id, raw_text="aaa", form=form
         )
 
+        assert reply is not None
         assert reply.substate == ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION
         assert reply.choices == [
             service.Choice(id="true", label="ใช่"),

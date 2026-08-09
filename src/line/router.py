@@ -157,6 +157,11 @@ async def _handle_message(event: MessageEvent) -> None:
                 await reply_text(event.reply_token, "ไม่พบบทสนทนานี้แล้ว")
                 return
 
+        if reply is None:
+            # Another message for this conversation was already being
+            # processed -- first message wins, this one is dropped silently
+            # (no reply sent; see handle_answer's own docstring/CB-12).
+            return
         await _reply(event.reply_token, reply)
     elif isinstance(message, LocationMessageContent):
         # TODO: hand off to src.conversation -- this is the direct LINE
@@ -201,6 +206,11 @@ async def _handle_postback(event: PostbackEvent) -> None:
             reply = await service.confirm_conversation(
                 session, conversation_id=conversation.conversation_id, form=form
             )
+        if reply.submission_failed:
+            # Re-attach the confirm button so tapping it again retries --
+            # the conversation is still awaiting confirmation, not completed.
+            await reply_confirm_prompt(event.reply_token, reply.text, reply.conversation_id)
+            return
         # Not _reply(): confirm_conversation's reply still carries substate
         # AWAITING_CONFIRMATION on its terminal "thanks" message (the
         # conversation is COMPLETED by this point, not awaiting anything),
@@ -221,6 +231,7 @@ async def webhook(
     LINE requires a fast response or it retries the delivery -- this is the
     FastAPI BackgroundTasks half of ADR 0003's async model.
     """
+
     for event in events:
         background_tasks.add_task(_handle_event, event)
     return {"status": "ok"}

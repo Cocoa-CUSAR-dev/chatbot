@@ -15,6 +15,7 @@ from fastapi.responses import HTMLResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.conversation import dev_queries, service
+from src.conversation.exceptions import AnswerInFlight
 from src.conversation.schemas import (
     ChoiceResponse,
     ConfirmRequest,
@@ -73,6 +74,8 @@ async def message(body: MessageRequest, session: SessionDep) -> ConversationRepl
     reply = await service.handle_answer(
         session, conversation_id=body.conversation_id, raw_text=body.text, form=form
     )
+    if reply is None:
+        raise AnswerInFlight()
     return _to_response(reply)
 
 
