@@ -102,7 +102,14 @@ def test_boolean_question_gets_synthesized_yes_no_choices() -> None:
 
 
 class TestStartConversation:
-    async def test_asks_first_mandatory_question(self) -> None:
+    async def test_asks_first_unanswered_question_regardless_of_mandatory(self) -> None:
+        """Every question gets asked, not just mandatory ones -- an optional
+        question gets a skip button instead of being silently omitted (see
+        _choices_for's skip-button logic). _next_unanswered_required
+        filtering on is_mandatory again would make skip buttons unreachable
+        dead code, since only questions it selects as "next" ever reach the
+        farmer.
+        """
         form, (q1, q2, q3) = _form(mandatory_flags=[False, True, True])
         session = _mock_session(answers=[])
 
@@ -115,11 +122,14 @@ class TestStartConversation:
         )
 
         assert reply.substate == ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION
-        assert reply.text == "question 1"  # q2, the first mandatory one, not q1
+        assert reply.text == "question 0"  # q1, sort_order 0 -- first regardless of mandatory
+        assert reply.choices == [service.Choice(id="__skip__", label="⏭️ ข้าม")]
 
-    async def test_no_mandatory_questions_goes_straight_to_confirmation(self) -> None:
-        """Matches database/seed/mock_forms.sql's processing_record shape --
-        every question there is is_mandatory=false in the real data.
+    async def test_all_optional_form_still_asks_every_question(self) -> None:
+        """An all-optional form (matches database/seed/mock_forms.sql's
+        processing_record shape) still asks each question with a skip
+        option, rather than silently deciding none of them are worth
+        asking and jumping straight to confirmation.
         """
         form, _ = _form(mandatory_flags=[False, False])
         session = _mock_session(answers=[])
@@ -132,7 +142,8 @@ class TestStartConversation:
             form=form,
         )
 
-        assert reply.substate == ActiveSubstate.AWAITING_CONFIRMATION
+        assert reply.substate == ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION
+        assert reply.text == "question 0"
 
 
 class TestHandleAnswer:

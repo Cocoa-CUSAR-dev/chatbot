@@ -169,11 +169,12 @@ def questions_from_form(form: FormDetail) -> list[Question]:
 
 
 def _next_unanswered_required(questions: list[Question], answered: set[UUID]) -> Question | None:
-    # TEMP: ignoring is_mandatory entirely so every question gets asked, not
-    # just required ones -- for exercising the full flow while the dev DB's
-    # is_mandatory data is inconsistent across forms. Revert to
-    # `question.is_mandatory and question.question_id not in answered` once
-    # that's no longer needed.
+    # Deliberately ignores is_mandatory -- every question gets asked, not
+    # just required ones. Started as a workaround for the dev DB's
+    # inconsistent is_mandatory data, but is now load-bearing: a
+    # non-mandatory question only ever reaches the farmer (with its skip
+    # button, see _choices_for) if this function selects it as "next".
+    # Filtering on is_mandatory here would make skip buttons unreachable.
     for question in questions:
         if question.question_id not in answered:
             return question
