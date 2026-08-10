@@ -36,6 +36,10 @@ class ConfirmRequest(BaseModel):
     task_form_id: UUID
 
 
+class CancelRequest(BaseModel):
+    conversation_id: UUID
+
+
 class ChoiceResponse(BaseModel):
     id: str
     label: str

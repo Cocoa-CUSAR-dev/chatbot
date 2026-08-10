@@ -11,6 +11,7 @@ class ConversationStatus(StrEnum):
     ACTIVE = "active"
     PAUSED = "paused"
     COMPLETED = "completed"
+    CANCELLED = "cancelled"
 
 
 class ActiveSubstate(StrEnum):

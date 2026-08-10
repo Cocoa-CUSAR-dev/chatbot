@@ -60,6 +60,7 @@
       </div>
       <div id="confirmRow">
         <button id="confirmBtn">Confirm &amp; Submit</button>
+        <button id="cancelBtn">Cancel</button>
       </div>
       <button id="restart">&larr; pick a different task</button>
     </div>
@@ -288,11 +289,24 @@ async function confirm() {
   showReply(await res.json());
 }
 
+async function cancelConversation() {
+  document.getElementById('confirmRow').style.display = 'none';
+  showTyping();
+  const res = await fetch('/conversation/test/cancel', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ conversation_id: conversationId }),
+  });
+  done = true;
+  showReply(await res.json());
+}
+
 document.getElementById('send').onclick = sendAnswer;
 document.getElementById('answerText').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') sendAnswer();
 });
 document.getElementById('confirmBtn').onclick = confirm;
+document.getElementById('cancelBtn').onclick = cancelConversation;
 document.getElementById('restart').onclick = () => {
   document.getElementById('log').innerHTML = '';
   document.getElementById('inputRow').style.display = 'none';

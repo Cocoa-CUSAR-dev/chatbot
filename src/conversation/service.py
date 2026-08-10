@@ -425,3 +425,27 @@ async def confirm_conversation(
         substate=ActiveSubstate.AWAITING_CONFIRMATION,
         text="บันทึกข้อมูลเรียบร้อยแล้ว ขอบคุณครับ",
     )
+
+
+async def cancel_conversation(session: AsyncSession, *, conversation_id: UUID) -> ConversationReply:
+    """The escape hatch confirm/retry didn't have -- added after a farmer got
+    stuck retrying a submission that could never succeed (an unsupported
+    handler, CB-1's honest-failure message correctly refusing to lie about
+    it, but with no way out other than retrying forever). Nothing to submit
+    here -- just marks the conversation CANCELLED so `เริ่ม` can start a
+    fresh one for the same task (the active-conversation lookup only
+    matches status == ACTIVE).
+    """
+    conversation = await session.get(Conversation, conversation_id)
+    if conversation is None:
+        raise ConversationNotFound()
+
+    conversation.status = ConversationStatus.CANCELLED
+    conversation.current_question_id = None
+    await session.commit()
+
+    return ConversationReply(
+        conversation_id=conversation_id,
+        substate=ActiveSubstate.AWAITING_CONFIRMATION,
+        text="ยกเลิกแล้ว ไม่ได้บันทึกข้อมูล",
+    )

@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.conversation import dev_queries, service
 from src.conversation.exceptions import AnswerInFlight
 from src.conversation.schemas import (
+    CancelRequest,
     ChoiceResponse,
     ConfirmRequest,
     ConversationReplyResponse,
@@ -85,6 +86,12 @@ async def confirm(body: ConfirmRequest, session: SessionDep) -> ConversationRepl
     reply = await service.confirm_conversation(
         session, conversation_id=body.conversation_id, form=form
     )
+    return _to_response(reply)
+
+
+@router.post("/cancel", response_model=ConversationReplyResponse)
+async def cancel(body: CancelRequest, session: SessionDep) -> ConversationReplyResponse:
+    reply = await service.cancel_conversation(session, conversation_id=body.conversation_id)
     return _to_response(reply)
 
 
