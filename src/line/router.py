@@ -128,12 +128,33 @@ async def _handle_message(event: MessageEvent) -> None:
                 )
             )
             conversation = result.scalars().first()
+            is_start_keyword = message.text.strip().lower() in temp_task_picker.START_KEYWORDS
+
+            # A conversation sitting ACTIVE with no open question is one
+            # that reached AWAITING_CONFIRMATION and was then abandoned --
+            # the farmer never tapped confirm or cancel (closed the app,
+            # got distracted, etc.). Live-reported 2026-08-09: this
+            # permanently blocked เริ่ม, since the keyword was only ever
+            # checked when there was NO active conversation at all --
+            # typing เริ่ม here got routed into handle_answer as if it were
+            # an answer, which raises ConversationNotFound (no open
+            # question), surfacing as an opaque "ไม่พบบทสนทนานี้แล้ว". เริ่ม
+            # should always be a way to start over -- auto-cancel the
+            # abandoned one first rather than leaving the farmer stuck.
+            is_abandoned = conversation is not None and conversation.current_question_id is None
+            if is_abandoned and is_start_keyword:
+                assert conversation is not None  # narrows for mypy; is_abandoned implies this
+                await service.cancel_conversation(
+                    session, conversation_id=conversation.conversation_id
+                )
+                conversation = None
+
             if conversation is None:
                 # TEMPORARY (see src/line/temp_task_picker.py): Boom's real
                 # LIFF to-do list is Sprint 5, ~2 months out as of when this
                 # was written. Until then, a keyword lists pending tasks as
                 # Quick Reply buttons instead of leaving the farmer stuck.
-                if message.text.strip().lower() in temp_task_picker.START_KEYWORDS:
+                if is_start_keyword:
                     tasks = await temp_task_picker.list_pending_tasks(session, user_id)
                     if not tasks:
                         await reply_text(event.reply_token, "ไม่มีงานที่ต้องทำในตอนนี้")
@@ -157,6 +178,11 @@ async def _handle_message(event: MessageEvent) -> None:
                 await reply_text(event.reply_token, "ไม่พบบทสนทนานี้แล้ว")
                 return
 
+        if reply is None:
+            # Another message for this conversation was already being
+            # processed -- first message wins, this one is dropped silently
+            # (no reply sent; see handle_answer's own docstring/CB-12).
+            return
         await _reply(event.reply_token, reply)
     elif isinstance(message, LocationMessageContent):
         # TODO: hand off to src.conversation -- this is the direct LINE
@@ -201,11 +227,28 @@ async def _handle_postback(event: PostbackEvent) -> None:
             reply = await service.confirm_conversation(
                 session, conversation_id=conversation.conversation_id, form=form
             )
+        if reply.submission_failed:
+            # Re-attach the confirm button so tapping it again retries --
+            # the conversation is still awaiting confirmation, not completed.
+            await reply_confirm_prompt(event.reply_token, reply.text, reply.conversation_id)
+            return
         # Not _reply(): confirm_conversation's reply still carries substate
         # AWAITING_CONFIRMATION on its terminal "thanks" message (the
         # conversation is COMPLETED by this point, not awaiting anything),
         # so routing it through _reply() would attach a confirm button
         # pointing at an already-completed conversation.
+        await reply_text(event.reply_token, reply.text)
+    elif action == "cancel":
+        (conversation_id,) = args
+        async with async_session_maker() as session:
+            try:
+                reply = await service.cancel_conversation(
+                    session, conversation_id=UUID(conversation_id)
+                )
+            except ConversationNotFound:
+                await reply_text(event.reply_token, "ไม่พบบทสนทนานี้แล้ว")
+                return
+        # Same reasoning as confirm above: terminal message, no button.
         await reply_text(event.reply_token, reply.text)
     else:
         logger.info("postback event, data=%s", event.postback.data)
@@ -221,6 +264,7 @@ async def webhook(
     LINE requires a fast response or it retries the delivery -- this is the
     FastAPI BackgroundTasks half of ADR 0003's async model.
     """
+
     for event in events:
         background_tasks.add_task(_handle_event, event)
     return {"status": "ok"}

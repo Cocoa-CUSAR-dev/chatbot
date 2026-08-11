@@ -78,14 +78,20 @@ async def reply_task_choices(reply_token: str, text: str, tasks: list["PendingTa
 
 
 async def reply_confirm_prompt(reply_token: str, text: str, conversation_id: UUID) -> None:
-    """Single Quick Reply button that fires the "confirm" Postback.
+    """Two Quick Reply buttons: "confirm" and "cancel" Postbacks.
 
     Without this, AWAITING_CONFIRMATION has no way for a farmer to actually
     confirm via real LINE -- typing free text at that point raises
     ConversationNotFound in handle_answer (no open question left to answer
     against). Same Postback convention reply_task_choices already
     established for "start"; router.py's _handle_postback already knows
-    how to handle "confirm:<conversation_id>".
+    how to handle "confirm:<conversation_id>" and "cancel:<conversation_id>".
+
+    Cancel exists because this same prompt is re-shown on a failed
+    submission (CB-1) -- for a handler Go can't save yet, retrying can
+    never succeed, and a farmer needs a way out other than retrying
+    forever (live-reported 2026-08-09: 3 retries in a row, all the same
+    honest failure, no escape).
     """
     quick_reply = QuickReply(
         items=[
@@ -95,7 +101,14 @@ async def reply_confirm_prompt(reply_token: str, text: str, conversation_id: UUI
                     data=f"confirm:{conversation_id}",
                     displayText="ยืนยัน",
                 )
-            )
+            ),
+            QuickReplyItem(
+                action=PostbackAction(
+                    label="ยกเลิก",
+                    data=f"cancel:{conversation_id}",
+                    displayText="ยกเลิก",
+                )
+            ),
         ]
     )
     message = TextMessage(text=text, quickReply=quick_reply)
