@@ -1,10 +1,13 @@
 import uuid
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.conversation import service
 from src.conversation.constants import ActiveSubstate, AnswerSource, ConversationStatus
 from src.conversation.models import Conversation, ConversationAnswer
+from src.exceptions import UpstreamServiceError
 from src.forms.schemas import FormDetail
+from src.line import parent_picker
+from src.tasks.exceptions import HandlerNotSupported
 
 
 def _form(*, mandatory_flags: list[bool]) -> tuple[FormDetail, list[uuid.UUID]]:
@@ -146,6 +149,38 @@ class TestStartConversation:
         assert reply.text == "question 0"
 
 
+class TestStartConversationWithParentPicker:
+    """The 5 previously-blocked handlers (docs/plans/chatbot-child-handler-
+    design.md) start on a synthetic parent-picker question instead of the
+    form's real first question -- router.py has already resolved
+    parent_choices and confirmed it's non-empty before calling this.
+    """
+
+    async def test_asks_parent_picker_question_before_any_real_question(self) -> None:
+        form, _ = _form(mandatory_flags=[True])  # a real question exists but must NOT be asked yet
+        session = _mock_session(answers=[])
+        choices = [parent_picker.ParentOption(id="pa-1", label="กิจกรรม 01/08/2026 — ใส่ปุ๋ย")]
+
+        reply = await service.start_conversation(
+            session,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            form=form,
+            parent_kind="farm_activity",
+            parent_choices=choices,
+        )
+
+        assert reply.substate == ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION
+        assert reply.text == parent_picker.PROMPT["farm_activity"]
+        assert reply.choices == [service.Choice(id="pa-1", label="กิจกรรม 01/08/2026 — ใส่ปุ๋ย")]
+        added_conversation = session.add.call_args.args[0]
+        assert (
+            added_conversation.current_question_id
+            == parent_picker.SENTINEL_QUESTION_ID["farm_activity"]
+        )
+
+
 class TestHandleAnswer:
     async def test_advances_to_next_required_question_when_slots_remain(self) -> None:
         form, (q1, q2) = _form(mandatory_flags=[True, True])
@@ -160,6 +195,9 @@ class TestHandleAnswer:
         )
         # q2 still unanswered
         session = _mock_session(answers=[_answer(q1)], conversation=conversation)
+        # confirm_conversation uses plain session.get, unlike handle_answer's
+        # locked select -- _mock_session only rigs session.execute.
+        session.get = AsyncMock(return_value=conversation)
 
         reply = await service.handle_answer(
             session, conversation_id=conversation_id, raw_text="answer 1", form=form
@@ -185,6 +223,9 @@ class TestHandleAnswer:
             current_question_id=q1,
         )
         session = _mock_session(answers=[_answer(q1)], conversation=conversation)
+        # confirm_conversation uses plain session.get, unlike handle_answer's
+        # locked select -- _mock_session only rigs session.execute.
+        session.get = AsyncMock(return_value=conversation)
 
         reply = await service.handle_answer(
             session, conversation_id=conversation_id, raw_text="answer 1", form=form
@@ -286,3 +327,166 @@ class TestHandleAnswerWithChoices:
         ]
         session.add.assert_not_called()  # bad answer never gets persisted
         assert conversation.current_question_id == question_id  # unchanged, still open
+
+
+class TestHandleAnswerParentPicker:
+    """current_question_id set to one of parent_picker.SENTINEL_QUESTION_ID
+    means this conversation is still on the synthetic parent-picker step,
+    not a real form.question -- handle_answer must route these through
+    _handle_parent_answer rather than the normal ConversationAnswer path
+    (that path would violate conversation_answer.question_id's real FK to
+    form.question, since the sentinel has no corresponding row there).
+    """
+
+    def _conversation_awaiting_parent_pick(self, conversation_id: uuid.UUID) -> Conversation:
+        return Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=parent_picker.SENTINEL_QUESTION_ID["batch"],
+        )
+
+    async def test_matching_pick_stores_parent_answer_and_advances_to_real_question(self) -> None:
+        form, (q1,) = _form(mandatory_flags=[True])
+        conversation_id = uuid.uuid4()
+        conversation = self._conversation_awaiting_parent_pick(conversation_id)
+        session = _mock_session(answers=[], conversation=conversation)
+        choices = [parent_picker.ParentOption(id="batch-1", label="แบทช์ 01/08/2026 — สถานี A")]
+
+        with patch("src.line.parent_picker.choices_for", new=AsyncMock(return_value=choices)):
+            reply = await service.handle_answer(
+                session,
+                conversation_id=conversation_id,
+                raw_text="แบทช์ 01/08/2026 — สถานี A",
+                form=form,
+            )
+
+        assert reply is not None
+        assert reply.substate == ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION
+        assert reply.text == "question 0"  # the form's real first question, not re-asking
+        assert conversation.current_question_id == q1
+        assert conversation.parent_answer == {"field_name": "batch_id", "value": "batch-1"}
+        session.add.assert_not_called()  # never written as a ConversationAnswer row
+
+    async def test_non_matching_pick_reasks_with_fresh_choices(self) -> None:
+        form, (q1,) = _form(mandatory_flags=[True])
+        conversation_id = uuid.uuid4()
+        conversation = self._conversation_awaiting_parent_pick(conversation_id)
+        session = _mock_session(answers=[], conversation=conversation)
+        choices = [parent_picker.ParentOption(id="batch-1", label="แบทช์ 01/08/2026 — สถานี A")]
+
+        with patch("src.line.parent_picker.choices_for", new=AsyncMock(return_value=choices)):
+            reply = await service.handle_answer(
+                session, conversation_id=conversation_id, raw_text="ไม่ตรงกับตัวเลือกไหนเลย", form=form
+            )
+
+        assert reply is not None
+        assert reply.substate == ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION
+        assert reply.choices == [service.Choice(id="batch-1", label="แบทช์ 01/08/2026 — สถานี A")]
+        assert conversation.parent_answer is None
+        # still on the picker step, not advanced to the real form
+        assert conversation.current_question_id == parent_picker.SENTINEL_QUESTION_ID["batch"]
+
+
+class TestConfirmConversation:
+    """No coverage existed for this function at all before -- adding it
+    while touching the HandlerNotSupported branch, since it's the function
+    responsible for CB-1's honest-failure behavior (see its own docstring).
+    """
+
+    def _conversation(self, conversation_id: uuid.UUID) -> Conversation:
+        return Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=None,
+        )
+
+    async def test_marks_completed_and_thanks_farmer_on_success(self) -> None:
+        form, (q1,) = _form(mandatory_flags=[True])
+        conversation_id = uuid.uuid4()
+        conversation = self._conversation(conversation_id)
+        session = _mock_session(answers=[_answer(q1)], conversation=conversation)
+        # confirm_conversation uses plain session.get, unlike handle_answer's
+        # locked select -- _mock_session only rigs session.execute.
+        session.get = AsyncMock(return_value=conversation)
+
+        with patch("src.conversation.service.submit_task", new=AsyncMock()):
+            reply = await service.confirm_conversation(
+                session, conversation_id=conversation_id, form=form
+            )
+
+        assert reply.submission_failed is False
+        assert "บันทึกข้อมูลเรียบร้อยแล้ว" in reply.text
+        assert conversation.status == ConversationStatus.COMPLETED
+
+    async def test_stays_open_and_honest_on_generic_failure(self) -> None:
+        form, (q1,) = _form(mandatory_flags=[True])
+        conversation_id = uuid.uuid4()
+        conversation = self._conversation(conversation_id)
+        session = _mock_session(answers=[_answer(q1)], conversation=conversation)
+        # confirm_conversation uses plain session.get, unlike handle_answer's
+        # locked select -- _mock_session only rigs session.execute.
+        session.get = AsyncMock(return_value=conversation)
+
+        failing_submit = AsyncMock(side_effect=UpstreamServiceError("Go returned 500"))
+        with patch("src.conversation.service.submit_task", new=failing_submit):
+            reply = await service.confirm_conversation(
+                session, conversation_id=conversation_id, form=form
+            )
+
+        assert reply.submission_failed is True
+        assert "ลองใหม่อีกครั้ง" in reply.text  # "try again" -- worth retrying
+        assert conversation.status == ConversationStatus.ACTIVE  # NOT completed -- nothing saved
+
+    async def test_stays_open_with_distinct_message_when_handler_not_supported(self) -> None:
+        """The regression this test guards against: before HandlerNotSupported
+        existed, this case fell into the generic branch and told the farmer
+        "ลองใหม่อีกครั้ง" (try again) for a failure retrying could never fix.
+        """
+        form, (q1,) = _form(mandatory_flags=[True])
+        conversation_id = uuid.uuid4()
+        conversation = self._conversation(conversation_id)
+        session = _mock_session(answers=[_answer(q1)], conversation=conversation)
+        # confirm_conversation uses plain session.get, unlike handle_answer's
+        # locked select -- _mock_session only rigs session.execute.
+        session.get = AsyncMock(return_value=conversation)
+
+        failing_submit = AsyncMock(side_effect=HandlerNotSupported("Go returned 501"))
+        with patch("src.conversation.service.submit_task", new=failing_submit):
+            reply = await service.confirm_conversation(
+                session, conversation_id=conversation_id, form=form
+            )
+
+        assert reply.submission_failed is True
+        assert "ลองใหม่อีกครั้ง" not in reply.text  # must NOT suggest retrying
+        assert "ยังไม่รองรับ" in reply.text  # "not supported yet" -- the honest reason
+        assert conversation.status == ConversationStatus.ACTIVE  # still cancellable
+
+    async def test_merges_parent_answer_into_submission_payload(self) -> None:
+        """The parent-picker's pick (stored on conversation.parent_answer, not
+        as a ConversationAnswer row -- see TestHandleAnswerParentPicker) must
+        still land in Go's payload under its real column name, alongside the
+        form's normal answers.
+        """
+        form, (q1,) = _form(mandatory_flags=[True])
+        conversation_id = uuid.uuid4()
+        conversation = self._conversation(conversation_id)
+        conversation.parent_answer = {"field_name": "batch_id", "value": "batch-1"}
+        session = _mock_session(answers=[_answer(q1, text="คำตอบ")], conversation=conversation)
+        session.get = AsyncMock(return_value=conversation)
+
+        submit_task_mock = AsyncMock()
+        with patch("src.conversation.service.submit_task", new=submit_task_mock):
+            reply = await service.confirm_conversation(
+                session, conversation_id=conversation_id, form=form
+            )
+
+        assert reply.submission_failed is False
+        submission = submit_task_mock.call_args.args[0]
+        assert submission.answer["batch_id"] == "batch-1"
+        assert submission.answer["field_0"] == "คำตอบ"

@@ -20,7 +20,7 @@ from src.conversation.exceptions import ConversationNotFound
 from src.conversation.models import Conversation
 from src.database import async_session_maker
 from src.forms.client import get_form
-from src.line import identity, temp_task_picker
+from src.line import identity, parent_picker, temp_task_picker
 from src.line.dependencies import parse_line_events
 from src.line.schemas import QuickReplyOption
 from src.line.service import reply_confirm_prompt, reply_task_choices, reply_text
@@ -200,20 +200,36 @@ async def _handle_postback(event: PostbackEvent) -> None:
     action, args = _parse_postback_data(event.postback.data)
 
     if action == "start":
-        task_id, task_form_id = args
+        task_id, task_form_id, handler = args
         user_id = await _resolve_user_id(event.source.user_id)
         if user_id is None:
             await reply_text(event.reply_token, "บัญชี LINE นี้ยังไม่ได้เชื่อมกับบัญชีในระบบ")
             return
 
         form = await get_form(task_form_id)
+        parent_kind = parent_picker.kind_for_handler(handler)
         async with async_session_maker() as session:
+            parent_choices = None
+            if parent_kind is not None:
+                # One of the 5 previously-blocked handlers -- resolve the
+                # farm/station-scoped picker options before starting the
+                # conversation at all. Checked here (not left to
+                # start_conversation) so an empty result never creates a
+                # Conversation row that would have nothing to ask -- the
+                # farmer is told to log the parent activity first instead.
+                parent_choices = await parent_picker.choices_for(session, parent_kind, user_id)
+                if not parent_choices:
+                    await reply_text(event.reply_token, parent_picker.EMPTY_PROMPT[parent_kind])
+                    return
+
             reply = await service.start_conversation(
                 session,
                 user_id=user_id,
                 task_id=UUID(task_id),
                 task_form_id=UUID(task_form_id),
                 form=form,
+                parent_kind=parent_kind,
+                parent_choices=parent_choices,
             )
         await _reply(event.reply_token, reply)
     elif action == "confirm":
