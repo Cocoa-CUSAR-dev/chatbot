@@ -18,7 +18,17 @@ from src.tasks.schemas import TaskSubmission
 
 
 async def submit_task(submission: TaskSubmission) -> None:
-    async with httpx.AsyncClient(base_url=tasks_settings.GO_BACKEND_URL) as client:
+    # 30s, not httpx's 5s default -- Go's own liveColumns cache (form_handler
+    # .go) has a one-time cold-cache cost per destination table per process
+    # lifetime, same shape as Kotlin's fetchRefChoices (BE-5). Live-caught
+    # 2026-08-19: the very first submission ever made against
+    # agriculture.farm_activity_fertilizer (one of the 5 newly-unblocked
+    # handlers) took 6.6s end to end on Go's side and actually succeeded --
+    # but this client's old 5s default timed out first, so confirm_conversation
+    # told the farmer it failed and to retry, when retrying would have
+    # inserted a second, duplicate row (dissectAnswer has no idempotency
+    # guard). Same fix, same reasoning as src/forms/client.py's get_form().
+    async with httpx.AsyncClient(base_url=tasks_settings.GO_BACKEND_URL, timeout=30.0) as client:
         response = await client.post(
             "/service/tasks",
             json=submission.model_dump(),

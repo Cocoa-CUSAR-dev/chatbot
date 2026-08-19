@@ -63,18 +63,6 @@ EMPTY_PROMPT = {
     "batch": "คุณยังไม่มีแบทช์การแปรรูปที่บันทึกไว้เลย กรุณาบันทึกแบทช์ก่อน",
 }
 
-# Fixed, made-up UUIDs -- never real form.question rows. Safe as
-# chat.conversation.current_question_id, since that column (unlike
-# chat.conversation_answer.question_id) has no FK to form.question; nothing
-# ever tries to write one of these into conversation_answer (service.py's
-# handle_answer intercepts the parent-pick step before that could happen).
-SENTINEL_QUESTION_ID = {
-    "farm_activity": UUID("00000000-0000-0000-0000-0000000000f1"),
-    "harvest": UUID("00000000-0000-0000-0000-0000000000f2"),
-    "batch": UUID("00000000-0000-0000-0000-0000000000f3"),
-}
-_KIND_BY_SENTINEL = {v: k for k, v in SENTINEL_QUESTION_ID.items()}
-
 
 @dataclass(frozen=True)
 class ParentOption:
@@ -84,12 +72,6 @@ class ParentOption:
 
 def kind_for_handler(handler: str) -> str | None:
     return _PARENT_KIND_BY_HANDLER.get(handler)
-
-
-def kind_for_sentinel(question_id: UUID | None) -> str | None:
-    if question_id is None:
-        return None
-    return _KIND_BY_SENTINEL.get(question_id)
 
 
 def _label(prefix: str, when: datetime, place: str) -> str:

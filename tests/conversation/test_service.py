@@ -175,10 +175,12 @@ class TestStartConversationWithParentPicker:
         assert reply.text == parent_picker.PROMPT["farm_activity"]
         assert reply.choices == [service.Choice(id="pa-1", label="กิจกรรม 01/08/2026 — ใส่ปุ๋ย")]
         added_conversation = session.add.call_args.args[0]
-        assert (
-            added_conversation.current_question_id
-            == parent_picker.SENTINEL_QUESTION_ID["farm_activity"]
-        )
+        # current_question_id has a real FK to form.question -- there's no
+        # such row for this synthetic step, so it must stay NULL, not some
+        # made-up placeholder (see the ForeignKeyViolationError this
+        # replaced). Which picker is pending lives in parent_answer instead.
+        assert added_conversation.current_question_id is None
+        assert added_conversation.parent_answer == {"pending_kind": "farm_activity"}
 
 
 class TestHandleAnswer:
@@ -345,7 +347,8 @@ class TestHandleAnswerParentPicker:
             task_id=uuid.uuid4(),
             task_form_id=uuid.uuid4(),
             status=ConversationStatus.ACTIVE,
-            current_question_id=parent_picker.SENTINEL_QUESTION_ID["batch"],
+            current_question_id=None,
+            parent_answer={"pending_kind": "batch"},
         )
 
     async def test_matching_pick_stores_parent_answer_and_advances_to_real_question(self) -> None:
@@ -385,9 +388,9 @@ class TestHandleAnswerParentPicker:
         assert reply is not None
         assert reply.substate == ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION
         assert reply.choices == [service.Choice(id="batch-1", label="แบทช์ 01/08/2026 — สถานี A")]
-        assert conversation.parent_answer is None
-        # still on the picker step, not advanced to the real form
-        assert conversation.current_question_id == parent_picker.SENTINEL_QUESTION_ID["batch"]
+        # still on the picker step, not advanced to the real form or resolved
+        assert conversation.parent_answer == {"pending_kind": "batch"}
+        assert conversation.current_question_id is None
 
 
 class TestConfirmConversation:

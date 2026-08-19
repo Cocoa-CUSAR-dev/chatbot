@@ -231,10 +231,13 @@ async def start_conversation(
     # parent_kind set means this handler is one of the 5 that need a parent
     # row picked first (router.py already resolved parent_choices and
     # confirmed it's non-empty before calling this -- see
-    # src/line/parent_picker.py). The conversation starts on that synthetic
-    # picker step instead of the form's first real question; handle_answer
-    # recognizes SENTINEL_QUESTION_ID and routes to _handle_parent_answer
-    # rather than treating it as a real form.question.
+    # src/line/parent_picker.py). The conversation starts with NO open
+    # question (current_question_id has a real FK to form.question -- there
+    # is no such row for this synthetic step, so it can only ever be NULL or
+    # a real question here, never a made-up placeholder). Which picker is
+    # pending instead lives in parent_answer as {"pending_kind": ...};
+    # handle_answer checks that before its normal current_question_id
+    # handling and routes to _handle_parent_answer.
     if parent_kind is not None:
         assert parent_choices, "router.py must not call start_conversation with empty choices"
         conversation = Conversation(
@@ -242,7 +245,8 @@ async def start_conversation(
             task_id=task_id,
             task_form_id=task_form_id,
             status=ConversationStatus.ACTIVE,
-            current_question_id=parent_picker.SENTINEL_QUESTION_ID[parent_kind],
+            current_question_id=None,
+            parent_answer={"pending_kind": parent_kind},
         )
         session.add(conversation)
         await session.commit()
@@ -291,10 +295,11 @@ async def _handle_parent_answer(
     form: FormDetail,
 ) -> ConversationReply:
     """Resolves an answer to the synthetic parent-picker step (see
-    parent_picker.SENTINEL_QUESTION_ID). Recomputes choices fresh rather than
-    trusting whatever was offered when the question was asked -- cheap (an
-    indexed, capped-at-13 query) and avoids acting on a stale list if the
-    farmer logged something new in between.
+    conversation.parent_answer's "pending_kind" shape in start_conversation).
+    Recomputes choices fresh rather than trusting whatever was offered when
+    the question was asked -- cheap (an indexed, capped-at-13 query) and
+    avoids acting on a stale list if the farmer logged something new in
+    between.
 
     On a match: stores the pick on conversation.parent_answer (NOT as a
     ConversationAnswer row -- there's no real form.question backing this
@@ -376,18 +381,23 @@ async def handle_answer(
         return None
     if conversation is None:
         raise ConversationNotFound()
-    if conversation.current_question_id is None:
-        raise ConversationNotFound("Conversation has no open question to answer")
 
-    parent_kind = parent_picker.kind_for_sentinel(conversation.current_question_id)
-    if parent_kind is not None:
+    # Checked before the current_question_id==None check below: the picker
+    # step deliberately leaves current_question_id NULL (see
+    # start_conversation), so without this, a pending pick would be
+    # misread as "no open question" instead of routed to the picker.
+    pending_kind = (conversation.parent_answer or {}).get("pending_kind")
+    if pending_kind is not None:
         return await _handle_parent_answer(
             session,
             conversation=conversation,
             raw_text=raw_text,
-            parent_kind=parent_kind,
+            parent_kind=pending_kind,
             form=form,
         )
+
+    if conversation.current_question_id is None:
+        raise ConversationNotFound("Conversation has no open question to answer")
 
     questions = questions_from_form(form)
     question_by_id = {q.question_id: q for q in questions}
@@ -474,7 +484,7 @@ async def confirm_conversation(
         for row in answer_rows
         if not row.answer.get("skipped")
     }
-    if conversation.parent_answer is not None:
+    if conversation.parent_answer is not None and "field_name" in conversation.parent_answer:
         parent_field_name = conversation.parent_answer["field_name"]
         answer_payload[parent_field_name] = conversation.parent_answer["value"]
 
