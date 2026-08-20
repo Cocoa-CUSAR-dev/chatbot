@@ -39,7 +39,9 @@ from src.conversation.exceptions import ConversationNotFound
 from src.conversation.models import Conversation, ConversationAnswer
 from src.conversation.state_machine import on_guided_answer
 from src.forms.schemas import FormDetail
+from src.line import parent_picker
 from src.tasks.client import submit_task
+from src.tasks.exceptions import HandlerNotSupported
 from src.tasks.schemas import TaskSubmission
 
 logger = logging.getLogger(__name__)
@@ -223,7 +225,39 @@ async def start_conversation(
     task_id: UUID,
     task_form_id: UUID,
     form: FormDetail,
+    parent_kind: str | None = None,
+    parent_choices: list[parent_picker.ParentOption] | None = None,
 ) -> ConversationReply:
+    # parent_kind set means this handler is one of the 5 that need a parent
+    # row picked first (router.py already resolved parent_choices and
+    # confirmed it's non-empty before calling this -- see
+    # src/line/parent_picker.py). The conversation starts with NO open
+    # question (current_question_id has a real FK to form.question -- there
+    # is no such row for this synthetic step, so it can only ever be NULL or
+    # a real question here, never a made-up placeholder). Which picker is
+    # pending instead lives in parent_answer as {"pending_kind": ...};
+    # handle_answer checks that before its normal current_question_id
+    # handling and routes to _handle_parent_answer.
+    if parent_kind is not None:
+        assert parent_choices, "router.py must not call start_conversation with empty choices"
+        conversation = Conversation(
+            user_id=user_id,
+            task_id=task_id,
+            task_form_id=task_form_id,
+            status=ConversationStatus.ACTIVE,
+            current_question_id=None,
+            parent_answer={"pending_kind": parent_kind},
+        )
+        session.add(conversation)
+        await session.commit()
+        await session.refresh(conversation)
+        return ConversationReply(
+            conversation_id=conversation.conversation_id,
+            substate=ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION,
+            text=parent_picker.PROMPT[parent_kind],
+            choices=[Choice(id=o.id, label=o.label) for o in parent_choices],
+        )
+
     questions = questions_from_form(form)
     first_question = _next_unanswered_required(questions, answered=set())
 
@@ -249,6 +283,59 @@ async def start_conversation(
             text="ไม่มีคำถามที่จำเป็นต้องตอบ ยืนยันการส่งข้อมูลหรือไม่?",
         )
 
+    return _reply_for_question(conversation.conversation_id, first_question)
+
+
+async def _handle_parent_answer(
+    session: AsyncSession,
+    *,
+    conversation: Conversation,
+    raw_text: str,
+    parent_kind: str,
+    form: FormDetail,
+) -> ConversationReply:
+    """Resolves an answer to the synthetic parent-picker step (see
+    conversation.parent_answer's "pending_kind" shape in start_conversation).
+    Recomputes choices fresh rather than trusting whatever was offered when
+    the question was asked -- cheap (an indexed, capped-at-13 query) and
+    avoids acting on a stale list if the farmer logged something new in
+    between.
+
+    On a match: stores the pick on conversation.parent_answer (NOT as a
+    ConversationAnswer row -- there's no real form.question backing this
+    step, and that table's question_id has a real FK, see
+    src/conversation/models.py) and advances to the form's actual first
+    question, exactly like start_conversation's non-parent path.
+    """
+    choices = await parent_picker.choices_for(session, parent_kind, conversation.user_id)
+    matched = next((o for o in choices if o.label == raw_text), None)
+    if matched is None:
+        # Doesn't match any listed choice -- re-ask with a fresh list,
+        # same "don't store what can't resolve to a real value" rule
+        # handle_answer's own OPTION-question path already follows.
+        return ConversationReply(
+            conversation_id=conversation.conversation_id,
+            substate=ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION,
+            text=parent_picker.PROMPT[parent_kind],
+            choices=[Choice(id=o.id, label=o.label) for o in choices],
+        )
+
+    conversation.parent_answer = {
+        "field_name": parent_picker.FIELD_NAME[parent_kind],
+        "value": matched.id,
+    }
+
+    questions = questions_from_form(form)
+    first_question = _next_unanswered_required(questions, answered=set())
+    conversation.current_question_id = first_question.question_id if first_question else None
+    await session.commit()
+
+    if first_question is None:
+        return ConversationReply(
+            conversation_id=conversation.conversation_id,
+            substate=ActiveSubstate.AWAITING_CONFIRMATION,
+            text="ไม่มีคำถามที่จำเป็นต้องตอบ ยืนยันการส่งข้อมูลหรือไม่?",
+        )
     return _reply_for_question(conversation.conversation_id, first_question)
 
 
@@ -294,6 +381,21 @@ async def handle_answer(
         return None
     if conversation is None:
         raise ConversationNotFound()
+
+    # Checked before the current_question_id==None check below: the picker
+    # step deliberately leaves current_question_id NULL (see
+    # start_conversation), so without this, a pending pick would be
+    # misread as "no open question" instead of routed to the picker.
+    pending_kind = (conversation.parent_answer or {}).get("pending_kind")
+    if pending_kind is not None:
+        return await _handle_parent_answer(
+            session,
+            conversation=conversation,
+            raw_text=raw_text,
+            parent_kind=pending_kind,
+            form=form,
+        )
+
     if conversation.current_question_id is None:
         raise ConversationNotFound("Conversation has no open question to answer")
 
@@ -382,6 +484,9 @@ async def confirm_conversation(
         for row in answer_rows
         if not row.answer.get("skipped")
     }
+    if conversation.parent_answer is not None and "field_name" in conversation.parent_answer:
+        parent_field_name = conversation.parent_answer["field_name"]
+        answer_payload[parent_field_name] = conversation.parent_answer["value"]
 
     try:
         await submit_task(
@@ -391,11 +496,34 @@ async def confirm_conversation(
                 answer=answer_payload,
             )
         )
+    except HandlerNotSupported:
+        # A permanent failure, not a transient one -- Go is correctly saying
+        # "not built yet" (see docs/plans/chatbot-child-handler-design.md),
+        # not reporting a bug or outage. Retrying this exact submission will
+        # never succeed, so the generic "ลองใหม่อีกครั้ง" (try again) message
+        # below would be actively misleading here -- tell the farmer the
+        # real reason instead. Still leaves the conversation awaiting
+        # confirmation (not COMPLETED) so the farmer's own cancel button
+        # works normally; this is a case not-yet-implemented, the pre-flight
+        # check in src/line/router.py should catch known cases earlier than
+        # this for the 5 handlers it knows about, but this is the honest
+        # fallback for any handler Go itself reports unsupported.
+        logger.info(
+            "submit_task failed for conversation_id=%s -- handler not supported yet, "
+            "telling the farmer honestly instead of suggesting a retry",
+            conversation_id,
+        )
+        return ConversationReply(
+            conversation_id=conversation_id,
+            substate=ActiveSubstate.AWAITING_CONFIRMATION,
+            text="ขออภัย แบบฟอร์มประเภทนี้ยังไม่รองรับการบันทึกอัตโนมัติ ทีมงานกำลังพัฒนาอยู่ คำตอบของคุณจะไม่ถูกบันทึก",
+            submission_failed=True,
+        )
     except Exception:
         # Go's dissection logic is real now (not a stub -- see tasks/client.py's
         # docstring), so a failure here means an actual problem worth reading
         # the exception message for (bad service key, no matching
-        # chat.conversation, unsupported handler, etc.) -- not an expected gap.
+        # chat.conversation, etc.) -- not an expected gap.
         #
         # Deliberately NOT marking the conversation COMPLETED here, and NOT
         # telling the farmer it saved -- it didn't. A prior version of this

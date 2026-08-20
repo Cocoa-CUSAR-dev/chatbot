@@ -13,11 +13,22 @@ import httpx
 
 from src.exceptions import UpstreamServiceError
 from src.tasks.config import tasks_settings
+from src.tasks.exceptions import HandlerNotSupported
 from src.tasks.schemas import TaskSubmission
 
 
 async def submit_task(submission: TaskSubmission) -> None:
-    async with httpx.AsyncClient(base_url=tasks_settings.GO_BACKEND_URL) as client:
+    # 30s, not httpx's 5s default -- Go's own liveColumns cache (form_handler
+    # .go) has a one-time cold-cache cost per destination table per process
+    # lifetime, same shape as Kotlin's fetchRefChoices (BE-5). Live-caught
+    # 2026-08-19: the very first submission ever made against
+    # agriculture.farm_activity_fertilizer (one of the 5 newly-unblocked
+    # handlers) took 6.6s end to end on Go's side and actually succeeded --
+    # but this client's old 5s default timed out first, so confirm_conversation
+    # told the farmer it failed and to retry, when retrying would have
+    # inserted a second, duplicate row (dissectAnswer has no idempotency
+    # guard). Same fix, same reasoning as src/forms/client.py's get_form().
+    async with httpx.AsyncClient(base_url=tasks_settings.GO_BACKEND_URL, timeout=30.0) as client:
         response = await client.post(
             "/service/tasks",
             json=submission.model_dump(),
@@ -41,7 +52,11 @@ async def submit_task(submission: TaskSubmission) -> None:
             f"submission's user_id/task_id don't match a real conversation: {detail}"
         )
     if response.status_code == 501:
-        raise UpstreamServiceError(
+        # Not an UpstreamServiceError -- Go isn't broken, it's correctly
+        # saying "not built yet." confirm_conversation catches this
+        # specifically to tell the farmer that honestly instead of
+        # suggesting a retry that can never succeed.
+        raise HandlerNotSupported(
             f"Go doesn't support automatic storage for this handler yet (501): {detail}"
         )
     raise UpstreamServiceError(f"Go backend returned {response.status_code}: {detail}")
