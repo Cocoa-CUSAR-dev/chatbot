@@ -72,6 +72,14 @@ _BOOLEAN_CHOICES = [Choice(id="true", label="ใช่"), Choice(id="false", lab
 _SKIP_CHOICE_ID = "__skip__"
 _SKIP_CHOICE = Choice(id=_SKIP_CHOICE_ID, label="⏭️ ข้าม")
 
+# Offered on EVERY guided-flow question, mandatory or not (US2-3: "farmer
+# pause at anytime") -- unlike skip, this never affects has_constrained_choices,
+# since it's not an answer at all: handle_answer intercepts it before any
+# answer-storage logic runs, leaving current_question_id and every already-
+# given answer exactly as they are. Same sentinel-id pattern as skip.
+_PAUSE_CHOICE_ID = "__pause__"
+_PAUSE_CHOICE = Choice(id=_PAUSE_CHOICE_ID, label="⏸️ พักไว้ก่อน")
+
 # LINE's own hard cap on Quick Reply buttons per message -- some OPTION
 # questions already carry this many real choices, so prepending skip must
 # make room for it rather than pushing the last real choice off the list.
@@ -112,22 +120,26 @@ def _constrained_choices_for(q: dict[str, Any]) -> list[Choice] | None:
     return None
 
 
-def _choices_for(q: dict[str, Any], is_mandatory: bool) -> tuple[list[Choice] | None, bool]:
+def _choices_for(q: dict[str, Any], is_mandatory: bool) -> tuple[list[Choice], bool]:
     """Returns (choices to offer, whether they're a real constrained set).
 
-    Mandatory questions are unchanged -- exactly the underlying OPTION/
-    BOOLEAN choices, or None for free text. Non-mandatory questions always
-    get a skip button prepended (first, even ahead of real choices); a
-    non-mandatory free-text question gets a skip-only Quick Reply, but typing
-    real text is still accepted (has_constrained_choices stays False).
+    Pause is prepended to every question regardless of mandatory/constrained
+    status -- it's never itself a constrained choice (see _PAUSE_CHOICE_ID).
+    Beyond that: mandatory questions get exactly the underlying OPTION/
+    BOOLEAN choices, or none, for free text. Non-mandatory questions always
+    also get a skip button; a non-mandatory free-text question gets a
+    skip+pause-only Quick Reply, but typing real text is still accepted
+    (has_constrained_choices stays False).
     """
     constrained = _constrained_choices_for(q)
     if is_mandatory:
-        return constrained, constrained is not None
+        if constrained is not None:
+            return [_PAUSE_CHOICE, *constrained], True
+        return [_PAUSE_CHOICE], False
     if constrained is not None:
-        room_for_real_choices = _QUICK_REPLY_LIMIT - 1
-        return [_SKIP_CHOICE, *constrained[:room_for_real_choices]], True
-    return [_SKIP_CHOICE], False
+        room_for_real_choices = _QUICK_REPLY_LIMIT - 2  # room for both skip and pause
+        return [_SKIP_CHOICE, _PAUSE_CHOICE, *constrained[:room_for_real_choices]], True
+    return [_SKIP_CHOICE, _PAUSE_CHOICE], False
 
 
 # Only these are actually wired up in the chat flow today -- DATE, DATETIME,
@@ -194,9 +206,11 @@ async def _answered_rows(session: AsyncSession, conversation_id: UUID) -> list[C
     return list(result.scalars().all())
 
 
-def _format_confirmation_summary(
-    questions: list[Question], answers: list[ConversationAnswer]
-) -> str:
+def _format_answered_lines(questions: list[Question], answers: list[ConversationAnswer]) -> str:
+    """Shared by the confirmation summary and the resume recap (US2-3) --
+    both need "label: answer" per already-answered question, just with
+    different framing text around them.
+    """
     label_by_id = {q.question_id: q.label for q in questions}
     sort_order_by_id = {q.question_id: q.sort_order for q in questions}
     # Skipped fields were saved as nothing -- leave them out of the review
@@ -206,7 +220,27 @@ def _format_confirmation_summary(
     # Always the human-readable text, even for resolved OPTION answers --
     # farmers review labels ("พ่นยา"), not the underlying UUID.
     lines = [f"- {label_by_id.get(a.question_id, '?')}: {a.answer.get('text')}" for a in ordered]
-    return "สรุปคำตอบของคุณ:\n" + "\n".join(lines) + "\n\nยืนยันการส่งข้อมูลหรือไม่?"
+    return "\n".join(lines)
+
+
+def _format_confirmation_summary(
+    questions: list[Question], answers: list[ConversationAnswer]
+) -> str:
+    lines = _format_answered_lines(questions, answers)
+    return "สรุปคำตอบของคุณ:\n" + lines + "\n\nยืนยันการส่งข้อมูลหรือไม่?"
+
+
+def _format_resume_recap(questions: list[Question], answers: list[ConversationAnswer]) -> str:
+    """Prefix for a resumed conversation's first message back (US2-3): the
+    questions already answered, so the farmer isn't left guessing what they
+    already told the bot before picking back up. Empty when there's nothing
+    answered yet (e.g. paused right at the parent-picker step) -- no point
+    prefixing an empty recap section.
+    """
+    lines = _format_answered_lines(questions, answers)
+    if not lines:
+        return ""
+    return "คำตอบที่บันทึกไว้:\n" + lines + "\n\n"
 
 
 def _reply_for_question(conversation_id: UUID, question: Question) -> ConversationReply:
@@ -255,7 +289,7 @@ async def start_conversation(
             conversation_id=conversation.conversation_id,
             substate=ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION,
             text=parent_picker.PROMPT[parent_kind],
-            choices=[Choice(id=o.id, label=o.label) for o in parent_choices],
+            choices=[_PAUSE_CHOICE, *(Choice(id=o.id, label=o.label) for o in parent_choices)],
         )
 
     questions = questions_from_form(form)
@@ -317,7 +351,7 @@ async def _handle_parent_answer(
             conversation_id=conversation.conversation_id,
             substate=ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION,
             text=parent_picker.PROMPT[parent_kind],
-            choices=[Choice(id=o.id, label=o.label) for o in choices],
+            choices=[_PAUSE_CHOICE, *(Choice(id=o.id, label=o.label) for o in choices)],
         )
 
     conversation.parent_answer = {
@@ -381,6 +415,22 @@ async def handle_answer(
         return None
     if conversation is None:
         raise ConversationNotFound()
+
+    # Checked before everything else below (parent-picker step, no open
+    # question, or a real question) -- pause (US2-3) works identically
+    # regardless of where in the flow the farmer currently is. A raw-text
+    # match rather than a per-question choice list, since the picker step
+    # and "no open question left" cases don't have a current_question to
+    # attach the button to at all. Doesn't touch current_question_id or
+    # write a ConversationAnswer -- pausing isn't answering.
+    if raw_text == _PAUSE_CHOICE.label:
+        conversation.status = ConversationStatus.PAUSED
+        await session.commit()
+        return ConversationReply(
+            conversation_id=conversation_id,
+            substate=ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION,
+            text='พักงานนี้ไว้ให้แล้ว คำตอบที่ตอบไปแล้วถูกบันทึกครบถ้วน พิมพ์ "เริ่ม" เพื่อดูรายการงานเมื่อพร้อมทำต่อ',
+        )
 
     # Checked before the current_question_id==None check below: the picker
     # step deliberately leaves current_question_id NULL (see
@@ -577,4 +627,114 @@ async def cancel_conversation(session: AsyncSession, *, conversation_id: UUID) -
         conversation_id=conversation_id,
         substate=ActiveSubstate.AWAITING_CONFIRMATION,
         text="ยกเลิกแล้ว ไม่ได้บันทึกข้อมูล",
+    )
+
+
+async def pause_active_conversation(session: AsyncSession, *, user_id: UUID) -> None:
+    """Called whenever the farmer types เริ่ม (US2-3) -- since เริ่ม now always
+    shows the task list, whatever's currently ACTIVE for this farmer needs
+    to be paused first so switching to look at the list never silently
+    loses it. A no-op if nothing is active. Distinct from
+    src/conversation/jobs.py's daily sweep: that one is the backstop for
+    "went quiet and never came back"; this one is the immediate, same-turn
+    "farmer is deliberately switching tasks right now" case.
+    """
+    conversation = (
+        (
+            await session.execute(
+                select(Conversation).where(
+                    Conversation.user_id == user_id,
+                    Conversation.status == ConversationStatus.ACTIVE,
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if conversation is None:
+        return
+    conversation.status = ConversationStatus.PAUSED
+    await session.commit()
+
+
+async def find_resumable_conversation(
+    session: AsyncSession, *, user_id: UUID, task_id: UUID
+) -> Conversation | None:
+    """Whether this (farmer, task) pair already has a conversation that
+    isn't done -- ACTIVE (mid-turn, rare to hit here since เริ่ม just paused
+    it) or PAUSED. Used by the "start" postback to decide resume vs a fresh
+    start_conversation; COMPLETED/CANCELLED rows are correctly excluded, so
+    a farmer can always begin again after either of those.
+    """
+    return (
+        (
+            await session.execute(
+                select(Conversation).where(
+                    Conversation.user_id == user_id,
+                    Conversation.task_id == task_id,
+                    Conversation.status.in_([ConversationStatus.ACTIVE, ConversationStatus.PAUSED]),
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+
+async def resume_conversation(
+    session: AsyncSession, *, conversation: Conversation, form: FormDetail
+) -> ConversationReply:
+    """Picks a paused (or still-active) conversation back up (US2-3's
+    resume-conversation logic) -- never silently: the reply always leads
+    with a recap of what's already been answered, since LINE's own Quick
+    Reply buttons from the original question are long gone from the chat UI
+    by the time a farmer comes back, and they may not remember where they
+    left off.
+
+    Reuses whichever "what happens next" the conversation was already
+    sitting at -- the parent-picker step, a real question, or the
+    confirmation summary -- rather than reimplementing that branching here.
+    """
+    conversation.status = ConversationStatus.ACTIVE
+    await session.commit()
+
+    questions = questions_from_form(form)
+    answer_rows = await _answered_rows(session, conversation.conversation_id)
+    recap = _format_resume_recap(questions, answer_rows)
+
+    pending_kind = (conversation.parent_answer or {}).get("pending_kind")
+    if pending_kind is not None:
+        choices = await parent_picker.choices_for(session, pending_kind, conversation.user_id)
+        return ConversationReply(
+            conversation_id=conversation.conversation_id,
+            substate=ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION,
+            text=recap + parent_picker.PROMPT[pending_kind],
+            choices=[_PAUSE_CHOICE, *(Choice(id=o.id, label=o.label) for o in choices)],
+        )
+
+    if conversation.current_question_id is None:
+        # Paused right at the confirmation step (or an all-optional form
+        # with nothing left to ask) -- the summary already IS "recap +
+        # what's needed now" in one, so no separate recap prefix here.
+        return ConversationReply(
+            conversation_id=conversation.conversation_id,
+            substate=ActiveSubstate.AWAITING_CONFIRMATION,
+            text=_format_confirmation_summary(questions, answer_rows),
+        )
+
+    question_by_id = {q.question_id: q for q in questions}
+    current_question = question_by_id.get(conversation.current_question_id)
+    if current_question is None:
+        # The form changed out from under a long-paused conversation (a
+        # question was removed/edited) -- fail loudly rather than silently
+        # asking about a question that no longer exists.
+        raise ConversationNotFound(
+            f"Resumed conversation_id={conversation.conversation_id}'s current question "
+            "is no longer part of the form"
+        )
+    return ConversationReply(
+        conversation_id=conversation.conversation_id,
+        substate=ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION,
+        text=recap + current_question.label,
+        choices=current_question.choices,
     )

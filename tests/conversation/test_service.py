@@ -1,8 +1,11 @@
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from src.conversation import service
 from src.conversation.constants import ActiveSubstate, AnswerSource, ConversationStatus
+from src.conversation.exceptions import ConversationNotFound
 from src.conversation.models import Conversation, ConversationAnswer
 from src.exceptions import UpstreamServiceError
 from src.forms.schemas import FormDetail
@@ -60,10 +63,11 @@ def _mock_session(
     """A DB session double -- no real Postgres, matching this repo's existing
     no-real-DB test convention (see tests/line/test_webhook.py).
 
-    session.execute is used for two different queries in handle_answer: the
-    locked conversation lookup (.scalar_one_or_none()) and the answered-rows
-    lookup (.scalars().all()) -- both rigged on the same result double since
-    each call site only ever touches the method chain it cares about.
+    session.execute is used for several different queries across this
+    module: the locked conversation lookup (.scalar_one_or_none()), the
+    answered-rows lookup (.scalars().all()), and the pause/resume lookups
+    (.scalars().first()) -- all rigged on the same result double since each
+    call site only ever touches the method chain it cares about.
     """
     session = MagicMock()
     session.add = MagicMock()
@@ -75,6 +79,7 @@ def _mock_session(
 
     execute_result = MagicMock()
     execute_result.scalars.return_value.all.return_value = answers
+    execute_result.scalars.return_value.first.return_value = conversation
     execute_result.scalar_one_or_none.return_value = conversation
     session.execute = AsyncMock(return_value=execute_result)
     return session
@@ -99,6 +104,7 @@ def test_boolean_question_gets_synthesized_yes_no_choices() -> None:
 
     assert len(questions) == 1
     assert questions[0].choices == [
+        service.Choice(id="__pause__", label="⏸️ พักไว้ก่อน"),
         service.Choice(id="true", label="ใช่"),
         service.Choice(id="false", label="ไม่"),
     ]
@@ -126,7 +132,10 @@ class TestStartConversation:
 
         assert reply.substate == ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION
         assert reply.text == "question 0"  # q1, sort_order 0 -- first regardless of mandatory
-        assert reply.choices == [service.Choice(id="__skip__", label="⏭️ ข้าม")]
+        assert reply.choices == [
+            service.Choice(id="__skip__", label="⏭️ ข้าม"),
+            service.Choice(id="__pause__", label="⏸️ พักไว้ก่อน"),
+        ]
 
     async def test_all_optional_form_still_asks_every_question(self) -> None:
         """An all-optional form (matches database/seed/mock_forms.sql's
@@ -173,7 +182,10 @@ class TestStartConversationWithParentPicker:
 
         assert reply.substate == ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION
         assert reply.text == parent_picker.PROMPT["farm_activity"]
-        assert reply.choices == [service.Choice(id="pa-1", label="กิจกรรม 01/08/2026 — ใส่ปุ๋ย")]
+        assert reply.choices == [
+            service.Choice(id="__pause__", label="⏸️ พักไว้ก่อน"),
+            service.Choice(id="pa-1", label="กิจกรรม 01/08/2026 — ใส่ปุ๋ย"),
+        ]
         added_conversation = session.add.call_args.args[0]
         # current_question_id has a real FK to form.question -- there's no
         # such row for this synthetic step, so it must stay NULL, not some
@@ -324,6 +336,7 @@ class TestHandleAnswerWithChoices:
         assert reply is not None
         assert reply.substate == ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION
         assert reply.choices == [
+            service.Choice(id="__pause__", label="⏸️ พักไว้ก่อน"),
             service.Choice(id="true", label="ใช่"),
             service.Choice(id="false", label="ไม่"),
         ]
@@ -332,12 +345,12 @@ class TestHandleAnswerWithChoices:
 
 
 class TestHandleAnswerParentPicker:
-    """current_question_id set to one of parent_picker.SENTINEL_QUESTION_ID
-    means this conversation is still on the synthetic parent-picker step,
-    not a real form.question -- handle_answer must route these through
-    _handle_parent_answer rather than the normal ConversationAnswer path
-    (that path would violate conversation_answer.question_id's real FK to
-    form.question, since the sentinel has no corresponding row there).
+    """parent_answer holding a "pending_kind" key means this conversation is
+    still on the synthetic parent-picker step, not a real form.question --
+    handle_answer must route these through _handle_parent_answer rather than
+    the normal ConversationAnswer path (that path would violate
+    conversation_answer.question_id's real FK to form.question, since the
+    picker step has no corresponding row there).
     """
 
     def _conversation_awaiting_parent_pick(self, conversation_id: uuid.UUID) -> Conversation:
@@ -387,10 +400,247 @@ class TestHandleAnswerParentPicker:
 
         assert reply is not None
         assert reply.substate == ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION
-        assert reply.choices == [service.Choice(id="batch-1", label="แบทช์ 01/08/2026 — สถานี A")]
+        assert reply.choices == [
+            service.Choice(id="__pause__", label="⏸️ พักไว้ก่อน"),
+            service.Choice(id="batch-1", label="แบทช์ 01/08/2026 — สถานี A"),
+        ]
         # still on the picker step, not advanced to the real form or resolved
         assert conversation.parent_answer == {"pending_kind": "batch"}
         assert conversation.current_question_id is None
+
+
+class TestHandleAnswerPause:
+    """US2-3: tapping the pause choice must never write a ConversationAnswer
+    row or touch current_question_id -- pausing isn't answering. Checked
+    against all three shapes handle_answer can be in when the pause label
+    arrives: a real question, the parent-picker step, and no open question
+    at all.
+    """
+
+    async def test_pauses_without_storing_an_answer(self) -> None:
+        form, (q1,) = _form(mandatory_flags=[True])
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=q1,
+        )
+        session = _mock_session(answers=[], conversation=conversation)
+
+        reply = await service.handle_answer(
+            session, conversation_id=conversation_id, raw_text="⏸️ พักไว้ก่อน", form=form
+        )
+
+        assert reply is not None
+        assert "พัก" in reply.text
+        assert conversation.status == ConversationStatus.PAUSED
+        assert conversation.current_question_id == q1  # unchanged -- not answered, just paused
+        session.add.assert_not_called()
+
+    async def test_pauses_during_parent_picker_step(self) -> None:
+        form, _ = _form(mandatory_flags=[True])
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=None,
+            parent_answer={"pending_kind": "batch"},
+        )
+        session = _mock_session(answers=[], conversation=conversation)
+
+        reply = await service.handle_answer(
+            session, conversation_id=conversation_id, raw_text="⏸️ พักไว้ก่อน", form=form
+        )
+
+        assert reply is not None
+        assert conversation.status == ConversationStatus.PAUSED
+        # still pending -- pausing didn't resolve the parent pick either
+        assert conversation.parent_answer == {"pending_kind": "batch"}
+
+    async def test_pauses_with_no_open_question(self) -> None:
+        """Awaiting confirmation has no pause button in the real UI (only
+        confirm/cancel), but the underlying check is a plain raw-text match
+        with no question-list dependency -- confirming it doesn't crash here
+        (ConversationNotFound) is cheap insurance, not just theoretical.
+        """
+        form, (q1,) = _form(mandatory_flags=[True])
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=None,
+        )
+        session = _mock_session(answers=[_answer(q1)], conversation=conversation)
+
+        reply = await service.handle_answer(
+            session, conversation_id=conversation_id, raw_text="⏸️ พักไว้ก่อน", form=form
+        )
+
+        assert reply is not None
+        assert conversation.status == ConversationStatus.PAUSED
+
+
+class TestPauseActiveConversation:
+    async def test_pauses_the_active_conversation(self) -> None:
+        conversation = Conversation(
+            conversation_id=uuid.uuid4(),
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=uuid.uuid4(),
+        )
+        session = _mock_session(answers=[], conversation=conversation)
+
+        await service.pause_active_conversation(session, user_id=conversation.user_id)
+
+        assert conversation.status == ConversationStatus.PAUSED
+
+    async def test_no_op_when_nothing_active(self) -> None:
+        session = _mock_session(answers=[], conversation=None)
+
+        await service.pause_active_conversation(session, user_id=uuid.uuid4())
+
+        session.commit.assert_not_called()
+
+
+class TestFindResumableConversation:
+    async def test_finds_a_paused_conversation(self) -> None:
+        user_id, task_id = uuid.uuid4(), uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=uuid.uuid4(),
+            user_id=user_id,
+            task_id=task_id,
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.PAUSED,
+            current_question_id=uuid.uuid4(),
+        )
+        session = _mock_session(answers=[], conversation=conversation)
+
+        found = await service.find_resumable_conversation(session, user_id=user_id, task_id=task_id)
+
+        assert found is conversation
+
+    async def test_none_when_nothing_open(self) -> None:
+        session = _mock_session(answers=[], conversation=None)
+
+        found = await service.find_resumable_conversation(
+            session, user_id=uuid.uuid4(), task_id=uuid.uuid4()
+        )
+
+        assert found is None
+
+
+class TestResumeConversation:
+    async def test_mid_question_resume_recaps_answers_then_asks_next(self) -> None:
+        form, (q1, q2) = _form(mandatory_flags=[True, True])
+        conversation = Conversation(
+            conversation_id=uuid.uuid4(),
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.PAUSED,
+            current_question_id=q2,
+        )
+        session = _mock_session(answers=[_answer(q1, text="คำตอบที่ 1")])
+
+        reply = await service.resume_conversation(session, conversation=conversation, form=form)
+
+        assert conversation.status == ConversationStatus.ACTIVE
+        assert reply.substate == ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION
+        assert "question 0" in reply.text  # recap of what was already answered
+        assert "คำตอบที่ 1" in reply.text
+        assert reply.text.endswith("question 1")  # the still-open question, asked fresh
+        assert reply.choices == [
+            service.Choice(id="__pause__", label="⏸️ พักไว้ก่อน"),
+        ]
+
+    async def test_resume_with_nothing_answered_yet_has_no_recap(self) -> None:
+        form, (q1,) = _form(mandatory_flags=[True])
+        conversation = Conversation(
+            conversation_id=uuid.uuid4(),
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.PAUSED,
+            current_question_id=q1,
+        )
+        session = _mock_session(answers=[])
+
+        reply = await service.resume_conversation(session, conversation=conversation, form=form)
+
+        assert reply.text == "question 0"  # no recap prefix -- nothing answered yet
+
+    async def test_resume_at_confirmation_step_shows_summary(self) -> None:
+        form, (q1,) = _form(mandatory_flags=[True])
+        conversation = Conversation(
+            conversation_id=uuid.uuid4(),
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.PAUSED,
+            current_question_id=None,
+        )
+        session = _mock_session(answers=[_answer(q1, text="คำตอบที่ 1")])
+
+        reply = await service.resume_conversation(session, conversation=conversation, form=form)
+
+        assert conversation.status == ConversationStatus.ACTIVE
+        assert reply.substate == ActiveSubstate.AWAITING_CONFIRMATION
+        assert "สรุปคำตอบของคุณ" in reply.text
+        assert "คำตอบที่ 1" in reply.text
+
+    async def test_resume_during_parent_picker_step(self) -> None:
+        form, _ = _form(mandatory_flags=[True])
+        conversation = Conversation(
+            conversation_id=uuid.uuid4(),
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.PAUSED,
+            current_question_id=None,
+            parent_answer={"pending_kind": "batch"},
+        )
+        session = _mock_session(answers=[])
+        choices = [parent_picker.ParentOption(id="batch-1", label="แบทช์ 01/08/2026 — สถานี A")]
+
+        with patch("src.line.parent_picker.choices_for", new=AsyncMock(return_value=choices)):
+            reply = await service.resume_conversation(session, conversation=conversation, form=form)
+
+        assert conversation.status == ConversationStatus.ACTIVE
+        assert reply.text == parent_picker.PROMPT["batch"]  # no recap -- nothing answered yet
+        assert reply.choices == [
+            service.Choice(id="__pause__", label="⏸️ พักไว้ก่อน"),
+            service.Choice(id="batch-1", label="แบทช์ 01/08/2026 — สถานี A"),
+        ]
+
+    async def test_resume_raises_if_current_question_no_longer_in_form(self) -> None:
+        """The form changed out from under a long-paused conversation (a
+        question was removed) -- fail loudly rather than silently asking
+        about a question that isn't there anymore.
+        """
+        form, _ = _form(mandatory_flags=[True])  # only question 0 exists
+        conversation = Conversation(
+            conversation_id=uuid.uuid4(),
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.PAUSED,
+            current_question_id=uuid.uuid4(),  # not in the form at all
+        )
+        session = _mock_session(answers=[])
+
+        with pytest.raises(ConversationNotFound):
+            await service.resume_conversation(session, conversation=conversation, form=form)
 
 
 class TestConfirmConversation:
