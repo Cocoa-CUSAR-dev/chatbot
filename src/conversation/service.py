@@ -38,6 +38,7 @@ from src.conversation.constants import ActiveSubstate, AnswerSource, Conversatio
 from src.conversation.exceptions import ConversationNotFound
 from src.conversation.models import Conversation, ConversationAnswer
 from src.conversation.state_machine import on_guided_answer
+from src.conversation.validation import validate_answer
 from src.forms.schemas import FormDetail
 from src.tasks.client import submit_task
 from src.tasks.schemas import TaskSubmission
@@ -207,11 +208,14 @@ def _format_confirmation_summary(
     return "สรุปคำตอบของคุณ:\n" + "\n".join(lines) + "\n\nยืนยันการส่งข้อมูลหรือไม่?"
 
 
-def _reply_for_question(conversation_id: UUID, question: Question) -> ConversationReply:
+def _reply_for_question(
+    conversation_id: UUID, question: Question, *, error: str | None = None
+) -> ConversationReply:
+    text = f"{error}\n\n{question.label}" if error else question.label
     return ConversationReply(
         conversation_id=conversation_id,
         substate=ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION,
-        text=question.label,
+        text=text,
         choices=question.choices,
     )
 
@@ -317,6 +321,16 @@ async def handle_answer(
         # else: non-mandatory free-text question offering only a skip button
         # -- typed text that isn't the skip label is a real answer, not a
         # mismatch, so it falls through to the normal free-text path below.
+
+    # Format validation (the Validate Answer step) only applies to genuine
+    # free text -- a skip is an intentional absence (nothing to check), and
+    # a resolved OPTION/BOOLEAN choice is already constrained to a
+    # known-good value by construction (matched against current_question's
+    # own choices above).
+    if not is_skip and resolved_value is None and current_question is not None:
+        error = validate_answer(current_question.field_name, raw_text)
+        if error is not None:
+            return _reply_for_question(conversation_id, current_question, error=error)
 
     if is_skip:
         answer: dict[str, Any] = {"skipped": True}

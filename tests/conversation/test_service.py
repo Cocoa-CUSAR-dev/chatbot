@@ -23,6 +23,26 @@ def _form(*, mandatory_flags: list[bool]) -> tuple[FormDetail, list[uuid.UUID]]:
     return FormDetail(task_form_id="tf-1", sections=[{"questions": questions}]), question_ids
 
 
+def _validated_field_form(field_name: str) -> tuple[FormDetail, uuid.UUID]:
+    """A single mandatory free-text question whose field_name has a real
+    entry in validation._RULES -- lets tests drive the Validate Answer step
+    without caring about input_type (validate_answer keys off field_name
+    alone, same as the real form.field_validation_rule table will).
+    """
+    question_id = uuid.uuid4()
+    questions = [
+        {
+            "question_id": str(question_id),
+            "label": "จำนวนพัดลม",
+            "field_name": field_name,
+            "input_type": "VARCHAR",
+            "is_mandatory": True,
+            "sort_order": 0,
+        }
+    ]
+    return FormDetail(task_form_id="tf-validated", sections=[{"questions": questions}]), question_id
+
+
 def _boolean_form() -> tuple[FormDetail, uuid.UUID]:
     """A single mandatory BOOLEAN question -- matches the real
     farm_pest_disease_record.is_quality_damage shape that actually failed
@@ -286,3 +306,85 @@ class TestHandleAnswerWithChoices:
         ]
         session.add.assert_not_called()  # bad answer never gets persisted
         assert conversation.current_question_id == question_id  # unchanged, still open
+
+
+class TestHandleAnswerValidation:
+    """The (New) Validate Answer step: a free-text answer that fails its
+    field's format rule must be rejected -- re-ask the same question with
+    the rule's own errorMessage, never persisted.
+    """
+
+    async def test_invalid_answer_reasks_with_error_message(self) -> None:
+        form, question_id = _validated_field_form("fan_count")  # INT, 0-50
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=question_id,
+        )
+        session = _mock_session(answers=[], conversation=conversation)
+
+        reply = await service.handle_answer(
+            session, conversation_id=conversation_id, raw_text="999", form=form
+        )
+
+        assert reply is not None
+        assert reply.substate == ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION
+        assert "กรุณากรอกจำนวนพัดลมเป็นจำนวนเต็ม 0-50" in reply.text
+        assert "จำนวนพัดลม" in reply.text  # question re-asked, not dropped
+        session.add.assert_not_called()  # invalid answer never gets persisted
+        assert conversation.current_question_id == question_id  # unchanged, still open
+
+    async def test_valid_answer_is_stored_and_advances(self) -> None:
+        form, question_id = _validated_field_form("fan_count")
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=question_id,
+        )
+        # answers=[...] simulates the DB state the post-add re-query will see --
+        # the mock can't react to session.add() dynamically (see _mock_session's
+        # own docstring / test_reaches_confirmation_once_all_required_answered).
+        session = _mock_session(answers=[_answer(question_id, text="5")], conversation=conversation)
+
+        reply = await service.handle_answer(
+            session, conversation_id=conversation_id, raw_text="5", form=form
+        )
+
+        assert reply is not None
+        assert reply.substate == ActiveSubstate.AWAITING_CONFIRMATION
+        added_answer = session.add.call_args.args[0]
+        assert added_answer.answer == {"text": "5"}
+
+    async def test_field_with_no_rule_skips_validation_entirely(self) -> None:
+        """Existing behavior for untracked fields (e.g. field_0/field_1 used
+        throughout this file's other fixtures) must be unaffected.
+        """
+        form, (q1,) = _form(mandatory_flags=[True])
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=q1,
+        )
+        session = _mock_session(
+            answers=[_answer(q1, text="anything goes")], conversation=conversation
+        )
+
+        reply = await service.handle_answer(
+            session, conversation_id=conversation_id, raw_text="anything goes", form=form
+        )
+
+        assert reply is not None
+        assert reply.substate == ActiveSubstate.AWAITING_CONFIRMATION
+        session.add.assert_called_once()
