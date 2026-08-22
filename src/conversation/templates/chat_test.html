@@ -28,8 +28,10 @@
   }
   .quick-reply-chip:hover { background: #eafaf1; }
 
-  #inputRow { display: flex; gap: 0.4rem; }
+  #inputRow { display: flex; gap: 0.4rem; align-items: center; }
   #inputRow input { flex: 1; padding: 0.5rem; }
+  #charCount { font-size: 0.75rem; color: #888; white-space: nowrap; }
+  #charCount.over { color: #c0392b; font-weight: 600; }
   #debugInfo {
     display: none; font-size: 0.75rem; color: #888; margin: 0.35rem 0 0.6rem;
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -61,6 +63,7 @@
       <div id="log"></div>
       <div id="inputRow" style="display: none;">
         <input id="answerText" type="text" placeholder="type an answer..." />
+        <span id="charCount"></span>
         <button id="send">Send</button>
       </div>
       <div id="debugInfo"></div>
@@ -143,6 +146,22 @@
 let conversationId = null;
 let taskFormId = null;
 let done = false;
+let currentValidationRule = null;
+
+// Live count of what's actually in the input box right now -- computed by
+// the same JS runtime that's about to submit it, so there's no copy-paste
+// step (into a separate counting tool, or through chat) that could silently
+// drop or duplicate characters in a long/repetitive string before you ever
+// see the number.
+function updateCharCount() {
+  const el = document.getElementById('charCount');
+  const length = document.getElementById('answerText').value.length;
+  const maxLength = currentValidationRule && currentValidationRule.type === 'VARCHAR'
+    ? currentValidationRule.max_length
+    : null;
+  el.textContent = maxLength != null ? `${length} / ${maxLength}` : `${length}`;
+  el.classList.toggle('over', maxLength != null && length > maxLength);
+}
 
 function setState(id) {
   document.querySelectorAll('.state-box.active').forEach((el) => el.classList.remove('active'));
@@ -219,13 +238,16 @@ function updateDebugInfo(reply) {
   const el = document.getElementById('debugInfo');
   if (reply.substate !== 'guided_asking_fixed_question') {
     el.style.display = 'none';
-    return;
+    currentValidationRule = null;
+  } else {
+    const ruleText = reply.validation_rule
+      ? JSON.stringify(reply.validation_rule)
+      : '(none)';
+    el.textContent = `type: ${reply.input_type || '(unknown)'}  |  validation_rule: ${ruleText}`;
+    el.style.display = 'block';
+    currentValidationRule = reply.validation_rule || null;
   }
-  const ruleText = reply.validation_rule
-    ? JSON.stringify(reply.validation_rule)
-    : '(none)';
-  el.textContent = `type: ${reply.input_type || '(unknown)'}  |  validation_rule: ${ruleText}`;
-  el.style.display = 'block';
+  updateCharCount();
 }
 
 function showReply(reply) {
@@ -298,6 +320,7 @@ async function sendAnswer() {
   if (!text) return;
   appendMsg(text, 'me');
   input.value = '';
+  updateCharCount();
   await submitAnswer(text);
 }
 
@@ -329,6 +352,7 @@ document.getElementById('send').onclick = sendAnswer;
 document.getElementById('answerText').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') sendAnswer();
 });
+document.getElementById('answerText').addEventListener('input', updateCharCount);
 document.getElementById('confirmBtn').onclick = confirm;
 document.getElementById('cancelBtn').onclick = cancelConversation;
 document.getElementById('restart').onclick = () => {
