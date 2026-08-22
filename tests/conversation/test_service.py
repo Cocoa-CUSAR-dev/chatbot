@@ -307,6 +307,7 @@ class TestHandleAnswerWithChoices:
             service.Choice(id="true", label="ใช่"),
             service.Choice(id="false", label="ไม่"),
         ]
+        assert "กรุณาเลือกคำตอบจากตัวเลือกที่กำหนดเท่านั้น" in reply.text
         session.add.assert_not_called()  # bad answer never gets persisted
         assert conversation.current_question_id == question_id  # unchanged, still open
 
