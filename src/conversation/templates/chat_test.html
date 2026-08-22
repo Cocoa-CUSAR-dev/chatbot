@@ -30,6 +30,11 @@
 
   #inputRow { display: flex; gap: 0.4rem; }
   #inputRow input { flex: 1; padding: 0.5rem; }
+  #debugInfo {
+    display: none; font-size: 0.75rem; color: #888; margin: 0.35rem 0 0.6rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    white-space: pre-wrap; word-break: break-all;
+  }
   #confirmRow { display: none; }
   #restart { margin-top: 1rem; }
 
@@ -58,6 +63,7 @@
         <input id="answerText" type="text" placeholder="type an answer..." />
         <button id="send">Send</button>
       </div>
+      <div id="debugInfo"></div>
       <div id="confirmRow">
         <button id="confirmBtn">Confirm &amp; Submit</button>
         <button id="cancelBtn">Cancel</button>
@@ -205,6 +211,23 @@ function hideTyping() {
   document.getElementById('typingIndicator')?.remove();
 }
 
+// Dev-only aid, not part of what a farmer would ever see on LINE -- shows
+// the open question's own input_type and validation_rule (see
+// service.ConversationReply's fields of the same name) so a developer can
+// tell what's actually being checked without guessing or reading the DB.
+function updateDebugInfo(reply) {
+  const el = document.getElementById('debugInfo');
+  if (reply.substate !== 'guided_asking_fixed_question') {
+    el.style.display = 'none';
+    return;
+  }
+  const ruleText = reply.validation_rule
+    ? JSON.stringify(reply.validation_rule)
+    : '(none)';
+  el.textContent = `type: ${reply.input_type || '(unknown)'}  |  validation_rule: ${ruleText}`;
+  el.style.display = 'block';
+}
+
 function showReply(reply) {
   hideTyping();
   if (reply.choices && reply.choices.length > 0) {
@@ -224,6 +247,7 @@ function showReply(reply) {
   const awaitingConfirm = reply.substate === 'awaiting_confirmation';
   document.getElementById('inputRow').style.display = (awaitingConfirm || done) ? 'none' : 'flex';
   document.getElementById('confirmRow').style.display = (awaitingConfirm && !done) ? 'block' : 'none';
+  updateDebugInfo(reply);
 
   if (done) {
     setState('state-completed');
@@ -311,6 +335,7 @@ document.getElementById('restart').onclick = () => {
   document.getElementById('log').innerHTML = '';
   document.getElementById('inputRow').style.display = 'none';
   document.getElementById('confirmRow').style.display = 'none';
+  document.getElementById('debugInfo').style.display = 'none';
   conversationId = null;
   taskFormId = null;
   setState(null);

@@ -82,6 +82,7 @@ class Question:
     question_id: UUID
     label: str
     field_name: str
+    input_type: str
     is_mandatory: bool
     sort_order: int
     choices: list[Choice] | None = None
@@ -106,6 +107,13 @@ class ConversationReply:
     # lets the caller re-attach the confirm button for a retry instead of
     # treating this as the terminal "saved" message.
     submission_failed: bool = False
+    # Debug-only passthrough of the open question's own shape -- None
+    # whenever this reply isn't "here's a fixed question to answer" (e.g.
+    # confirmation/completed/cancelled replies have no single open question).
+    # Not used by the real LINE webhook path; exists so the dev test UI can
+    # show a developer what's actually being validated without guessing.
+    input_type: str | None = None
+    validation_rule: dict[str, Any] | None = None
 
 
 def _constrained_choices_for(q: dict[str, Any]) -> list[Choice] | None:
@@ -156,6 +164,7 @@ def _question_from_dict(q: dict[str, Any]) -> Question:
         question_id=UUID(str(q["question_id"])),
         label=str(q.get("label") or ""),
         field_name=str(q.get("field_name") or ""),
+        input_type=str(q.get("input_type") or ""),
         is_mandatory=is_mandatory,
         sort_order=int(q.get("sort_order", 0)),
         choices=choices,
@@ -223,6 +232,8 @@ def _reply_for_question(
         substate=ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION,
         text=text,
         choices=question.choices,
+        input_type=question.input_type,
+        validation_rule=question.validation_rule,
     )
 
 

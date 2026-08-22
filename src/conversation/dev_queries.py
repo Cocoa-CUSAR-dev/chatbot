@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.conversation.exceptions import ConversationNotFound
 from src.conversation.schemas import FormSummary
+from src.forms.client import _convert_keys
 from src.forms.exceptions import FormNotFound
 from src.forms.schemas import FormDetail
 
@@ -142,7 +143,16 @@ async def load_form_detail(session: AsyncSession, task_form_id: UUID) -> FormDet
         # None, not a "null" string, so only the str case needs handling.
         raw_rule = question.get("validation_rule")
         if isinstance(raw_rule, str):
-            question["validation_rule"] = json.loads(raw_rule)
+            # The jsonb column itself stores camelCase keys (errorMessage,
+            # maxLength, ...) -- forms/client.py's get_form() normally does
+            # this same camelCase -> snake_case conversion for the real
+            # Kotlin response before service.py/validation.py ever see it.
+            # This dev-only path reads the column directly, bypassing that
+            # conversion entirely, so it has to apply it here too -- without
+            # this, every _valid_* helper's rule.get("max_length") etc. would
+            # silently miss (still spelled maxLength) and every answer would
+            # pass unvalidated, exactly what happened testing this locally.
+            question["validation_rule"] = _convert_keys(json.loads(raw_rule))
 
     return FormDetail(task_form_id=str(task_form_id), sections=[{"questions": questions}])
 
