@@ -322,7 +322,7 @@ async def handle_answer(
                 # Doesn't match any listed choice -- re-ask rather than store
                 # text that can't resolve to a real domain value later. Keeps
                 # the same question open, same choices offered again.
-                return _reply_for_question( conversation_id, current_question
+                return _reply_for_question(
                     conversation_id,
                     current_question,
                     error="กรุณาเลือกคำตอบจากตัวเลือกที่กำหนดเท่านั้น",
