@@ -23,21 +23,24 @@ def _form(*, mandatory_flags: list[bool]) -> tuple[FormDetail, list[uuid.UUID]]:
     return FormDetail(task_form_id="tf-1", sections=[{"questions": questions}]), question_ids
 
 
-def _validated_field_form(field_name: str) -> tuple[FormDetail, uuid.UUID]:
-    """A single mandatory free-text question whose field_name has a real
-    entry in validation._RULES -- lets tests drive the Validate Answer step
-    without caring about input_type (validate_answer keys off field_name
-    alone, same as the real form.field_validation_rule table will).
+def _validated_field_form(
+    validation_rule: dict[str, object] | None,
+) -> tuple[FormDetail, uuid.UUID]:
+    """A single mandatory free-text question carrying `validation_rule`
+    directly, the same shape _question_from_dict reads off a real question
+    dict post-forms/client.py-conversion -- lets tests drive the Validate
+    Answer step without needing a live Kotlin response.
     """
     question_id = uuid.uuid4()
     questions = [
         {
             "question_id": str(question_id),
             "label": "จำนวนพัดลม",
-            "field_name": field_name,
+            "field_name": "fan_count",
             "input_type": "VARCHAR",
             "is_mandatory": True,
             "sort_order": 0,
+            "validation_rule": validation_rule,
         }
     ]
     return FormDetail(task_form_id="tf-validated", sections=[{"questions": questions}]), question_id
@@ -308,14 +311,23 @@ class TestHandleAnswerWithChoices:
         assert conversation.current_question_id == question_id  # unchanged, still open
 
 
+_FAN_COUNT_RULE = {
+    "type": "INT",
+    "min": 0,
+    "max": 50,
+    "integer_only": True,
+    "error_message": "กรุณากรอกจำนวนพัดลมเป็นจำนวนเต็ม 0-50",
+}
+
+
 class TestHandleAnswerValidation:
     """The (New) Validate Answer step: a free-text answer that fails its
     field's format rule must be rejected -- re-ask the same question with
-    the rule's own errorMessage, never persisted.
+    the rule's own error_message, never persisted.
     """
 
     async def test_invalid_answer_reasks_with_error_message(self) -> None:
-        form, question_id = _validated_field_form("fan_count")  # INT, 0-50
+        form, question_id = _validated_field_form(_FAN_COUNT_RULE)
         conversation_id = uuid.uuid4()
         conversation = Conversation(
             conversation_id=conversation_id,
@@ -339,7 +351,7 @@ class TestHandleAnswerValidation:
         assert conversation.current_question_id == question_id  # unchanged, still open
 
     async def test_valid_answer_is_stored_and_advances(self) -> None:
-        form, question_id = _validated_field_form("fan_count")
+        form, question_id = _validated_field_form(_FAN_COUNT_RULE)
         conversation_id = uuid.uuid4()
         conversation = Conversation(
             conversation_id=conversation_id,

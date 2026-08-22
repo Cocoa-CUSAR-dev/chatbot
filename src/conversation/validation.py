@@ -2,121 +2,28 @@
 Answer step between GUIDED_AWAITING_FIXED_ANSWER and either the next
 question or a re-ask with guidance on the expected format.
 
-Rules should eventually come from Kotlin (form.field_validation_rule, keyed
-by field_name), the same way question scripts already do via
-forms/client.py's get_form(). That table isn't exposed over the API yet, so
-_RULES below is a local, hand-copied mirror of the researcher side's own
-seed data (see `INSERT INTO form.field_validation_rule` in this task's
-history) standing in until it is. Swapping to a real lookup later only means
-replacing `_RULES.get(field_name)` inside `validate_answer` -- its signature
-(field_name, raw_text) -> error message or None doesn't need to change, so
-nothing in service.py has to know which source is live.
+Rules come from Kotlin's form.field_validation_rule, keyed by field_name and
+joined onto each question server-side (web-backend's FormRepository.kt --
+queryFormRecords LEFT JOINs FIELD_VALIDATION_RULE on field_name,
+toQuestionEntity maps it into Question.Entity.validationRule). GET
+/service/forms/{formId} (the exact route forms/client.py's get_form() calls)
+returns it null for OPTION/BOOLEAN/upload questions (already constrained
+another way) and as the rule's own JSON object otherwise -- validate_answer
+below takes that dict directly, already attached to the question by
+service.py's _question_from_dict, no lookup needed here.
+
+Mind the key casing: forms/client.py's _convert_keys recursively
+camelCase -> snake_cases *every* nested dict in Kotlin's response, including
+the contents of validationRule itself, not just the outer question/section
+keys it exists for. So by the time a rule dict reaches this module, its keys
+are already error_message/max_length/integer_only/max_date/valid_lat_lng --
+not the jsonb column's own camelCase spelling (type/min/max are single
+words, unaffected). Reading the camelCase spelling here would silently
+never match, letting every answer through unvalidated.
 """
 
 from datetime import date, datetime
 from typing import Any, Protocol
-
-_RULES: dict[str, dict[str, Any]] = {
-    "amount": {"type": "FLOAT", "min": 0, "max": 1000, "errorMessage": "กรุณากรอกปริมาณ 0-1,000"},
-    "bean_color_inside": {
-        "type": "VARCHAR",
-        "maxLength": 200,
-        "errorMessage": "กรุณากรอกไม่เกิน 200 ตัวอักษร",
-    },
-    "bean_color_outside": {
-        "type": "VARCHAR",
-        "maxLength": 200,
-        "errorMessage": "กรุณากรอกไม่เกิน 200 ตัวอักษร",
-    },
-    "cut_test_result": {
-        "type": "VARCHAR",
-        "maxLength": 500,
-        "errorMessage": "กรุณากรอกไม่เกิน 500 ตัวอักษร",
-    },
-    "description": {
-        "type": "VARCHAR",
-        "maxLength": 500,
-        "errorMessage": "กรุณากรอกไม่เกิน 500 ตัวอักษร",
-    },
-    "drying_facility_type_code": {
-        "type": "VARCHAR",
-        "maxLength": 200,
-        "errorMessage": "กรุณากรอกไม่เกิน 200 ตัวอักษร",
-    },
-    "ends_at": {"type": "DATETIME", "maxDate": "today", "errorMessage": "ห้ามระบุเวลาที่ยังไม่ถึง"},
-    "fan_count": {
-        "type": "INT",
-        "min": 0,
-        "max": 50,
-        "integerOnly": True,
-        "errorMessage": "กรุณากรอกจำนวนพัดลมเป็นจำนวนเต็ม 0-50",
-    },
-    "fan_power": {
-        "type": "FLOAT",
-        "min": 0,
-        "max": 5000,
-        "errorMessage": "กรุณากรอกกำลังไฟฟ้า 0-5,000 (วัตต์)",
-    },
-    "gis": {"type": "GEODATA", "validLatLng": True, "errorMessage": "พิกัดไม่ถูกต้อง"},
-    "harvest_date": {
-        "type": "DATE",
-        "maxDate": "today",
-        "errorMessage": "ห้ามระบุวันที่ในอนาคต",
-    },
-    "humi": {"type": "FLOAT", "min": 0, "max": 100, "errorMessage": "ความชื้นต้องอยู่ระหว่าง 0-100%"},
-    "logistic_result": {
-        "type": "VARCHAR",
-        "maxLength": 500,
-        "errorMessage": "กรุณากรอกไม่เกิน 500 ตัวอักษร",
-    },
-    "management_method": {
-        "type": "VARCHAR",
-        "maxLength": 500,
-        "errorMessage": "กรุณากรอกไม่เกิน 500 ตัวอักษร",
-    },
-    "notes": {"type": "VARCHAR", "maxLength": 500, "errorMessage": "กรุณากรอกไม่เกิน 500 ตัวอักษร"},
-    "quantity_kg": {
-        "type": "FLOAT",
-        "min": 0,
-        "max": 5000,
-        "errorMessage": "กรุณากรอกปริมาณ 0-5,000 (กก.)",
-    },
-    "smell": {"type": "VARCHAR", "maxLength": 200, "errorMessage": "กรุณากรอกไม่เกิน 200 ตัวอักษร"},
-    "started_at": {
-        "type": "DATETIME",
-        "maxDate": "today",
-        "errorMessage": "ห้ามระบุเวลาที่ยังไม่ถึง",
-    },
-    "tank_volume_liter": {
-        "type": "FLOAT",
-        "min": 0,
-        "max": 10000,
-        "errorMessage": "กรุณากรอกขนาดถัง 0-10,000 (ลิตร)",
-    },
-    "temp_inside": {
-        "type": "FLOAT",
-        "min": 0,
-        "max": 100,
-        "errorMessage": "กรุณากรอกอุณหภูมิ 0-100 (องศาเซลเซียส)",
-    },
-    "temp_outside": {
-        "type": "FLOAT",
-        "min": 0,
-        "max": 60,
-        "errorMessage": "กรุณากรอกอุณหภูมิ 0-60 (องศาเซลเซียส)",
-    },
-    "weather_condition_code": {
-        "type": "VARCHAR",
-        "maxLength": 200,
-        "errorMessage": "กรุณากรอกไม่เกิน 200 ตัวอักษร",
-    },
-    "weight_gram_per_pod": {
-        "type": "FLOAT",
-        "min": 0,
-        "max": 500,
-        "errorMessage": "กรุณากรอกน้ำหนัก 0-500 (กรัม)",
-    },
-}
 
 
 class _Validator(Protocol):
@@ -147,7 +54,7 @@ def _valid_int(text: str, rule: dict[str, Any]) -> bool:
 
 
 def _valid_varchar(text: str, rule: dict[str, Any]) -> bool:
-    max_length = rule.get("maxLength")
+    max_length = rule.get("max_length")
     return max_length is None or len(text) <= max_length
 
 
@@ -156,7 +63,7 @@ def _valid_date(text: str, rule: dict[str, Any]) -> bool:
         value = date.fromisoformat(text.strip())
     except ValueError:
         return False
-    return not (rule.get("maxDate") == "today" and value > date.today())
+    return not (rule.get("max_date") == "today" and value > date.today())
 
 
 def _valid_datetime(text: str, rule: dict[str, Any]) -> bool:
@@ -164,7 +71,7 @@ def _valid_datetime(text: str, rule: dict[str, Any]) -> bool:
         value = datetime.fromisoformat(text.strip())
     except ValueError:
         return False
-    return not (rule.get("maxDate") == "today" and value > datetime.now())
+    return not (rule.get("max_date") == "today" and value > datetime.now())
 
 
 def _valid_geodata(text: str, rule: dict[str, Any]) -> bool:
@@ -177,7 +84,7 @@ def _valid_geodata(text: str, rule: dict[str, Any]) -> bool:
         lat, lng = float(parts[0].strip()), float(parts[1].strip())
     except ValueError:
         return False
-    if not rule.get("validLatLng"):
+    if not rule.get("valid_lat_lng"):
         return True
     return -90 <= lat <= 90 and -180 <= lng <= 180
 
@@ -192,16 +99,16 @@ _VALIDATORS: dict[str, _Validator] = {
 }
 
 
-def validate_answer(field_name: str, raw_text: str) -> str | None:
-    """None if `raw_text` satisfies field_name's rule, or if the field has no
-    rule at all -- unvalidated fields pass through unchanged, same as before
-    this existed. Otherwise returns the rule's own errorMessage, ready to
-    show the farmer as-is alongside the re-asked question.
+def validate_answer(rule: dict[str, Any] | None, raw_text: str) -> str | None:
+    """None if `raw_text` satisfies `rule`, or if `rule` is None -- questions
+    with no validation_rule (OPTION/BOOLEAN/upload, or any field_name with
+    no row in form.field_validation_rule) pass through unchanged. Otherwise
+    returns the rule's own error_message, ready to show the farmer as-is
+    alongside the re-asked question.
     """
-    rule = _RULES.get(field_name)
     if rule is None:
         return None
     validator = _VALIDATORS.get(rule.get("type", ""))
     if validator is None or validator(raw_text, rule):
         return None
-    return str(rule.get("errorMessage") or "รูปแบบคำตอบไม่ถูกต้อง กรุณาลองใหม่อีกครั้ง")
+    return str(rule.get("error_message") or "รูปแบบคำตอบไม่ถูกต้อง กรุณาลองใหม่อีกครั้ง")

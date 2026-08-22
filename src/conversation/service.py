@@ -89,6 +89,11 @@ class Question:
     # from "has a skip button but is otherwise free text", which must still
     # accept arbitrary typed text rather than re-asking on a non-match.
     has_constrained_choices: bool = False
+    # From Kotlin's form.field_validation_rule, already joined onto this
+    # question server-side (FormRepository.kt) -- null for OPTION/BOOLEAN/
+    # upload (constrained another way already) or any field_name with no
+    # rule row. See validation.py's own docstring for the key-casing wrinkle.
+    validation_rule: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -155,6 +160,7 @@ def _question_from_dict(q: dict[str, Any]) -> Question:
         sort_order=int(q.get("sort_order", 0)),
         choices=choices,
         has_constrained_choices=has_constrained_choices,
+        validation_rule=q.get("validation_rule"),
     )
 
 
@@ -316,7 +322,7 @@ async def handle_answer(
                 # Doesn't match any listed choice -- re-ask rather than store
                 # text that can't resolve to a real domain value later. Keeps
                 # the same question open, same choices offered again.
-                return _reply_for_question(conversation_id, current_question)
+                return _reply_for_question( conversation_id, current_question)
             resolved_value = matched.id
         # else: non-mandatory free-text question offering only a skip button
         # -- typed text that isn't the skip label is a real answer, not a
@@ -328,7 +334,7 @@ async def handle_answer(
     # known-good value by construction (matched against current_question's
     # own choices above).
     if not is_skip and resolved_value is None and current_question is not None:
-        error = validate_answer(current_question.field_name, raw_text)
+        error = validate_answer(current_question.validation_rule, raw_text)
         if error is not None:
             return _reply_for_question(conversation_id, current_question, error=error)
 

@@ -16,6 +16,7 @@ handlers (task-dissection-design.md) and reuses the existing `farmer01`
 account (role=farmer) as the test conversation owner.
 """
 
+import json
 import logging
 import re
 from typing import cast
@@ -108,14 +109,19 @@ async def load_form_detail(session: AsyncSession, task_form_id: UUID) -> FormDet
     """Direct-query counterpart to forms.client.get_form() -- builds the same
     FormDetail shape service.py expects, from the local `form.*` tables
     instead of a real Kotlin call. OPTION-type questions get a real
-    `choices` list attached, same shape Kotlin's own response uses.
+    `choices` list attached, same shape Kotlin's own response uses; every
+    question gets `validation_rule` from form.field_validation_rule, same
+    LEFT JOIN on field_name web-backend's FormRepository.kt now does (null
+    for OPTION/BOOLEAN/upload or any field_name with no rule row).
     """
     rows = await session.execute(
         text(
             """
-            SELECT q.question_id, q.label, q.field_name, q.input_type, q.is_mandatory, q.sort_order
+            SELECT q.question_id, q.label, q.field_name, q.input_type, q.is_mandatory,
+                   q.sort_order, fvr.validation_rule
             FROM form.question q
             JOIN form.section s ON s.section_id = q.section_id
+            LEFT JOIN form.field_validation_rule fvr ON fvr.field_name = q.field_name
             WHERE s.form_id = :task_form_id
             ORDER BY q.sort_order
             """
@@ -129,6 +135,14 @@ async def load_form_detail(session: AsyncSession, task_form_id: UUID) -> FormDet
     for question in questions:
         if question["input_type"] == "OPTION" and question.get("field_name"):
             question["choices"] = await _load_choices(session, question["field_name"])
+        # asyncpg returns jsonb as raw text on a bare text() query (no
+        # column-level JSONB typing to trigger SQLAlchemy's own decoding) --
+        # parse it into the same dict shape service.py expects from a real
+        # Kotlin response. NULL (no matching rule row) already comes back as
+        # None, not a "null" string, so only the str case needs handling.
+        raw_rule = question.get("validation_rule")
+        if isinstance(raw_rule, str):
+            question["validation_rule"] = json.loads(raw_rule)
 
     return FormDetail(task_form_id=str(task_form_id), sections=[{"questions": questions}])
 
