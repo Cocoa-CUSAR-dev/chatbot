@@ -136,13 +136,16 @@ async def load_form_detail(session: AsyncSession, task_form_id: UUID) -> FormDet
     for question in questions:
         if question["input_type"] == "OPTION" and question.get("field_name"):
             question["choices"] = await _load_choices(session, question["field_name"])
-        # asyncpg returns jsonb as raw text on a bare text() query (no
-        # column-level JSONB typing to trigger SQLAlchemy's own decoding) --
-        # parse it into the same dict shape service.py expects from a real
-        # Kotlin response. NULL (no matching rule row) already comes back as
-        # None, not a "null" string, so only the str case needs handling.
+        # SQLAlchemy's asyncpg dialect auto-decodes jsonb into a dict at the
+        # connection level (confirmed directly against this app's own
+        # async_session_maker -- NOT the same as a bare asyncpg.connect(),
+        # which returns raw text; that difference is what made an earlier
+        # version of this fix silently no-op). Handle both shapes so this
+        # doesn't re-break if that decoding behavior ever changes.
         raw_rule = question.get("validation_rule")
-        if isinstance(raw_rule, str):
+        if raw_rule is not None:
+            if isinstance(raw_rule, str):
+                raw_rule = json.loads(raw_rule)
             # The jsonb column itself stores camelCase keys (errorMessage,
             # maxLength, ...) -- forms/client.py's get_form() normally does
             # this same camelCase -> snake_case conversion for the real
@@ -152,7 +155,7 @@ async def load_form_detail(session: AsyncSession, task_form_id: UUID) -> FormDet
             # this, every _valid_* helper's rule.get("max_length") etc. would
             # silently miss (still spelled maxLength) and every answer would
             # pass unvalidated, exactly what happened testing this locally.
-            question["validation_rule"] = _convert_keys(json.loads(raw_rule))
+            question["validation_rule"] = _convert_keys(raw_rule)
 
     return FormDetail(task_form_id=str(task_form_id), sections=[{"questions": questions}])
 
