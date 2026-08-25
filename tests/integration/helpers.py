@@ -117,12 +117,18 @@ def question_json(
     label: str = "คำถามทดสอบ",
     is_mandatory: bool = True,
     sort_order: int = 1,
+    validation_rule: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """A question exactly as Kotlin's GET /service/forms/{formId} would spell
     it -- camelCase, matching web-backend's Question.Entity -- for respx to
     hand back before forms/client.py's get_form() converts it.
+
+    `validation_rule`, if given, should use the same camelCase spelling
+    form.field_validation_rule stores it with (e.g. "errorMessage", not
+    "error_message") -- get_form()'s _convert_keys() converts it recursively,
+    same as it would a real Kotlin response.
     """
-    return {
+    question: dict[str, Any] = {
         "questionId": str(question_id),
         "label": label,
         "fieldName": field_name,
@@ -130,6 +136,9 @@ def question_json(
         "isMandatory": is_mandatory,
         "sortOrder": sort_order,
     }
+    if validation_rule is not None:
+        question["validationRule"] = validation_rule
+    return question
 
 
 def build_form_response(
