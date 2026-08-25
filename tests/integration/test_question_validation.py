@@ -523,3 +523,137 @@ class TestChoiceResolution:
             next_text = reply_message.await_args.args[0].messages[0].text
             assert next_text == "คำถามที่สอง"
             assert await _current_question_id(db_session, conversation_id) == question_2
+
+
+class TestSkipButton:
+    _SKIP_LABEL = "⏭️ ข้าม"
+    _NOTES_RULE = {
+        "type": "VARCHAR",
+        "maxLength": 10,
+        "errorMessage": "กรุณากรอกไม่เกิน 10 ตัวอักษร",
+    }
+
+    async def _seed(
+        self, session: AsyncSession, *, line_user_id: str
+    ) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID]:
+        task_id, task_form_id = await seed_task_form(session)
+        question_1 = await seed_question(
+            session,
+            task_id=task_id,
+            field_name="field_under_test",
+            input_type="VARCHAR",
+            is_mandatory=False,
+        )
+        question_2 = await seed_question(
+            session,
+            task_id=task_id,
+            field_name="notes2",
+            input_type="VARCHAR",
+            label="คำถามที่สอง",
+            sort_order=2,
+        )
+        user_id = await seed_user_with_line_identity(session, line_user_id=line_user_id)
+        conversation_id = await seed_active_conversation(
+            session,
+            user_id=user_id,
+            task_id=task_id,
+            task_form_id=task_form_id,
+            current_question_id=question_1,
+        )
+        return task_form_id, conversation_id, question_1, question_2
+
+    def _mock_form(
+        self,
+        *,
+        task_form_id: uuid.UUID,
+        question_1: uuid.UUID,
+        question_2: uuid.UUID,
+        validation_rule: dict[str, Any] | None,
+    ) -> None:
+        respx.get(f"{forms_settings.KOTLIN_BACKEND_URL}/service/forms/{task_form_id}").mock(
+            return_value=Response(
+                200,
+                json=build_form_response(
+                    task_form_id=task_form_id,
+                    questions=[
+                        question_json(
+                            question_id=question_1,
+                            field_name="field_under_test",
+                            input_type="VARCHAR",
+                            is_mandatory=False,
+                            validation_rule=validation_rule,
+                        ),
+                        question_json(
+                            question_id=question_2,
+                            field_name="notes2",
+                            input_type="VARCHAR",
+                            label="คำถามที่สอง",
+                            sort_order=2,
+                        ),
+                    ],
+                ),
+            )
+        )
+
+    async def test_skip_label_skips_without_validation(
+        self, db_session: AsyncSession, client: AsyncClient
+    ) -> None:
+        line_user_id = f"U{uuid.uuid4().hex}"
+        task_form_id, conversation_id, question_1, question_2 = await self._seed(
+            db_session, line_user_id=line_user_id
+        )
+
+        with respx.mock:
+            self._mock_form(
+                task_form_id=task_form_id,
+                question_1=question_1,
+                question_2=question_2,
+                validation_rule=self._NOTES_RULE,
+            )
+
+            reply_message = await _send_answer(
+                client, line_user_id=line_user_id, text_content=self._SKIP_LABEL
+            )
+            reply_message.assert_awaited_once()
+            next_text = reply_message.await_args.args[0].messages[0].text
+            assert next_text == "คำถามที่สอง"
+            assert await _current_question_id(db_session, conversation_id) == question_2
+
+        answer = await db_session.execute(
+            text(
+                "SELECT answer FROM chat.conversation_answer "
+                "WHERE conversation_id = :conversation_id AND question_id = :question_id"
+            ),
+            {"conversation_id": conversation_id, "question_id": question_1},
+        )
+        assert answer.scalar_one()["skipped"] is True
+
+    async def test_real_text_on_optional_question_still_validates(
+        self, db_session: AsyncSession, client: AsyncClient
+    ) -> None:
+        line_user_id = f"U{uuid.uuid4().hex}"
+        task_form_id, conversation_id, question_1, question_2 = await self._seed(
+            db_session, line_user_id=line_user_id
+        )
+
+        with respx.mock:
+            self._mock_form(
+                task_form_id=task_form_id,
+                question_1=question_1,
+                question_2=question_2,
+                validation_rule=self._NOTES_RULE,
+            )
+
+            reply_message = await _send_answer(
+                client, line_user_id=line_user_id, text_content="ข้อความนี้ยาวเกินสิบตัวอักษร"
+            )
+            reply_message.assert_awaited_once()
+            error_text = reply_message.await_args.args[0].messages[0].text
+            assert "กรุณากรอกไม่เกิน 10 ตัวอักษร" in error_text
+            assert await _current_question_id(db_session, conversation_id) == question_1
+
+            reply_message = await _send_answer(client, line_user_id=line_user_id, text_content="สั้น")
+            reply_message.assert_awaited_once()
+            next_text = reply_message.await_args.args[0].messages[0].text
+            assert next_text == "คำถามที่สอง"
+            assert await _current_question_id(db_session, conversation_id) == question_2
