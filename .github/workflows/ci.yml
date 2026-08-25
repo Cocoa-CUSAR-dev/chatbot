@@ -54,6 +54,7 @@ jobs:
       GO_BACKEND_URL: http://localhost:8080
       LINE_CHANNEL_SECRET: test-secret
       LINE_CHANNEL_ACCESS_TOKEN: test-token
+      RUN_DB_TESTS: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
