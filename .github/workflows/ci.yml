@@ -30,10 +30,26 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: chatbot_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U test"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
     env:
-      # Dummy values -- these tests don't hit a real DB/LINE/LLM, they only
-      # need Settings() to construct without error at import time.
-      DATABASE_URL: postgresql+asyncpg://test:test@localhost/test
+      # Most tests don't hit a real DB/LINE/LLM, they only need Settings()
+      # to construct without error at import time -- but DATABASE_URL now
+      # points at the real Postgres service above, since DB-backed
+      # integration tests (see tests/resources/schema.sql) use it directly.
+      DATABASE_URL: postgresql+asyncpg://test:test@localhost:5432/chatbot_test
       KOTLIN_BACKEND_URL: http://localhost:3001/api/v1
       GO_BACKEND_URL: http://localhost:8080
       LINE_CHANNEL_SECRET: test-secret
@@ -44,6 +60,15 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
+      - name: Wait for Postgres
+        run: |
+          until pg_isready -h localhost -p 5432 -U test; do
+            echo "waiting for postgres..."; sleep 2;
+          done
+      - name: Initialize test schema
+        run: |
+          PGPASSWORD=test psql -h localhost -U test -d chatbot_test \
+            -f tests/resources/schema.sql
       - run: pytest tests/ -v
 
   build:
