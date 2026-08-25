@@ -355,7 +355,6 @@ class TestHandleAnswerWithChoices:
         assert conversation.current_question_id == question_id  # unchanged, still open
 
 
-
 _FAN_COUNT_RULE = {
     "type": "INT",
     "min": 0,
@@ -445,6 +444,7 @@ class TestHandleAnswerValidation:
         assert reply is not None
         assert reply.substate == ActiveSubstate.AWAITING_CONFIRMATION
         session.add.assert_called_once()
+
 
 class TestHandleAnswerParentPicker:
     """current_question_id set to one of parent_picker.SENTINEL_QUESTION_ID
