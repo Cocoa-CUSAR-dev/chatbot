@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import json
 import uuid
+from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -61,18 +62,9 @@ async def seed_user_with_line_identity(session: AsyncSession, *, line_user_id: s
     return user_id
 
 
-async def seed_question(
-    session: AsyncSession,
-    *,
-    field_name: str,
-    input_type: str,
-    label: str = "คำถามทดสอบ",
-    is_mandatory: bool = True,
-    sort_order: int = 1,
-) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
+async def seed_task_form(session: AsyncSession) -> tuple[uuid.UUID, uuid.UUID]:
     task_id = uuid.uuid4()
     task_form_id = uuid.uuid4()
-    question_id = uuid.uuid4()
 
     await session.execute(
         text("INSERT INTO form.task (task_id) VALUES (:task_id)"), {"task_id": task_id}
@@ -81,6 +73,21 @@ async def seed_question(
         text("INSERT INTO form.task_form (form_id, task_id) VALUES (:form_id, :task_id)"),
         {"form_id": task_form_id, "task_id": task_id},
     )
+    await session.commit()
+    return task_id, task_form_id
+
+
+async def seed_question(
+    session: AsyncSession,
+    *,
+    task_id: uuid.UUID,
+    field_name: str,
+    input_type: str,
+    label: str = "คำถามทดสอบ",
+    is_mandatory: bool = True,
+    sort_order: int = 1,
+) -> uuid.UUID:
+    question_id = uuid.uuid4()
     await session.execute(
         text(
             "INSERT INTO form.question "
@@ -99,7 +106,45 @@ async def seed_question(
         },
     )
     await session.commit()
-    return task_id, task_form_id, question_id
+    return question_id
+
+
+def question_json(
+    *,
+    question_id: uuid.UUID,
+    field_name: str,
+    input_type: str,
+    label: str = "คำถามทดสอบ",
+    is_mandatory: bool = True,
+    sort_order: int = 1,
+) -> dict[str, Any]:
+    """A question exactly as Kotlin's GET /service/forms/{formId} would spell
+    it -- camelCase, matching web-backend's Question.Entity -- for respx to
+    hand back before forms/client.py's get_form() converts it.
+    """
+    return {
+        "questionId": str(question_id),
+        "label": label,
+        "fieldName": field_name,
+        "inputType": input_type,
+        "isMandatory": is_mandatory,
+        "sortOrder": sort_order,
+    }
+
+
+def build_form_response(
+    *, task_form_id: uuid.UUID, questions: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """The full `{"value": ..., "error": null}` envelope forms/client.py's
+    get_form() expects, wrapping the given questions in a single section.
+    """
+    return {
+        "value": {
+            "formId": str(task_form_id),
+            "sections": [{"questions": questions}],
+        },
+        "error": None,
+    }
 
 
 async def seed_active_conversation(
