@@ -118,6 +118,7 @@ def question_json(
     is_mandatory: bool = True,
     sort_order: int = 1,
     validation_rule: dict[str, Any] | None = None,
+    choices: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """A question exactly as Kotlin's GET /service/forms/{formId} would spell
     it -- camelCase, matching web-backend's Question.Entity -- for respx to
@@ -127,6 +128,10 @@ def question_json(
     form.field_validation_rule stores it with (e.g. "errorMessage", not
     "error_message") -- get_form()'s _convert_keys() converts it recursively,
     same as it would a real Kotlin response.
+
+    `choices` (OPTION questions only -- BOOLEAN's are synthesized in
+    service.py itself, never sent by Kotlin) is `[{"id": ..., "name": ...}]`,
+    matching Kotlin's own field names verbatim (no camelCase in either key).
     """
     question: dict[str, Any] = {
         "questionId": str(question_id),
@@ -138,6 +143,8 @@ def question_json(
     }
     if validation_rule is not None:
         question["validationRule"] = validation_rule
+    if choices is not None:
+        question["choices"] = choices
     return question
 
 
