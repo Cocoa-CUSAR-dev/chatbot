@@ -27,6 +27,8 @@ from tests.integration.helpers import (
     sign_signature,
 )
 
+_START_KEYWORD = "เริ่ม"
+
 _PAUSE_LABEL = "⏸️ พักไว้ก่อน"
 
 
@@ -210,3 +212,66 @@ class TestResume:
         row = await _conversation_row(db_session, conversation_id)
         assert row["status"] == "active"
         assert row["current_question_id"] == question_2
+
+
+class TestStartKeywordListsTasks:
+    async def test_start_keyword_pauses_active_conversation_and_lists_it(
+        self, db_session: AsyncSession, client: AsyncClient
+    ) -> None:
+        task_id, task_form_id = await seed_task_form(db_session, title="งานทดสอบ", handler="notes")
+        line_user_id = f"U{uuid.uuid4().hex}"
+        user_id = await seed_user_with_line_identity(db_session, line_user_id=line_user_id)
+        conversation_id = await seed_conversation(
+            db_session, user_id=user_id, task_id=task_id, task_form_id=task_form_id, status="active"
+        )
+
+        reply_message = await _send_message(
+            client, line_user_id=line_user_id, text_content=_START_KEYWORD
+        )
+
+        reply_message.assert_awaited_once()
+        message = reply_message.await_args.args[0].messages[0]
+        assert message.text == "เลือกงานที่ต้องการทำ:"
+        assert len(message.quick_reply.items) == 1
+        action = message.quick_reply.items[0].action
+        assert action.label == "🔄 งานทดสอบ"
+        assert action.data == f"start:{task_id}:{task_form_id}:notes"
+        assert action.display_text == "ทำต่อ: งานทดสอบ"
+
+        row = await _conversation_row(db_session, conversation_id)
+        assert row["status"] == "paused"
+
+    async def test_start_keyword_labels_new_task_without_prefix(
+        self, db_session: AsyncSession, client: AsyncClient
+    ) -> None:
+        resumable_task_id, resumable_task_form_id = await seed_task_form(
+            db_session, title="งานค้างไว้", handler="notes"
+        )
+        new_task_id, new_task_form_id = await seed_task_form(
+            db_session, title="งานใหม่", handler="notes"
+        )
+        line_user_id = f"U{uuid.uuid4().hex}"
+        user_id = await seed_user_with_line_identity(db_session, line_user_id=line_user_id)
+        await seed_conversation(
+            db_session,
+            user_id=user_id,
+            task_id=resumable_task_id,
+            task_form_id=resumable_task_form_id,
+            status="paused",
+        )
+
+        reply_message = await _send_message(
+            client, line_user_id=line_user_id, text_content=_START_KEYWORD
+        )
+
+        reply_message.assert_awaited_once()
+        items = reply_message.await_args.args[0].messages[0].quick_reply.items
+        actions_by_task_id = {item.action.data.split(":")[1]: item.action for item in items}
+
+        resumable_action = actions_by_task_id[str(resumable_task_id)]
+        assert resumable_action.label == "🔄 งานค้างไว้"
+        assert resumable_action.display_text == "ทำต่อ: งานค้างไว้"
+
+        new_action = actions_by_task_id[str(new_task_id)]
+        assert new_action.label == "งานใหม่"
+        assert new_action.display_text == "งานใหม่"

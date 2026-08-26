@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import json
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import text
@@ -81,19 +82,43 @@ async def seed_user_with_line_identity(session: AsyncSession, *, line_user_id: s
     return user_id
 
 
-async def seed_task_form(session: AsyncSession) -> tuple[uuid.UUID, uuid.UUID]:
+async def seed_task_form(
+    session: AsyncSession,
+    *,
+    title: str | None = None,
+    handler: str = "notes",
+    open_at: datetime | None = None,
+) -> tuple[uuid.UUID, uuid.UUID]:
     task_id = uuid.uuid4()
     task_form_id = uuid.uuid4()
 
     await session.execute(
-        text("INSERT INTO form.task (task_id) VALUES (:task_id)"), {"task_id": task_id}
+        text("INSERT INTO form.task (task_id, title, open_at) VALUES (:task_id, :title, :open_at)"),
+        {
+            "task_id": task_id,
+            "title": title,
+            "open_at": open_at or datetime.now(UTC).replace(tzinfo=None),
+        },
     )
     await session.execute(
-        text("INSERT INTO form.task_form (form_id, task_id) VALUES (:form_id, :task_id)"),
-        {"form_id": task_form_id, "task_id": task_id},
+        text(
+            "INSERT INTO form.task_form (form_id, task_id, handler) "
+            "VALUES (:form_id, :task_id, :handler)"
+        ),
+        {"form_id": task_form_id, "task_id": task_id, "handler": handler},
     )
     await session.commit()
     return task_id, task_form_id
+
+
+async def seed_form_response(
+    session: AsyncSession, *, task_id: uuid.UUID, user_id: uuid.UUID
+) -> None:
+    await session.execute(
+        text("INSERT INTO form.response (task_log_id, user_id) VALUES (:task_log_id, :user_id)"),
+        {"task_log_id": task_id, "user_id": user_id},
+    )
+    await session.commit()
 
 
 async def seed_question(

@@ -26,6 +26,7 @@ CREATE TABLE auth.line_identity (
 CREATE TABLE form.task (
     task_id uuid DEFAULT gen_random_uuid() NOT NULL,
     title character varying,
+    open_at timestamp without time zone,
     CONSTRAINT pk_task PRIMARY KEY (task_id)
 );
 
@@ -33,8 +34,17 @@ CREATE TABLE form.task_form (
     form_id uuid DEFAULT gen_random_uuid() NOT NULL,
     task_id uuid NOT NULL,
     title character varying,
+    handler character varying,
     CONSTRAINT pk_form PRIMARY KEY (form_id),
     CONSTRAINT fk_form_task FOREIGN KEY (task_id) REFERENCES form.task (task_id)
+);
+
+CREATE TABLE form.response (
+    response_id uuid DEFAULT gen_random_uuid() NOT NULL,
+    task_log_id uuid NOT NULL,
+    user_id uuid NOT NULL,
+    CONSTRAINT pk_response PRIMARY KEY (response_id),
+    CONSTRAINT fk_response_user FOREIGN KEY (user_id) REFERENCES auth.user_account (user_id)
 );
 
 CREATE TABLE form.question (
