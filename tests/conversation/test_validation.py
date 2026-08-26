@@ -28,6 +28,14 @@ class TestFloat:
         assert validate_answer(self._RULE, "0") is None
         assert validate_answer(self._RULE, "100") is None
 
+    def test_nan_fails(self) -> None:
+        # float("nan") parses without raising, and every comparison against
+        # NaN (< and >) is False -- so without an explicit check, "nan"
+        # silently satisfied both the min and max bounds regardless of what
+        # they were, and got submitted as a value.
+        assert validate_answer(self._RULE, "nan") is not None
+        assert validate_answer(self._RULE, "NaN") is not None
+
 
 class TestInt:
     _RULE = {
