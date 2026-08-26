@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.conversation.jobs import pause_idle_conversations
 from src.forms.config import forms_settings
 from src.line.config import line_settings
+from src.line.parent_picker import ParentOption
 from tests.integration.helpers import (
     build_form_response,
     build_postback_event,
@@ -325,3 +326,65 @@ class TestPauseIdleConversations:
         assert statuses[already_paused] == "paused"
         assert statuses[completed] == "completed"
         assert statuses[cancelled] == "cancelled"
+
+
+class TestResumeAtParentPicker:
+    async def test_resume_shows_parent_choices_again(
+        self, db_session: AsyncSession, client: AsyncClient
+    ) -> None:
+        task_id, task_form_id = await seed_task_form(db_session, handler="farm_activity_fertilizer")
+        question_1 = await seed_question(
+            db_session, task_id=task_id, field_name="amount_kg", input_type="FLOAT", sort_order=1
+        )
+        line_user_id = f"U{uuid.uuid4().hex}"
+        user_id = await seed_user_with_line_identity(db_session, line_user_id=line_user_id)
+        conversation_id = await seed_conversation(
+            db_session,
+            user_id=user_id,
+            task_id=task_id,
+            task_form_id=task_form_id,
+            status="paused",
+            parent_answer={"pending_kind": "farm_activity"},
+        )
+
+        form_response = build_form_response(
+            task_form_id=task_form_id,
+            questions=[
+                question_json(
+                    question_id=question_1,
+                    field_name="amount_kg",
+                    input_type="FLOAT",
+                    sort_order=1,
+                )
+            ],
+        )
+        parent_choices = [
+            ParentOption(id="activity-1", label="ตัวเลือก 1"),
+            ParentOption(id="activity-2", label="ตัวเลือก 2"),
+        ]
+
+        with (
+            respx.mock,
+            patch(
+                "src.line.parent_picker.choices_for",
+                new_callable=AsyncMock,
+                return_value=parent_choices,
+            ),
+        ):
+            respx.get(f"{forms_settings.KOTLIN_BACKEND_URL}/service/forms/{task_form_id}").mock(
+                return_value=Response(200, json=form_response)
+            )
+            reply_message = await _send_postback(
+                client,
+                line_user_id=line_user_id,
+                data=f"start:{task_id}:{task_form_id}:farm_activity_fertilizer",
+            )
+
+        reply_message.assert_awaited_once()
+        message = reply_message.await_args.args[0].messages[0]
+        assert message.text == "เลือกกิจกรรมในฟาร์มที่เกี่ยวข้อง:"
+        labels = [item.action.label for item in message.quick_reply.items]
+        assert labels == ["⏸️ พักไว้ก่อน", "ตัวเลือก 1", "ตัวเลือก 2"]
+
+        row = await _conversation_row(db_session, conversation_id)
+        assert row["status"] == "active"
