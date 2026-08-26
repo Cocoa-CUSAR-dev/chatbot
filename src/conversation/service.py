@@ -451,6 +451,19 @@ async def handle_answer(
     # known-good value by construction (matched against current_question's
     # own choices above).
     if not is_skip and resolved_value is None and current_question is not None:
+        # A mandatory free-text question offers no skip button (see
+        # _choices_for), so blank/whitespace-only text is never an
+        # intentional skip -- it's an empty non-answer. Checked ahead of
+        # validate_answer since a field with no validation_rule row at all
+        # (or a VARCHAR rule with no min_length) would otherwise let it
+        # through unchecked, defeating the point of gating the DB write on
+        # validation (US2-2).
+        if current_question.is_mandatory and not raw_text.strip():
+            return _reply_for_question(
+                conversation_id,
+                current_question,
+                error="กรุณาตอบคำถามนี้ ไม่สามารถเว้นว่างได้",
+            )
         error = validate_answer(current_question.validation_rule, raw_text)
         if error is not None:
             return _reply_for_question(conversation_id, current_question, error=error)

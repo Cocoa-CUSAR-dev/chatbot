@@ -445,6 +445,62 @@ class TestHandleAnswerValidation:
         assert reply.substate == ActiveSubstate.AWAITING_CONFIRMATION
         session.add.assert_called_once()
 
+    async def test_mandatory_question_with_no_rule_rejects_blank_answer(self) -> None:
+        """A mandatory field with no validation_rule row at all must still
+        reject a blank/whitespace-only answer -- validate_answer alone would
+        pass it through unchecked (see test_field_with_no_rule_skips_
+        validation_entirely), which is exactly the gap this guards against.
+        """
+        form, (q1,) = _form(mandatory_flags=[True])
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=q1,
+        )
+        session = _mock_session(answers=[], conversation=conversation)
+
+        reply = await service.handle_answer(
+            session, conversation_id=conversation_id, raw_text="   ", form=form
+        )
+
+        assert reply is not None
+        assert reply.substate == ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION
+        assert "เว้นว่าง" in reply.text
+        session.add.assert_not_called()  # blank answer never gets persisted
+        assert conversation.current_question_id == q1  # unchanged, still open
+
+    async def test_mandatory_question_with_rule_rejects_blank_answer(self) -> None:
+        """Same as above but for a field that DOES have a validation_rule --
+        the blank check must fire before validate_answer's own type check,
+        not rely on it (an empty string trivially satisfies VARCHAR's
+        max_length-only check).
+        """
+        form, question_id = _validated_field_form(_FAN_COUNT_RULE)
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=question_id,
+        )
+        session = _mock_session(answers=[], conversation=conversation)
+
+        reply = await service.handle_answer(
+            session, conversation_id=conversation_id, raw_text="", form=form
+        )
+
+        assert reply is not None
+        assert reply.substate == ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION
+        assert "เว้นว่าง" in reply.text
+        session.add.assert_not_called()
+        assert conversation.current_question_id == question_id
+
 
 class TestHandleAnswerParentPicker:
     """current_question_id set to one of parent_picker.SENTINEL_QUESTION_ID
