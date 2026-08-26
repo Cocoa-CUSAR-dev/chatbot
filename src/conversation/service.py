@@ -144,13 +144,19 @@ def _choices_for(q: dict[str, Any], is_mandatory: bool) -> tuple[list[Choice] | 
     return [_SKIP_CHOICE], False
 
 
-# Only these are actually wired up in the chat flow today -- DATE, DATETIME,
-# GEODATA, FLOAT, and INT are explicitly deferred (next sprints / LLM), and
-# "upload" is a VARCHAR field_name convention (see form.question seed data)
-# for photo attachments, which have nowhere to go yet either. Filtered out
-# at the form level (not just skipped when picking the next question) so
-# they never show up in the guided flow OR the confirmation summary.
-_SUPPORTED_INPUT_TYPES = {"VARCHAR", "OPTION", "BOOLEAN"}
+# DATE/DATETIME/FLOAT/INT all validate as free text through the same
+# validate_answer()-then-re-ask path VARCHAR/BOOLEAN already use, with no
+# LINE-side UI dependency -- CB-9 confirmed there's no blocker for any of
+# them. GEODATA stays deferred: it needs a storage.geo row + FK link, which
+# Go's dissection (SubmitTaskForUser, form_handler.go) still only does as a
+# single-table flat insert with no storage.geo handling at all -- a farmer
+# could answer a GEODATA question here and have the submission silently
+# lose the coordinate. "upload" is a VARCHAR field_name convention (see
+# form.question seed data) for photo attachments, which have nowhere to go
+# yet either. Filtered out at the form level (not just skipped when picking
+# the next question) so unsupported types never show up in the guided flow
+# OR the confirmation summary.
+_SUPPORTED_INPUT_TYPES = {"VARCHAR", "OPTION", "BOOLEAN", "FLOAT", "INT", "DATE", "DATETIME"}
 
 
 def _is_supported(q: dict[str, Any]) -> bool:

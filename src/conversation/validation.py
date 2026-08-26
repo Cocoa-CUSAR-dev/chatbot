@@ -22,6 +22,7 @@ words, unaffected). Reading the camelCase spelling here would silently
 never match, letting every answer through unvalidated.
 """
 
+import math
 from datetime import date, datetime
 from typing import Any, Protocol
 
@@ -34,6 +35,11 @@ def _valid_float(text: str, rule: dict[str, Any]) -> bool:
     try:
         value = float(text.strip())
     except ValueError:
+        return False
+    # float("nan") parses without raising, and every comparison against NaN
+    # (< and >) is False -- so without this check, "nan" silently satisfies
+    # both the min and max bounds below regardless of what they are.
+    if math.isnan(value):
         return False
     if "min" in rule and value < rule["min"]:
         return False
