@@ -1,7 +1,9 @@
-"""Webhook-level tests for pause/resume (US2-3) -- exercises src.line.router
-+ src.conversation.service together through the real /line/webhook route
-and a real Postgres session, with Kotlin's forms endpoint and LINE's reply
-call mocked at the boundary.
+"""Tests for pause/resume (US2-3) against a real Postgres session -- most
+classes exercise src.line.router + src.conversation.service together through
+the real /line/webhook route, with Kotlin's forms endpoint and LINE's reply
+call mocked at the boundary. TestPauseIdleConversations is the exception: it
+calls src.conversation.jobs.pause_idle_conversations directly, since that's a
+scheduled job with no webhook involved.
 """
 
 import uuid
@@ -12,6 +14,7 @@ from httpx import AsyncClient, Response
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.conversation.jobs import pause_idle_conversations
 from src.forms.config import forms_settings
 from src.line.config import line_settings
 from tests.integration.helpers import (
@@ -275,3 +278,50 @@ class TestStartKeywordListsTasks:
         new_action = actions_by_task_id[str(new_task_id)]
         assert new_action.label == "งานใหม่"
         assert new_action.display_text == "งานใหม่"
+
+
+async def _conversation_statuses(
+    session: AsyncSession, conversation_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, str]:
+    result = await session.execute(
+        text(
+            "SELECT conversation_id, status FROM chat.conversation "
+            "WHERE conversation_id = ANY(:ids)"
+        ),
+        {"ids": conversation_ids},
+    )
+    return {row.conversation_id: row.status for row in result}
+
+
+class TestPauseIdleConversations:
+    async def test_pauses_only_active_conversations(self, db_session: AsyncSession) -> None:
+        task_id, task_form_id = await seed_task_form(db_session)
+
+        async def _seed(status: str) -> uuid.UUID:
+            user_id = await seed_user_with_line_identity(
+                db_session, line_user_id=f"U{uuid.uuid4().hex}"
+            )
+            return await seed_conversation(
+                db_session,
+                user_id=user_id,
+                task_id=task_id,
+                task_form_id=task_form_id,
+                status=status,
+            )
+
+        active_1 = await _seed("active")
+        active_2 = await _seed("active")
+        already_paused = await _seed("paused")
+        completed = await _seed("completed")
+        cancelled = await _seed("cancelled")
+
+        await pause_idle_conversations()
+
+        statuses = await _conversation_statuses(
+            db_session, [active_1, active_2, already_paused, completed, cancelled]
+        )
+        assert statuses[active_1] == "paused"
+        assert statuses[active_2] == "paused"
+        assert statuses[already_paused] == "paused"
+        assert statuses[completed] == "completed"
+        assert statuses[cancelled] == "cancelled"
