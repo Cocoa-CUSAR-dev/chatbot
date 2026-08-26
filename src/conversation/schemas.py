@@ -2,6 +2,7 @@
 by the real LINE webhook path, which builds its own replies via src/line.
 """
 
+from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel
@@ -50,3 +51,7 @@ class ConversationReplyResponse(BaseModel):
     substate: str
     text: str
     choices: list[ChoiceResponse] | None = None
+    # Debug-only passthrough for the dev test UI -- see
+    # service.ConversationReply's own fields of the same name.
+    input_type: str | None = None
+    validation_rule: dict[str, Any] | None = None

@@ -16,6 +16,7 @@ handlers (task-dissection-design.md) and reuses the existing `farmer01`
 account (role=farmer) as the test conversation owner.
 """
 
+import json
 import logging
 import re
 from typing import cast
@@ -26,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.conversation.exceptions import ConversationNotFound
 from src.conversation.schemas import FormSummary
+from src.forms.client import _convert_keys
 from src.forms.exceptions import FormNotFound
 from src.forms.schemas import FormDetail
 
@@ -108,14 +110,19 @@ async def load_form_detail(session: AsyncSession, task_form_id: UUID) -> FormDet
     """Direct-query counterpart to forms.client.get_form() -- builds the same
     FormDetail shape service.py expects, from the local `form.*` tables
     instead of a real Kotlin call. OPTION-type questions get a real
-    `choices` list attached, same shape Kotlin's own response uses.
+    `choices` list attached, same shape Kotlin's own response uses; every
+    question gets `validation_rule` from form.field_validation_rule, same
+    LEFT JOIN on field_name web-backend's FormRepository.kt now does (null
+    for OPTION/BOOLEAN/upload or any field_name with no rule row).
     """
     rows = await session.execute(
         text(
             """
-            SELECT q.question_id, q.label, q.field_name, q.input_type, q.is_mandatory, q.sort_order
+            SELECT q.question_id, q.label, q.field_name, q.input_type, q.is_mandatory,
+                   q.sort_order, fvr.validation_rule
             FROM form.question q
             JOIN form.section s ON s.section_id = q.section_id
+            LEFT JOIN form.field_validation_rule fvr ON fvr.field_name = q.field_name
             WHERE s.form_id = :task_form_id
             ORDER BY q.sort_order
             """
@@ -129,6 +136,26 @@ async def load_form_detail(session: AsyncSession, task_form_id: UUID) -> FormDet
     for question in questions:
         if question["input_type"] == "OPTION" and question.get("field_name"):
             question["choices"] = await _load_choices(session, question["field_name"])
+        # SQLAlchemy's asyncpg dialect auto-decodes jsonb into a dict at the
+        # connection level (confirmed directly against this app's own
+        # async_session_maker -- NOT the same as a bare asyncpg.connect(),
+        # which returns raw text; that difference is what made an earlier
+        # version of this fix silently no-op). Handle both shapes so this
+        # doesn't re-break if that decoding behavior ever changes.
+        raw_rule = question.get("validation_rule")
+        if raw_rule is not None:
+            if isinstance(raw_rule, str):
+                raw_rule = json.loads(raw_rule)
+            # The jsonb column itself stores camelCase keys (errorMessage,
+            # maxLength, ...) -- forms/client.py's get_form() normally does
+            # this same camelCase -> snake_case conversion for the real
+            # Kotlin response before service.py/validation.py ever see it.
+            # This dev-only path reads the column directly, bypassing that
+            # conversion entirely, so it has to apply it here too -- without
+            # this, every _valid_* helper's rule.get("max_length") etc. would
+            # silently miss (still spelled maxLength) and every answer would
+            # pass unvalidated, exactly what happened testing this locally.
+            question["validation_rule"] = _convert_keys(raw_rule)
 
     return FormDetail(task_form_id=str(task_form_id), sections=[{"questions": questions}])
 

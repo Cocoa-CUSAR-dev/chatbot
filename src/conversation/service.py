@@ -38,6 +38,7 @@ from src.conversation.constants import ActiveSubstate, AnswerSource, Conversatio
 from src.conversation.exceptions import ConversationNotFound
 from src.conversation.models import Conversation, ConversationAnswer
 from src.conversation.state_machine import on_guided_answer
+from src.conversation.validation import validate_answer
 from src.forms.schemas import FormDetail
 from src.line import parent_picker
 from src.tasks.client import submit_task
@@ -83,6 +84,7 @@ class Question:
     question_id: UUID
     label: str
     field_name: str
+    input_type: str
     is_mandatory: bool
     sort_order: int
     choices: list[Choice] | None = None
@@ -90,6 +92,11 @@ class Question:
     # from "has a skip button but is otherwise free text", which must still
     # accept arbitrary typed text rather than re-asking on a non-match.
     has_constrained_choices: bool = False
+    # From Kotlin's form.field_validation_rule, already joined onto this
+    # question server-side (FormRepository.kt) -- null for OPTION/BOOLEAN/
+    # upload (constrained another way already) or any field_name with no
+    # rule row. See validation.py's own docstring for the key-casing wrinkle.
+    validation_rule: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -102,6 +109,13 @@ class ConversationReply:
     # lets the caller re-attach the confirm button for a retry instead of
     # treating this as the terminal "saved" message.
     submission_failed: bool = False
+    # Debug-only passthrough of the open question's own shape -- None
+    # whenever this reply isn't "here's a fixed question to answer" (e.g.
+    # confirmation/completed/cancelled replies have no single open question).
+    # Not used by the real LINE webhook path; exists so the dev test UI can
+    # show a developer what's actually being validated without guessing.
+    input_type: str | None = None
+    validation_rule: dict[str, Any] | None = None
 
 
 def _constrained_choices_for(q: dict[str, Any]) -> list[Choice] | None:
@@ -152,10 +166,12 @@ def _question_from_dict(q: dict[str, Any]) -> Question:
         question_id=UUID(str(q["question_id"])),
         label=str(q.get("label") or ""),
         field_name=str(q.get("field_name") or ""),
+        input_type=str(q.get("input_type") or ""),
         is_mandatory=is_mandatory,
         sort_order=int(q.get("sort_order", 0)),
         choices=choices,
         has_constrained_choices=has_constrained_choices,
+        validation_rule=q.get("validation_rule"),
     )
 
 
@@ -209,12 +225,17 @@ def _format_confirmation_summary(
     return "สรุปคำตอบของคุณ:\n" + "\n".join(lines) + "\n\nยืนยันการส่งข้อมูลหรือไม่?"
 
 
-def _reply_for_question(conversation_id: UUID, question: Question) -> ConversationReply:
+def _reply_for_question(
+    conversation_id: UUID, question: Question, *, error: str | None = None
+) -> ConversationReply:
+    text = f"{error}\n\n{question.label}" if error else question.label
     return ConversationReply(
         conversation_id=conversation_id,
         substate=ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION,
-        text=question.label,
+        text=text,
         choices=question.choices,
+        input_type=question.input_type,
+        validation_rule=question.validation_rule,
     )
 
 
@@ -414,11 +435,25 @@ async def handle_answer(
                 # Doesn't match any listed choice -- re-ask rather than store
                 # text that can't resolve to a real domain value later. Keeps
                 # the same question open, same choices offered again.
-                return _reply_for_question(conversation_id, current_question)
+                return _reply_for_question(
+                    conversation_id,
+                    current_question,
+                    error="กรุณาเลือกคำตอบจากตัวเลือกที่กำหนดเท่านั้น",
+                )
             resolved_value = matched.id
         # else: non-mandatory free-text question offering only a skip button
         # -- typed text that isn't the skip label is a real answer, not a
         # mismatch, so it falls through to the normal free-text path below.
+
+    # Format validation (the Validate Answer step) only applies to genuine
+    # free text -- a skip is an intentional absence (nothing to check), and
+    # a resolved OPTION/BOOLEAN choice is already constrained to a
+    # known-good value by construction (matched against current_question's
+    # own choices above).
+    if not is_skip and resolved_value is None and current_question is not None:
+        error = validate_answer(current_question.validation_rule, raw_text)
+        if error is not None:
+            return _reply_for_question(conversation_id, current_question, error=error)
 
     if is_skip:
         answer: dict[str, Any] = {"skipped": True}
