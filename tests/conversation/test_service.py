@@ -48,6 +48,28 @@ def _boolean_form() -> tuple[FormDetail, uuid.UUID]:
     return FormDetail(task_form_id="tf-bool", sections=[{"questions": questions}]), question_id
 
 
+def _mandatory_option_form(choice_count: int) -> tuple[FormDetail, uuid.UUID]:
+    """A single mandatory OPTION question with `choice_count` real choices --
+    matches farm_id (backed by ref.farm_constant) on the harvest/farm_activity
+    forms, the field a reviewer caught actually hitting this at 13 real rows.
+    """
+    question_id = uuid.uuid4()
+    questions = [
+        {
+            "question_id": str(question_id),
+            "label": "เลือกฟาร์ม",
+            "field_name": "farm_id",
+            "input_type": "OPTION",
+            "is_mandatory": True,
+            "sort_order": 0,
+            "choices": [
+                {"id": str(uuid.uuid4()), "name": f"farm {i}"} for i in range(choice_count)
+            ],
+        }
+    ]
+    return FormDetail(task_form_id="tf-option", sections=[{"questions": questions}]), question_id
+
+
 def _answer(question_id: uuid.UUID, text: str = "some answer") -> ConversationAnswer:
     return ConversationAnswer(
         conversation_id=uuid.uuid4(),
@@ -108,6 +130,42 @@ def test_boolean_question_gets_synthesized_yes_no_choices() -> None:
         service.Choice(id="true", label="ใช่"),
         service.Choice(id="false", label="ไม่"),
     ]
+
+
+def test_mandatory_option_at_quota_leaves_room_for_pause() -> None:
+    """Regression caught in review (PR #25): the mandatory branch of
+    _choices_for used to return `[_PAUSE_CHOICE, *constrained]` completely
+    unsliced, on the assumption a mandatory question's real choices already
+    fit LINE's 13-item Quick Reply cap. Adding pause broke that -- a
+    mandatory OPTION field with exactly 13 real choices (farm_id, backed by
+    ref.farm_constant, real production data) became 14 total, and router.py's
+    own send-time `choices[:13]` slice silently dropped the LAST real
+    choice -- a farm a farmer could no longer actually select via button.
+    """
+    form, _ = _mandatory_option_form(choice_count=service._QUICK_REPLY_LIMIT)
+
+    questions = service.questions_from_form(form)
+
+    assert len(questions) == 1
+    choices = questions[0].choices
+    assert choices is not None
+    assert len(choices) == service._QUICK_REPLY_LIMIT  # pause + 12 real, not 14
+    assert choices[0] == service.Choice(id="__pause__", label="⏸️ พักไว้ก่อน")
+    expected_labels = [f"farm {i}" for i in range(service._QUICK_REPLY_LIMIT - 1)]
+    assert [c.label for c in choices[1:]] == expected_labels
+
+
+def test_mandatory_option_well_under_quota_keeps_every_real_choice() -> None:
+    """The fix must not over-truncate the common case -- only the
+    near-the-cap case actually needs anything dropped."""
+    form, _ = _mandatory_option_form(choice_count=3)
+
+    questions = service.questions_from_form(form)
+
+    choices = questions[0].choices
+    assert choices is not None
+    assert len(choices) == 4  # pause + all 3 real choices, nothing dropped
+    assert [c.label for c in choices[1:]] == ["farm 0", "farm 1", "farm 2"]
 
 
 class TestStartConversation:

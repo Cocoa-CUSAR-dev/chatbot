@@ -134,7 +134,18 @@ def _choices_for(q: dict[str, Any], is_mandatory: bool) -> tuple[list[Choice], b
     constrained = _constrained_choices_for(q)
     if is_mandatory:
         if constrained is not None:
-            return [_PAUSE_CHOICE, *constrained], True
+            # Reviewer-caught regression: this branch used to return
+            # `constrained` completely unsliced, on the assumption a
+            # mandatory question's real choices were already within LINE's
+            # 13-item cap. Adding pause broke that assumption -- a
+            # mandatory OPTION field with exactly 13 real choices (e.g.
+            # farm_id) became 14 total, and router.py's own send-time
+            # `choices[:13]` slice silently dropped the LAST real choice --
+            # a farm a farmer could no longer actually select via button,
+            # not just a cosmetic overflow. Same room-for-pause treatment
+            # the non-mandatory branch below already had.
+            room_for_real_choices = _QUICK_REPLY_LIMIT - 1
+            return [_PAUSE_CHOICE, *constrained[:room_for_real_choices]], True
         return [_PAUSE_CHOICE], False
     if constrained is not None:
         room_for_real_choices = _QUICK_REPLY_LIMIT - 2  # room for both skip and pause
