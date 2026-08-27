@@ -121,6 +121,32 @@ async def _handle_message(event: MessageEvent) -> None:
             return
 
         async with async_session_maker() as session:
+            is_start_keyword = message.text.strip().lower() in temp_task_picker.START_KEYWORDS
+
+            if is_start_keyword:
+                # US2-3: เริ่ม always shows every not-yet-done task (never
+                # started, or a conversation still active/paused) -- not
+                # gated on "is nothing currently active" anymore. Whatever
+                # WAS active gets paused first so switching to look at the
+                # list never silently loses it (replaces the old
+                # abandoned-conversation-triggers-auto-cancel workaround:
+                # that existed only to rescue เริ่ม from getting swallowed
+                # as a literal answer, which pausing-instead-of-getting-
+                # stuck no longer needs). Cancel itself is untouched, still
+                # its own explicit action via the confirm prompt's button.
+                await service.pause_active_conversation(session, user_id=user_id)
+
+                # TEMPORARY (see src/line/temp_task_picker.py): Boom's real
+                # LIFF to-do list is Sprint 5, ~2 months out as of when this
+                # was written. Until then, a keyword lists pending tasks as
+                # Quick Reply buttons instead of leaving the farmer stuck.
+                tasks = await temp_task_picker.list_pending_tasks(session, user_id)
+                if not tasks:
+                    await reply_text(event.reply_token, "ไม่มีงานที่ต้องทำในตอนนี้")
+                    return
+                await reply_task_choices(event.reply_token, "เลือกงานที่ต้องการทำ:", tasks)
+                return
+
             result = await session.execute(
                 select(Conversation).where(
                     Conversation.user_id == user_id,
@@ -128,40 +154,7 @@ async def _handle_message(event: MessageEvent) -> None:
                 )
             )
             conversation = result.scalars().first()
-            is_start_keyword = message.text.strip().lower() in temp_task_picker.START_KEYWORDS
-
-            # A conversation sitting ACTIVE with no open question is one
-            # that reached AWAITING_CONFIRMATION and was then abandoned --
-            # the farmer never tapped confirm or cancel (closed the app,
-            # got distracted, etc.). Live-reported 2026-08-09: this
-            # permanently blocked เริ่ม, since the keyword was only ever
-            # checked when there was NO active conversation at all --
-            # typing เริ่ม here got routed into handle_answer as if it were
-            # an answer, which raises ConversationNotFound (no open
-            # question), surfacing as an opaque "ไม่พบบทสนทนานี้แล้ว". เริ่ม
-            # should always be a way to start over -- auto-cancel the
-            # abandoned one first rather than leaving the farmer stuck.
-            is_abandoned = conversation is not None and conversation.current_question_id is None
-            if is_abandoned and is_start_keyword:
-                assert conversation is not None  # narrows for mypy; is_abandoned implies this
-                await service.cancel_conversation(
-                    session, conversation_id=conversation.conversation_id
-                )
-                conversation = None
-
             if conversation is None:
-                # TEMPORARY (see src/line/temp_task_picker.py): Boom's real
-                # LIFF to-do list is Sprint 5, ~2 months out as of when this
-                # was written. Until then, a keyword lists pending tasks as
-                # Quick Reply buttons instead of leaving the farmer stuck.
-                if is_start_keyword:
-                    tasks = await temp_task_picker.list_pending_tasks(session, user_id)
-                    if not tasks:
-                        await reply_text(event.reply_token, "ไม่มีงานที่ต้องทำในตอนนี้")
-                        return
-                    await reply_task_choices(event.reply_token, "เลือกงานที่ต้องการทำ:", tasks)
-                    return
-
                 keyword = next(iter(temp_task_picker.START_KEYWORDS))
                 await reply_text(event.reply_token, f'พิมพ์ "{keyword}" เพื่อดูงานที่ต้องทำ')
                 return
@@ -206,9 +199,23 @@ async def _handle_postback(event: PostbackEvent) -> None:
             await reply_text(event.reply_token, "บัญชี LINE นี้ยังไม่ได้เชื่อมกับบัญชีในระบบ")
             return
 
-        form = await get_form(task_form_id)
-        parent_kind = parent_picker.kind_for_handler(handler)
         async with async_session_maker() as session:
+            # US2-3/resume-conversation logic: this task might already have
+            # a paused (or still-active) conversation -- resume it instead
+            # of starting a duplicate one from scratch. Checked before
+            # touching get_form/parent_picker at all, since a resumed
+            # conversation doesn't need either of those precomputed again.
+            existing = await service.find_resumable_conversation(
+                session, user_id=user_id, task_id=UUID(task_id)
+            )
+            if existing is not None:
+                form = await get_form(str(existing.task_form_id))
+                reply = await service.resume_conversation(session, conversation=existing, form=form)
+                await _reply(event.reply_token, reply)
+                return
+
+            form = await get_form(task_form_id)
+            parent_kind = parent_picker.kind_for_handler(handler)
             parent_choices = None
             if parent_kind is not None:
                 # One of the 5 previously-blocked handlers -- resolve the

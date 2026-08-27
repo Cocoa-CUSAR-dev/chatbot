@@ -63,9 +63,16 @@ async def reply_task_choices(reply_token: str, text: str, tasks: list["PendingTa
         items=[
             QuickReplyItem(
                 action=PostbackAction(
-                    label=task.title[:_QUICK_REPLY_LABEL_MAX],
+                    # US2-3: a short "🔄 " marker on the button itself
+                    # (label is truncated to 20 chars, so a longer prefix
+                    # would eat into an already-tight budget) -- the
+                    # unclipped displayText spells it out in full instead,
+                    # since that's what shows in the chat history.
+                    label=(f"🔄 {task.title}" if task.has_conversation else task.title)[
+                        :_QUICK_REPLY_LABEL_MAX
+                    ],
                     data=f"start:{task.task_id}:{task.task_form_id}:{task.handler}",
-                    displayText=task.title,
+                    displayText=(f"ทำต่อ: {task.title}" if task.has_conversation else task.title),
                 )
             )
             for task in tasks
