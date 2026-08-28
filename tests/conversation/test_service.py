@@ -29,6 +29,29 @@ def _form(*, mandatory_flags: list[bool]) -> tuple[FormDetail, list[uuid.UUID]]:
     return FormDetail(task_form_id="tf-1", sections=[{"questions": questions}]), question_ids
 
 
+def _validated_field_form(
+    validation_rule: dict[str, object] | None,
+) -> tuple[FormDetail, uuid.UUID]:
+    """A single mandatory free-text question carrying `validation_rule`
+    directly, the same shape _question_from_dict reads off a real question
+    dict post-forms/client.py-conversion -- lets tests drive the Validate
+    Answer step without needing a live Kotlin response.
+    """
+    question_id = uuid.uuid4()
+    questions = [
+        {
+            "question_id": str(question_id),
+            "label": "จำนวนพัดลม",
+            "field_name": "fan_count",
+            "input_type": "VARCHAR",
+            "is_mandatory": True,
+            "sort_order": 0,
+            "validation_rule": validation_rule,
+        }
+    ]
+    return FormDetail(task_form_id="tf-validated", sections=[{"questions": questions}]), question_id
+
+
 def _boolean_form() -> tuple[FormDetail, uuid.UUID]:
     """A single mandatory BOOLEAN question -- matches the real
     farm_pest_disease_record.is_quality_damage shape that actually failed
@@ -46,6 +69,28 @@ def _boolean_form() -> tuple[FormDetail, uuid.UUID]:
         }
     ]
     return FormDetail(task_form_id="tf-bool", sections=[{"questions": questions}]), question_id
+
+
+def _mandatory_option_form(choice_count: int) -> tuple[FormDetail, uuid.UUID]:
+    """A single mandatory OPTION question with `choice_count` real choices --
+    matches farm_id (backed by ref.farm_constant) on the harvest/farm_activity
+    forms, the field a reviewer caught actually hitting this at 13 real rows.
+    """
+    question_id = uuid.uuid4()
+    questions = [
+        {
+            "question_id": str(question_id),
+            "label": "เลือกฟาร์ม",
+            "field_name": "farm_id",
+            "input_type": "OPTION",
+            "is_mandatory": True,
+            "sort_order": 0,
+            "choices": [
+                {"id": str(uuid.uuid4()), "name": f"farm {i}"} for i in range(choice_count)
+            ],
+        }
+    ]
+    return FormDetail(task_form_id="tf-option", sections=[{"questions": questions}]), question_id
 
 
 def _answer(question_id: uuid.UUID, text: str = "some answer") -> ConversationAnswer:
@@ -108,6 +153,42 @@ def test_boolean_question_gets_synthesized_yes_no_choices() -> None:
         service.Choice(id="true", label="ใช่"),
         service.Choice(id="false", label="ไม่"),
     ]
+
+
+def test_mandatory_option_at_quota_leaves_room_for_pause() -> None:
+    """Regression caught in review (PR #25): the mandatory branch of
+    _choices_for used to return `[_PAUSE_CHOICE, *constrained]` completely
+    unsliced, on the assumption a mandatory question's real choices already
+    fit LINE's 13-item Quick Reply cap. Adding pause broke that -- a
+    mandatory OPTION field with exactly 13 real choices (farm_id, backed by
+    ref.farm_constant, real production data) became 14 total, and router.py's
+    own send-time `choices[:13]` slice silently dropped the LAST real
+    choice -- a farm a farmer could no longer actually select via button.
+    """
+    form, _ = _mandatory_option_form(choice_count=service._QUICK_REPLY_LIMIT)
+
+    questions = service.questions_from_form(form)
+
+    assert len(questions) == 1
+    choices = questions[0].choices
+    assert choices is not None
+    assert len(choices) == service._QUICK_REPLY_LIMIT  # pause + 12 real, not 14
+    assert choices[0] == service.Choice(id="__pause__", label="⏸️ พักไว้ก่อน")
+    expected_labels = [f"farm {i}" for i in range(service._QUICK_REPLY_LIMIT - 1)]
+    assert [c.label for c in choices[1:]] == expected_labels
+
+
+def test_mandatory_option_well_under_quota_keeps_every_real_choice() -> None:
+    """The fix must not over-truncate the common case -- only the
+    near-the-cap case actually needs anything dropped."""
+    form, _ = _mandatory_option_form(choice_count=3)
+
+    questions = service.questions_from_form(form)
+
+    choices = questions[0].choices
+    assert choices is not None
+    assert len(choices) == 4  # pause + all 3 real choices, nothing dropped
+    assert [c.label for c in choices[1:]] == ["farm 0", "farm 1", "farm 2"]
 
 
 class TestStartConversation:
@@ -340,8 +421,156 @@ class TestHandleAnswerWithChoices:
             service.Choice(id="true", label="ใช่"),
             service.Choice(id="false", label="ไม่"),
         ]
+        assert "กรุณาเลือกคำตอบจากตัวเลือกที่กำหนดเท่านั้น" in reply.text
         session.add.assert_not_called()  # bad answer never gets persisted
         assert conversation.current_question_id == question_id  # unchanged, still open
+
+
+_FAN_COUNT_RULE = {
+    "type": "INT",
+    "min": 0,
+    "max": 50,
+    "integer_only": True,
+    "error_message": "กรุณากรอกจำนวนพัดลมเป็นจำนวนเต็ม 0-50",
+}
+
+
+class TestHandleAnswerValidation:
+    """The (New) Validate Answer step: a free-text answer that fails its
+    field's format rule must be rejected -- re-ask the same question with
+    the rule's own error_message, never persisted.
+    """
+
+    async def test_invalid_answer_reasks_with_error_message(self) -> None:
+        form, question_id = _validated_field_form(_FAN_COUNT_RULE)
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=question_id,
+        )
+        session = _mock_session(answers=[], conversation=conversation)
+
+        reply = await service.handle_answer(
+            session, conversation_id=conversation_id, raw_text="999", form=form
+        )
+
+        assert reply is not None
+        assert reply.substate == ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION
+        assert "กรุณากรอกจำนวนพัดลมเป็นจำนวนเต็ม 0-50" in reply.text
+        assert "จำนวนพัดลม" in reply.text  # question re-asked, not dropped
+        session.add.assert_not_called()  # invalid answer never gets persisted
+        assert conversation.current_question_id == question_id  # unchanged, still open
+
+    async def test_valid_answer_is_stored_and_advances(self) -> None:
+        form, question_id = _validated_field_form(_FAN_COUNT_RULE)
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=question_id,
+        )
+        # answers=[...] simulates the DB state the post-add re-query will see --
+        # the mock can't react to session.add() dynamically (see _mock_session's
+        # own docstring / test_reaches_confirmation_once_all_required_answered).
+        session = _mock_session(answers=[_answer(question_id, text="5")], conversation=conversation)
+
+        reply = await service.handle_answer(
+            session, conversation_id=conversation_id, raw_text="5", form=form
+        )
+
+        assert reply is not None
+        assert reply.substate == ActiveSubstate.AWAITING_CONFIRMATION
+        added_answer = session.add.call_args.args[0]
+        assert added_answer.answer == {"text": "5"}
+
+    async def test_field_with_no_rule_skips_validation_entirely(self) -> None:
+        """Existing behavior for untracked fields (e.g. field_0/field_1 used
+        throughout this file's other fixtures) must be unaffected.
+        """
+        form, (q1,) = _form(mandatory_flags=[True])
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=q1,
+        )
+        session = _mock_session(
+            answers=[_answer(q1, text="anything goes")], conversation=conversation
+        )
+
+        reply = await service.handle_answer(
+            session, conversation_id=conversation_id, raw_text="anything goes", form=form
+        )
+
+        assert reply is not None
+        assert reply.substate == ActiveSubstate.AWAITING_CONFIRMATION
+        session.add.assert_called_once()
+
+    async def test_mandatory_question_with_no_rule_rejects_blank_answer(self) -> None:
+        """A mandatory field with no validation_rule row at all must still
+        reject a blank/whitespace-only answer -- validate_answer alone would
+        pass it through unchecked (see test_field_with_no_rule_skips_
+        validation_entirely), which is exactly the gap this guards against.
+        """
+        form, (q1,) = _form(mandatory_flags=[True])
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=q1,
+        )
+        session = _mock_session(answers=[], conversation=conversation)
+
+        reply = await service.handle_answer(
+            session, conversation_id=conversation_id, raw_text="   ", form=form
+        )
+
+        assert reply is not None
+        assert reply.substate == ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION
+        assert "เว้นว่าง" in reply.text
+        session.add.assert_not_called()  # blank answer never gets persisted
+        assert conversation.current_question_id == q1  # unchanged, still open
+
+    async def test_mandatory_question_with_rule_rejects_blank_answer(self) -> None:
+        """Same as above but for a field that DOES have a validation_rule --
+        the blank check must fire before validate_answer's own type check,
+        not rely on it (an empty string trivially satisfies VARCHAR's
+        max_length-only check).
+        """
+        form, question_id = _validated_field_form(_FAN_COUNT_RULE)
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=question_id,
+        )
+        session = _mock_session(answers=[], conversation=conversation)
+
+        reply = await service.handle_answer(
+            session, conversation_id=conversation_id, raw_text="", form=form
+        )
+
+        assert reply is not None
+        assert reply.substate == ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION
+        assert "เว้นว่าง" in reply.text
+        session.add.assert_not_called()
+        assert conversation.current_question_id == question_id
 
 
 class TestHandleAnswerParentPicker:

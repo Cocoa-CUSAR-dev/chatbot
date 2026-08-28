@@ -1,3 +1,21 @@
+-- Minimal schema for the DB-backed integration tests under tests/conversation/
+-- (validation e2e, see tests/conversation/test_validation_e2e.py once added).
+--
+-- Mirrors only the tables this service's own code actually touches or has a
+-- real FK dependency on, taken from the `database` repo's Flyway migrations
+-- (V1__baseline.sql for auth.user_account/form.task/form.task_form/
+-- form.question, V9__line_chat_notify_models.sql for auth.line_identity/
+-- chat.conversation/chat.conversation_answer). Copied rather than pulled in
+-- live -- `database` is a separate git repo with its own history, same
+-- reasoning mobile-backend's testSchemaDDL and web-backend's ci-schema.sql
+-- already use. If those migrations change shape, this needs a manual update
+-- to match.
+--
+-- form.section and form.field_validation_rule are deliberately NOT included:
+-- this service never queries either directly (ADR 0001's seam) -- form
+-- structure and validation rules arrive over HTTP from Kotlin's
+-- GET /forms/{formId}, which the tests mock instead of hitting a real DB.
+
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 CREATE SCHEMA auth;

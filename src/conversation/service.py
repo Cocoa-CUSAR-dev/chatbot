@@ -38,6 +38,7 @@ from src.conversation.constants import ActiveSubstate, AnswerSource, Conversatio
 from src.conversation.exceptions import ConversationNotFound
 from src.conversation.models import Conversation, ConversationAnswer
 from src.conversation.state_machine import on_guided_answer
+from src.conversation.validation import validate_answer
 from src.forms.schemas import FormDetail
 from src.line import parent_picker
 from src.tasks.client import submit_task
@@ -91,6 +92,7 @@ class Question:
     question_id: UUID
     label: str
     field_name: str
+    input_type: str
     is_mandatory: bool
     sort_order: int
     choices: list[Choice] | None = None
@@ -98,6 +100,11 @@ class Question:
     # from "has a skip button but is otherwise free text", which must still
     # accept arbitrary typed text rather than re-asking on a non-match.
     has_constrained_choices: bool = False
+    # From Kotlin's form.field_validation_rule, already joined onto this
+    # question server-side (FormRepository.kt) -- null for OPTION/BOOLEAN/
+    # upload (constrained another way already) or any field_name with no
+    # rule row. See validation.py's own docstring for the key-casing wrinkle.
+    validation_rule: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -110,6 +117,13 @@ class ConversationReply:
     # lets the caller re-attach the confirm button for a retry instead of
     # treating this as the terminal "saved" message.
     submission_failed: bool = False
+    # Debug-only passthrough of the open question's own shape -- None
+    # whenever this reply isn't "here's a fixed question to answer" (e.g.
+    # confirmation/completed/cancelled replies have no single open question).
+    # Not used by the real LINE webhook path; exists so the dev test UI can
+    # show a developer what's actually being validated without guessing.
+    input_type: str | None = None
+    validation_rule: dict[str, Any] | None = None
 
 
 def _constrained_choices_for(q: dict[str, Any]) -> list[Choice] | None:
@@ -134,7 +148,18 @@ def _choices_for(q: dict[str, Any], is_mandatory: bool) -> tuple[list[Choice], b
     constrained = _constrained_choices_for(q)
     if is_mandatory:
         if constrained is not None:
-            return [_PAUSE_CHOICE, *constrained], True
+            # Reviewer-caught regression: this branch used to return
+            # `constrained` completely unsliced, on the assumption a
+            # mandatory question's real choices were already within LINE's
+            # 13-item cap. Adding pause broke that assumption -- a
+            # mandatory OPTION field with exactly 13 real choices (e.g.
+            # farm_id) became 14 total, and router.py's own send-time
+            # `choices[:13]` slice silently dropped the LAST real choice --
+            # a farm a farmer could no longer actually select via button,
+            # not just a cosmetic overflow. Same room-for-pause treatment
+            # the non-mandatory branch below already had.
+            room_for_real_choices = _QUICK_REPLY_LIMIT - 1
+            return [_PAUSE_CHOICE, *constrained[:room_for_real_choices]], True
         return [_PAUSE_CHOICE], False
     if constrained is not None:
         room_for_real_choices = _QUICK_REPLY_LIMIT - 2  # room for both skip and pause
@@ -142,13 +167,19 @@ def _choices_for(q: dict[str, Any], is_mandatory: bool) -> tuple[list[Choice], b
     return [_SKIP_CHOICE, _PAUSE_CHOICE], False
 
 
-# Only these are actually wired up in the chat flow today -- DATE, DATETIME,
-# GEODATA, FLOAT, and INT are explicitly deferred (next sprints / LLM), and
-# "upload" is a VARCHAR field_name convention (see form.question seed data)
-# for photo attachments, which have nowhere to go yet either. Filtered out
-# at the form level (not just skipped when picking the next question) so
-# they never show up in the guided flow OR the confirmation summary.
-_SUPPORTED_INPUT_TYPES = {"VARCHAR", "OPTION", "BOOLEAN"}
+# DATE/DATETIME/FLOAT/INT all validate as free text through the same
+# validate_answer()-then-re-ask path VARCHAR/BOOLEAN already use, with no
+# LINE-side UI dependency -- CB-9 confirmed there's no blocker for any of
+# them. GEODATA stays deferred: it needs a storage.geo row + FK link, which
+# Go's dissection (SubmitTaskForUser, form_handler.go) still only does as a
+# single-table flat insert with no storage.geo handling at all -- a farmer
+# could answer a GEODATA question here and have the submission silently
+# lose the coordinate. "upload" is a VARCHAR field_name convention (see
+# form.question seed data) for photo attachments, which have nowhere to go
+# yet either. Filtered out at the form level (not just skipped when picking
+# the next question) so unsupported types never show up in the guided flow
+# OR the confirmation summary.
+_SUPPORTED_INPUT_TYPES = {"VARCHAR", "OPTION", "BOOLEAN", "FLOAT", "INT", "DATE", "DATETIME"}
 
 
 def _is_supported(q: dict[str, Any]) -> bool:
@@ -164,10 +195,12 @@ def _question_from_dict(q: dict[str, Any]) -> Question:
         question_id=UUID(str(q["question_id"])),
         label=str(q.get("label") or ""),
         field_name=str(q.get("field_name") or ""),
+        input_type=str(q.get("input_type") or ""),
         is_mandatory=is_mandatory,
         sort_order=int(q.get("sort_order", 0)),
         choices=choices,
         has_constrained_choices=has_constrained_choices,
+        validation_rule=q.get("validation_rule"),
     )
 
 
@@ -243,12 +276,17 @@ def _format_resume_recap(questions: list[Question], answers: list[ConversationAn
     return "คำตอบที่บันทึกไว้:\n" + lines + "\n\n"
 
 
-def _reply_for_question(conversation_id: UUID, question: Question) -> ConversationReply:
+def _reply_for_question(
+    conversation_id: UUID, question: Question, *, error: str | None = None
+) -> ConversationReply:
+    text = f"{error}\n\n{question.label}" if error else question.label
     return ConversationReply(
         conversation_id=conversation_id,
         substate=ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION,
-        text=question.label,
+        text=text,
         choices=question.choices,
+        input_type=question.input_type,
+        validation_rule=question.validation_rule,
     )
 
 
@@ -464,11 +502,38 @@ async def handle_answer(
                 # Doesn't match any listed choice -- re-ask rather than store
                 # text that can't resolve to a real domain value later. Keeps
                 # the same question open, same choices offered again.
-                return _reply_for_question(conversation_id, current_question)
+                return _reply_for_question(
+                    conversation_id,
+                    current_question,
+                    error="กรุณาเลือกคำตอบจากตัวเลือกที่กำหนดเท่านั้น",
+                )
             resolved_value = matched.id
         # else: non-mandatory free-text question offering only a skip button
         # -- typed text that isn't the skip label is a real answer, not a
         # mismatch, so it falls through to the normal free-text path below.
+
+    # Format validation (the Validate Answer step) only applies to genuine
+    # free text -- a skip is an intentional absence (nothing to check), and
+    # a resolved OPTION/BOOLEAN choice is already constrained to a
+    # known-good value by construction (matched against current_question's
+    # own choices above).
+    if not is_skip and resolved_value is None and current_question is not None:
+        # A mandatory free-text question offers no skip button (see
+        # _choices_for), so blank/whitespace-only text is never an
+        # intentional skip -- it's an empty non-answer. Checked ahead of
+        # validate_answer since a field with no validation_rule row at all
+        # (or a VARCHAR rule with no min_length) would otherwise let it
+        # through unchecked, defeating the point of gating the DB write on
+        # validation (US2-2).
+        if current_question.is_mandatory and not raw_text.strip():
+            return _reply_for_question(
+                conversation_id,
+                current_question,
+                error="กรุณาตอบคำถามนี้ ไม่สามารถเว้นว่างได้",
+            )
+        error = validate_answer(current_question.validation_rule, raw_text)
+        if error is not None:
+            return _reply_for_question(conversation_id, current_question, error=error)
 
     if is_skip:
         answer: dict[str, Any] = {"skipped": True}

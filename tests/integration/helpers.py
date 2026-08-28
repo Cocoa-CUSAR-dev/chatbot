@@ -161,8 +161,23 @@ def question_json(
     label: str = "คำถามทดสอบ",
     is_mandatory: bool = True,
     sort_order: int = 1,
+    validation_rule: dict[str, Any] | None = None,
+    choices: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
-    return {
+    """A question exactly as Kotlin's GET /service/forms/{formId} would spell
+    it -- camelCase, matching web-backend's Question.Entity -- for respx to
+    hand back before forms/client.py's get_form() converts it.
+
+    `validation_rule`, if given, should use the same camelCase spelling
+    form.field_validation_rule stores it with (e.g. "errorMessage", not
+    "error_message") -- get_form()'s _convert_keys() converts it recursively,
+    same as it would a real Kotlin response.
+
+    `choices` (OPTION questions only -- BOOLEAN's are synthesized in
+    service.py itself, never sent by Kotlin) is `[{"id": ..., "name": ...}]`,
+    matching Kotlin's own field names verbatim (no camelCase in either key).
+    """
+    question: dict[str, Any] = {
         "questionId": str(question_id),
         "label": label,
         "fieldName": field_name,
@@ -170,11 +185,19 @@ def question_json(
         "isMandatory": is_mandatory,
         "sortOrder": sort_order,
     }
+    if validation_rule is not None:
+        question["validationRule"] = validation_rule
+    if choices is not None:
+        question["choices"] = choices
+    return question
 
 
 def build_form_response(
     *, task_form_id: uuid.UUID, questions: list[dict[str, Any]]
 ) -> dict[str, Any]:
+    """The full `{"value": ..., "error": null}` envelope forms/client.py's
+    get_form() expects, wrapping the given questions in a single section.
+    """
     return {
         "value": {
             "formId": str(task_form_id),
@@ -182,6 +205,34 @@ def build_form_response(
         },
         "error": None,
     }
+
+
+async def seed_active_conversation(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    task_id: uuid.UUID,
+    task_form_id: uuid.UUID,
+    current_question_id: uuid.UUID,
+) -> uuid.UUID:
+    conversation_id = uuid.uuid4()
+    await session.execute(
+        text(
+            "INSERT INTO chat.conversation "
+            "(conversation_id, user_id, task_id, task_form_id, status, current_question_id) "
+            "VALUES (:conversation_id, :user_id, :task_id, :task_form_id, 'active', "
+            ":current_question_id)"
+        ),
+        {
+            "conversation_id": conversation_id,
+            "user_id": user_id,
+            "task_id": task_id,
+            "task_form_id": task_form_id,
+            "current_question_id": current_question_id,
+        },
+    )
+    await session.commit()
+    return conversation_id
 
 
 async def seed_conversation(
