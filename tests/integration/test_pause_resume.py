@@ -1,0 +1,390 @@
+"""Tests for pause/resume (US2-3) against a real Postgres session -- most
+classes exercise src.line.router + src.conversation.service together through
+the real /line/webhook route, with Kotlin's forms endpoint and LINE's reply
+call mocked at the boundary. TestPauseIdleConversations is the exception: it
+calls src.conversation.jobs.pause_idle_conversations directly, since that's a
+scheduled job with no webhook involved.
+"""
+
+import uuid
+from unittest.mock import AsyncMock, patch
+
+import respx
+from httpx import AsyncClient, Response
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.conversation.jobs import pause_idle_conversations
+from src.forms.config import forms_settings
+from src.line.config import line_settings
+from src.line.parent_picker import ParentOption
+from tests.integration.helpers import (
+    build_form_response,
+    build_postback_event,
+    build_text_message_event,
+    question_json,
+    seed_conversation,
+    seed_conversation_answer,
+    seed_question,
+    seed_task_form,
+    seed_user_with_line_identity,
+    sign_signature,
+)
+
+_START_KEYWORD = "เริ่ม"
+
+_PAUSE_LABEL = "⏸️ พักไว้ก่อน"
+
+
+async def _conversation_row(session: AsyncSession, conversation_id: uuid.UUID) -> dict:
+    result = await session.execute(
+        text(
+            "SELECT status, current_question_id FROM chat.conversation WHERE conversation_id = :id"
+        ),
+        {"id": conversation_id},
+    )
+    row = result.mappings().one()
+    return dict(row)
+
+
+async def _send_message(client: AsyncClient, *, line_user_id: str, text_content: str) -> AsyncMock:
+    body = build_text_message_event(line_user_id=line_user_id, text_content=text_content)
+    signature = sign_signature(body, line_settings.LINE_CHANNEL_SECRET)
+    with patch(
+        "src.line.service.AsyncMessagingApi.reply_message", new_callable=AsyncMock
+    ) as reply_message:
+        response = await client.post(
+            "/line/webhook", content=body, headers={"X-Line-Signature": signature}
+        )
+    assert response.status_code == 200
+    return reply_message
+
+
+async def _send_postback(client: AsyncClient, *, line_user_id: str, data: str) -> AsyncMock:
+    body = build_postback_event(line_user_id=line_user_id, data=data)
+    signature = sign_signature(body, line_settings.LINE_CHANNEL_SECRET)
+    with patch(
+        "src.line.service.AsyncMessagingApi.reply_message", new_callable=AsyncMock
+    ) as reply_message:
+        response = await client.post(
+            "/line/webhook", content=body, headers={"X-Line-Signature": signature}
+        )
+    assert response.status_code == 200
+    return reply_message
+
+
+class TestExplicitPause:
+    async def test_pause_label_pauses_without_touching_answers(
+        self, db_session: AsyncSession, client: AsyncClient
+    ) -> None:
+        task_id, task_form_id = await seed_task_form(db_session)
+        question_1 = await seed_question(
+            db_session, task_id=task_id, field_name="notes", input_type="VARCHAR", sort_order=1
+        )
+        question_2 = await seed_question(
+            db_session,
+            task_id=task_id,
+            field_name="notes2",
+            input_type="VARCHAR",
+            label="คำถามที่สอง",
+            sort_order=2,
+        )
+        line_user_id = f"U{uuid.uuid4().hex}"
+        user_id = await seed_user_with_line_identity(db_session, line_user_id=line_user_id)
+        conversation_id = await seed_conversation(
+            db_session,
+            user_id=user_id,
+            task_id=task_id,
+            task_form_id=task_form_id,
+            current_question_id=question_2,
+            status="active",
+        )
+        await seed_conversation_answer(
+            db_session,
+            conversation_id=conversation_id,
+            question_id=question_1,
+            text_value="คำตอบแรก",
+        )
+
+        form_response = build_form_response(
+            task_form_id=task_form_id,
+            questions=[
+                question_json(
+                    question_id=question_1, field_name="notes", input_type="VARCHAR", sort_order=1
+                ),
+                question_json(
+                    question_id=question_2,
+                    field_name="notes2",
+                    input_type="VARCHAR",
+                    label="คำถามที่สอง",
+                    sort_order=2,
+                ),
+            ],
+        )
+
+        with respx.mock:
+            respx.get(f"{forms_settings.KOTLIN_BACKEND_URL}/service/forms/{task_form_id}").mock(
+                return_value=Response(200, json=form_response)
+            )
+            reply_message = await _send_message(
+                client, line_user_id=line_user_id, text_content=_PAUSE_LABEL
+            )
+
+        reply_message.assert_awaited_once()
+        reply_text = reply_message.await_args.args[0].messages[0].text
+        assert reply_text == (
+            'พักงานนี้ไว้ให้แล้ว คำตอบที่ตอบไปแล้วถูกบันทึกครบถ้วน พิมพ์ "เริ่ม" เพื่อดูรายการงานเมื่อพร้อมทำต่อ'
+        )
+
+        row = await _conversation_row(db_session, conversation_id)
+        assert row["status"] == "paused"
+        assert row["current_question_id"] == question_2
+
+        answered = await db_session.execute(
+            text(
+                "SELECT answer FROM chat.conversation_answer "
+                "WHERE conversation_id = :conversation_id AND question_id = :question_id"
+            ),
+            {"conversation_id": conversation_id, "question_id": question_1},
+        )
+        assert answered.scalar_one()["text"] == "คำตอบแรก"
+
+
+class TestResume:
+    async def test_resume_shows_recap_then_next_question(
+        self, db_session: AsyncSession, client: AsyncClient
+    ) -> None:
+        task_id, task_form_id = await seed_task_form(db_session)
+        question_1 = await seed_question(
+            db_session, task_id=task_id, field_name="notes", input_type="VARCHAR", sort_order=1
+        )
+        question_2 = await seed_question(
+            db_session,
+            task_id=task_id,
+            field_name="notes2",
+            input_type="VARCHAR",
+            label="คำถามที่สอง",
+            sort_order=2,
+        )
+        line_user_id = f"U{uuid.uuid4().hex}"
+        user_id = await seed_user_with_line_identity(db_session, line_user_id=line_user_id)
+        conversation_id = await seed_conversation(
+            db_session,
+            user_id=user_id,
+            task_id=task_id,
+            task_form_id=task_form_id,
+            current_question_id=question_2,
+            status="paused",
+        )
+        await seed_conversation_answer(
+            db_session,
+            conversation_id=conversation_id,
+            question_id=question_1,
+            text_value="คำตอบแรก",
+        )
+
+        form_response = build_form_response(
+            task_form_id=task_form_id,
+            questions=[
+                question_json(
+                    question_id=question_1, field_name="notes", input_type="VARCHAR", sort_order=1
+                ),
+                question_json(
+                    question_id=question_2,
+                    field_name="notes2",
+                    input_type="VARCHAR",
+                    label="คำถามที่สอง",
+                    sort_order=2,
+                ),
+            ],
+        )
+
+        with respx.mock:
+            respx.get(f"{forms_settings.KOTLIN_BACKEND_URL}/service/forms/{task_form_id}").mock(
+                return_value=Response(200, json=form_response)
+            )
+            reply_message = await _send_postback(
+                client,
+                line_user_id=line_user_id,
+                data=f"start:{task_id}:{task_form_id}:simple_handler",
+            )
+
+        reply_message.assert_awaited_once()
+        reply_text = reply_message.await_args.args[0].messages[0].text
+        assert reply_text == "คำตอบที่บันทึกไว้:\n- คำถามทดสอบ: คำตอบแรก\n\nคำถามที่สอง"
+
+        row = await _conversation_row(db_session, conversation_id)
+        assert row["status"] == "active"
+        assert row["current_question_id"] == question_2
+
+
+class TestStartKeywordListsTasks:
+    async def test_start_keyword_pauses_active_conversation_and_lists_it(
+        self, db_session: AsyncSession, client: AsyncClient
+    ) -> None:
+        task_id, task_form_id = await seed_task_form(db_session, title="งานทดสอบ", handler="notes")
+        line_user_id = f"U{uuid.uuid4().hex}"
+        user_id = await seed_user_with_line_identity(db_session, line_user_id=line_user_id)
+        conversation_id = await seed_conversation(
+            db_session, user_id=user_id, task_id=task_id, task_form_id=task_form_id, status="active"
+        )
+
+        reply_message = await _send_message(
+            client, line_user_id=line_user_id, text_content=_START_KEYWORD
+        )
+
+        reply_message.assert_awaited_once()
+        message = reply_message.await_args.args[0].messages[0]
+        assert message.text == "เลือกงานที่ต้องการทำ:"
+        assert len(message.quick_reply.items) == 1
+        action = message.quick_reply.items[0].action
+        assert action.label == "🔄 งานทดสอบ"
+        assert action.data == f"start:{task_id}:{task_form_id}:notes"
+        assert action.display_text == "ทำต่อ: งานทดสอบ"
+
+        row = await _conversation_row(db_session, conversation_id)
+        assert row["status"] == "paused"
+
+    async def test_start_keyword_labels_new_task_without_prefix(
+        self, db_session: AsyncSession, client: AsyncClient
+    ) -> None:
+        resumable_task_id, resumable_task_form_id = await seed_task_form(
+            db_session, title="งานค้างไว้", handler="notes"
+        )
+        new_task_id, new_task_form_id = await seed_task_form(
+            db_session, title="งานใหม่", handler="notes"
+        )
+        line_user_id = f"U{uuid.uuid4().hex}"
+        user_id = await seed_user_with_line_identity(db_session, line_user_id=line_user_id)
+        await seed_conversation(
+            db_session,
+            user_id=user_id,
+            task_id=resumable_task_id,
+            task_form_id=resumable_task_form_id,
+            status="paused",
+        )
+
+        reply_message = await _send_message(
+            client, line_user_id=line_user_id, text_content=_START_KEYWORD
+        )
+
+        reply_message.assert_awaited_once()
+        items = reply_message.await_args.args[0].messages[0].quick_reply.items
+        actions_by_task_id = {item.action.data.split(":")[1]: item.action for item in items}
+
+        resumable_action = actions_by_task_id[str(resumable_task_id)]
+        assert resumable_action.label == "🔄 งานค้างไว้"
+        assert resumable_action.display_text == "ทำต่อ: งานค้างไว้"
+
+        new_action = actions_by_task_id[str(new_task_id)]
+        assert new_action.label == "งานใหม่"
+        assert new_action.display_text == "งานใหม่"
+
+
+async def _conversation_statuses(
+    session: AsyncSession, conversation_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, str]:
+    result = await session.execute(
+        text(
+            "SELECT conversation_id, status FROM chat.conversation "
+            "WHERE conversation_id = ANY(:ids)"
+        ),
+        {"ids": conversation_ids},
+    )
+    return {row.conversation_id: row.status for row in result}
+
+
+class TestPauseIdleConversations:
+    async def test_pauses_only_active_conversations(self, db_session: AsyncSession) -> None:
+        task_id, task_form_id = await seed_task_form(db_session)
+
+        async def _seed(status: str) -> uuid.UUID:
+            user_id = await seed_user_with_line_identity(
+                db_session, line_user_id=f"U{uuid.uuid4().hex}"
+            )
+            return await seed_conversation(
+                db_session,
+                user_id=user_id,
+                task_id=task_id,
+                task_form_id=task_form_id,
+                status=status,
+            )
+
+        active_1 = await _seed("active")
+        active_2 = await _seed("active")
+        already_paused = await _seed("paused")
+        completed = await _seed("completed")
+        cancelled = await _seed("cancelled")
+
+        await pause_idle_conversations()
+
+        statuses = await _conversation_statuses(
+            db_session, [active_1, active_2, already_paused, completed, cancelled]
+        )
+        assert statuses[active_1] == "paused"
+        assert statuses[active_2] == "paused"
+        assert statuses[already_paused] == "paused"
+        assert statuses[completed] == "completed"
+        assert statuses[cancelled] == "cancelled"
+
+
+class TestResumeAtParentPicker:
+    async def test_resume_shows_parent_choices_again(
+        self, db_session: AsyncSession, client: AsyncClient
+    ) -> None:
+        task_id, task_form_id = await seed_task_form(db_session, handler="farm_activity_fertilizer")
+        question_1 = await seed_question(
+            db_session, task_id=task_id, field_name="amount_kg", input_type="FLOAT", sort_order=1
+        )
+        line_user_id = f"U{uuid.uuid4().hex}"
+        user_id = await seed_user_with_line_identity(db_session, line_user_id=line_user_id)
+        conversation_id = await seed_conversation(
+            db_session,
+            user_id=user_id,
+            task_id=task_id,
+            task_form_id=task_form_id,
+            status="paused",
+            parent_answer={"pending_kind": "farm_activity"},
+        )
+
+        form_response = build_form_response(
+            task_form_id=task_form_id,
+            questions=[
+                question_json(
+                    question_id=question_1,
+                    field_name="amount_kg",
+                    input_type="FLOAT",
+                    sort_order=1,
+                )
+            ],
+        )
+        parent_choices = [
+            ParentOption(id="activity-1", label="ตัวเลือก 1"),
+            ParentOption(id="activity-2", label="ตัวเลือก 2"),
+        ]
+
+        with (
+            respx.mock,
+            patch(
+                "src.line.parent_picker.choices_for",
+                new_callable=AsyncMock,
+                return_value=parent_choices,
+            ),
+        ):
+            respx.get(f"{forms_settings.KOTLIN_BACKEND_URL}/service/forms/{task_form_id}").mock(
+                return_value=Response(200, json=form_response)
+            )
+            reply_message = await _send_postback(
+                client,
+                line_user_id=line_user_id,
+                data=f"start:{task_id}:{task_form_id}:farm_activity_fertilizer",
+            )
+
+        reply_message.assert_awaited_once()
+        message = reply_message.await_args.args[0].messages[0]
+        assert message.text == "เลือกกิจกรรมในฟาร์มที่เกี่ยวข้อง:"
+        labels = [item.action.label for item in message.quick_reply.items]
+        assert labels == ["⏸️ พักไว้ก่อน", "ตัวเลือก 1", "ตัวเลือก 2"]
+
+        row = await _conversation_row(db_session, conversation_id)
+        assert row["status"] == "active"

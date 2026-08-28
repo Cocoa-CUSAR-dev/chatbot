@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import json
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import text
@@ -45,6 +46,25 @@ def build_text_message_event(
     return json.dumps(payload).encode()
 
 
+def build_postback_event(*, line_user_id: str, data: str, reply_token: str | None = None) -> bytes:
+    payload = {
+        "destination": "Udestination0000000000000000000",
+        "events": [
+            {
+                "type": "postback",
+                "source": {"type": "user", "userId": line_user_id},
+                "timestamp": 1700000000000,
+                "mode": "active",
+                "webhookEventId": str(uuid.uuid4()),
+                "deliveryContext": {"isRedelivery": False},
+                "replyToken": reply_token or str(uuid.uuid4()),
+                "postback": {"data": data},
+            }
+        ],
+    }
+    return json.dumps(payload).encode()
+
+
 async def seed_user_with_line_identity(session: AsyncSession, *, line_user_id: str) -> uuid.UUID:
     user_id = uuid.uuid4()
     await session.execute(
@@ -62,19 +82,43 @@ async def seed_user_with_line_identity(session: AsyncSession, *, line_user_id: s
     return user_id
 
 
-async def seed_task_form(session: AsyncSession) -> tuple[uuid.UUID, uuid.UUID]:
+async def seed_task_form(
+    session: AsyncSession,
+    *,
+    title: str | None = None,
+    handler: str = "notes",
+    open_at: datetime | None = None,
+) -> tuple[uuid.UUID, uuid.UUID]:
     task_id = uuid.uuid4()
     task_form_id = uuid.uuid4()
 
     await session.execute(
-        text("INSERT INTO form.task (task_id) VALUES (:task_id)"), {"task_id": task_id}
+        text("INSERT INTO form.task (task_id, title, open_at) VALUES (:task_id, :title, :open_at)"),
+        {
+            "task_id": task_id,
+            "title": title,
+            "open_at": open_at or datetime.now(UTC).replace(tzinfo=None),
+        },
     )
     await session.execute(
-        text("INSERT INTO form.task_form (form_id, task_id) VALUES (:form_id, :task_id)"),
-        {"form_id": task_form_id, "task_id": task_id},
+        text(
+            "INSERT INTO form.task_form (form_id, task_id, handler) "
+            "VALUES (:form_id, :task_id, :handler)"
+        ),
+        {"form_id": task_form_id, "task_id": task_id, "handler": handler},
     )
     await session.commit()
     return task_id, task_form_id
+
+
+async def seed_form_response(
+    session: AsyncSession, *, task_id: uuid.UUID, user_id: uuid.UUID
+) -> None:
+    await session.execute(
+        text("INSERT INTO form.response (task_log_id, user_id) VALUES (:task_log_id, :user_id)"),
+        {"task_log_id": task_id, "user_id": user_id},
+    )
+    await session.commit()
 
 
 async def seed_question(
@@ -189,3 +233,58 @@ async def seed_active_conversation(
     )
     await session.commit()
     return conversation_id
+
+
+async def seed_conversation(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    task_id: uuid.UUID,
+    task_form_id: uuid.UUID,
+    current_question_id: uuid.UUID | None = None,
+    status: str = "active",
+    parent_answer: dict[str, Any] | None = None,
+) -> uuid.UUID:
+    conversation_id = uuid.uuid4()
+    await session.execute(
+        text(
+            "INSERT INTO chat.conversation "
+            "(conversation_id, user_id, task_id, task_form_id, status, "
+            "current_question_id, parent_answer) "
+            "VALUES (:conversation_id, :user_id, :task_id, :task_form_id, :status, "
+            ":current_question_id, CAST(:parent_answer AS jsonb))"
+        ),
+        {
+            "conversation_id": conversation_id,
+            "user_id": user_id,
+            "task_id": task_id,
+            "task_form_id": task_form_id,
+            "status": status,
+            "current_question_id": current_question_id,
+            "parent_answer": json.dumps(parent_answer) if parent_answer is not None else None,
+        },
+    )
+    await session.commit()
+    return conversation_id
+
+
+async def seed_conversation_answer(
+    session: AsyncSession,
+    *,
+    conversation_id: uuid.UUID,
+    question_id: uuid.UUID,
+    text_value: str,
+) -> None:
+    await session.execute(
+        text(
+            "INSERT INTO chat.conversation_answer "
+            "(conversation_id, question_id, answer, source) "
+            "VALUES (:conversation_id, :question_id, CAST(:answer AS jsonb), 'guided_flow')"
+        ),
+        {
+            "conversation_id": conversation_id,
+            "question_id": question_id,
+            "answer": json.dumps({"text": text_value}),
+        },
+    )
+    await session.commit()

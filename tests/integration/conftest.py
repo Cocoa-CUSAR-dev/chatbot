@@ -15,6 +15,7 @@ _CLEANUP_TABLES = (
     "chat.conversation_answer",
     "chat.conversation",
     "auth.line_identity",
+    "form.response",
     "form.question",
     "form.task_form",
     "form.task",
