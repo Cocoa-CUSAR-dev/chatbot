@@ -126,6 +126,48 @@ async def reply_confirm_prompt(reply_token: str, text: str, conversation_id: UUI
         )
 
 
+async def reply_autofill_offer(
+    reply_token: str, *, task_id: str, task_form_id: str, handler: str
+) -> None:
+    """US2-4: offers reusing the farmer's last COMPLETED submission for this
+    handler, before a fresh Conversation row exists. Two Postback buttons,
+    not a guided-flow question -- there's no current_question_id yet for
+    handle_answer to resolve a typed "ใช่"/"ไม่" against, since the
+    conversation itself doesn't exist until the farmer answers this. Same
+    encode-everything-in-postback-data convention as reply_task_choices/
+    reply_confirm_prompt: no extra state is persisted between this offer and
+    the tap -- router.py's "start_autofill" branch re-fetches the last
+    answer itself on "yes" rather than trusting whatever was true when this
+    was sent.
+    """
+    quick_reply = QuickReply(
+        items=[
+            QuickReplyItem(
+                action=PostbackAction(
+                    label="ใช้ข้อมูลเดิม",
+                    data=f"start_autofill:yes:{task_id}:{task_form_id}:{handler}",
+                    displayText="ใช้ข้อมูลเดิม",
+                )
+            ),
+            QuickReplyItem(
+                action=PostbackAction(
+                    label="กรอกใหม่",
+                    data=f"start_autofill:no:{task_id}:{task_form_id}:{handler}",
+                    displayText="กรอกใหม่",
+                )
+            ),
+        ]
+    )
+    message = TextMessage(
+        text="พบข้อมูลที่เคยกรอกไว้ก่อนหน้านี้ ต้องการนำมาใช้กรอกให้อัตโนมัติหรือไม่?",
+        quickReply=quick_reply,
+    )
+    async with AsyncApiClient(_configuration) as client:
+        await AsyncMessagingApi(client).reply_message(
+            ReplyMessageRequest(replyToken=reply_token, messages=[message])
+        )
+
+
 async def reply_flex(reply_token: str, alt_text: str, contents: dict[str, Any]) -> None:
     """Flex Message reply -- e.g. a confirmation summary (AwaitingConfirmation,
     target-architecture.md #4) with real layout instead of a wall of text.

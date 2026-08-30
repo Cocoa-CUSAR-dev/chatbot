@@ -239,6 +239,83 @@ class TestStartConversation:
         assert reply.text == "question 0"
 
 
+class TestStartConversationWithAutofill:
+    """US2-4: seeding a brand-new conversation from a sanitized reuse
+    answer (already filtered by src.conversation.reuse.sanitize_for_autofill
+    before it reaches here -- these tests pass already-clean dicts, the
+    same way router.py will after calling that function itself).
+    """
+
+    async def test_every_question_reused_goes_straight_to_confirmation(self) -> None:
+        form, (q1, q2) = _form(mandatory_flags=[True, True])
+        session = _mock_session(answers=[])
+
+        reply = await service.start_conversation_with_autofill(
+            session,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            form=form,
+            sanitized_answer={"field_0": "คำตอบที่ 1", "field_1": "คำตอบที่ 2"},
+        )
+
+        assert reply.substate == ActiveSubstate.AWAITING_CONFIRMATION
+        assert "สรุปคำตอบของคุณ" in reply.text
+        assert "คำตอบที่ 1" in reply.text
+        assert "คำตอบที่ 2" in reply.text
+
+    async def test_partial_reuse_recaps_then_asks_the_remaining_question(self) -> None:
+        form, (q1, q2) = _form(mandatory_flags=[True, True])
+        session = _mock_session(answers=[])
+
+        reply = await service.start_conversation_with_autofill(
+            session,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            form=form,
+            sanitized_answer={"field_0": "คำตอบที่ 1"},
+        )
+
+        assert reply.substate == ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION
+        assert "question 0" in reply.text  # recap of the reused answer
+        assert "คำตอบที่ 1" in reply.text
+        assert reply.text.endswith("question 1")  # the one still unanswered, asked fresh
+
+    async def test_nothing_reused_behaves_like_a_fresh_start_with_no_recap(self) -> None:
+        form, (q1,) = _form(mandatory_flags=[True])
+        session = _mock_session(answers=[])
+
+        reply = await service.start_conversation_with_autofill(
+            session,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            form=form,
+            sanitized_answer={},
+        )
+
+        assert reply.text == "question 0"  # no recap prefix -- nothing was reused
+
+    async def test_reused_option_value_shows_its_label_not_its_raw_id(self) -> None:
+        form, question_id = _mandatory_option_form(choice_count=3)
+        farm_choice_id = form.sections[0]["questions"][0]["choices"][1]["id"]
+        session = _mock_session(answers=[])
+
+        reply = await service.start_conversation_with_autofill(
+            session,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            form=form,
+            sanitized_answer={"farm_id": farm_choice_id},
+        )
+
+        assert reply.substate == ActiveSubstate.AWAITING_CONFIRMATION
+        assert "farm 1" in reply.text  # the label, not the raw uuid
+        assert farm_choice_id not in reply.text
+
+
 class TestStartConversationWithParentPicker:
     """The 5 previously-blocked handlers (docs/plans/chatbot-child-handler-
     design.md) start on a synthetic parent-picker question instead of the

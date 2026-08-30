@@ -14,16 +14,23 @@ from linebot.v3.webhooks import (
 )
 from sqlalchemy import select
 
-from src.conversation import service
+from src.conversation import reuse, service
 from src.conversation.constants import ActiveSubstate, ConversationStatus
 from src.conversation.exceptions import ConversationNotFound
 from src.conversation.models import Conversation
 from src.database import async_session_maker
+from src.exceptions import UpstreamServiceError
 from src.forms.client import get_form
 from src.line import identity, parent_picker, temp_task_picker
 from src.line.dependencies import parse_line_events
 from src.line.schemas import QuickReplyOption
-from src.line.service import reply_confirm_prompt, reply_task_choices, reply_text
+from src.line.service import (
+    reply_autofill_offer,
+    reply_confirm_prompt,
+    reply_task_choices,
+    reply_text,
+)
+from src.tasks.client import fetch_last_answer
 
 router = APIRouter(prefix="/line", tags=["line"])
 logger = logging.getLogger(__name__)
@@ -228,6 +235,30 @@ async def _handle_postback(event: PostbackEvent) -> None:
                 if not parent_choices:
                     await reply_text(event.reply_token, parent_picker.EMPTY_PROMPT[parent_kind])
                     return
+            else:
+                # US2-4: offer reusing the farmer's last COMPLETED
+                # submission for this handler -- never for the 5
+                # parent-picker handlers above (which farm/harvest/batch a
+                # submission belongs to must always be picked fresh, never
+                # reused). A Go hiccup here must not block starting a plain
+                # conversation -- worst case, just no offer.
+                try:
+                    last_answer = await fetch_last_answer(user_id=str(user_id), handler=handler)
+                except UpstreamServiceError:
+                    logger.warning(
+                        "fetch_last_answer failed for handler=%s -- starting fresh, no offer",
+                        handler,
+                        exc_info=True,
+                    )
+                    last_answer = None
+                if last_answer is not None:
+                    await reply_autofill_offer(
+                        event.reply_token,
+                        task_id=task_id,
+                        task_form_id=task_form_id,
+                        handler=handler,
+                    )
+                    return
 
             reply = await service.start_conversation(
                 session,
@@ -237,6 +268,71 @@ async def _handle_postback(event: PostbackEvent) -> None:
                 form=form,
                 parent_kind=parent_kind,
                 parent_choices=parent_choices,
+            )
+        await _reply(event.reply_token, reply)
+    elif action == "start_autofill":
+        decision, task_id, task_form_id, handler = args
+        user_id = await _resolve_user_id(event.source.user_id)
+        if user_id is None:
+            await reply_text(event.reply_token, "บัญชี LINE นี้ยังไม่ได้เชื่อมกับบัญชีในระบบ")
+            return
+
+        form = await get_form(task_form_id)
+        async with async_session_maker() as session:
+            # Same double-tap/race guard as the "start" branch above --
+            # this offer can only have been sent for a task with no
+            # resumable conversation at the time, but time has passed
+            # since then (the farmer had to read the offer and tap a
+            # button), so re-check rather than trust that's still true.
+            existing = await service.find_resumable_conversation(
+                session, user_id=user_id, task_id=UUID(task_id)
+            )
+            if existing is not None:
+                resume_form = await get_form(str(existing.task_form_id))
+                reply = await service.resume_conversation(
+                    session, conversation=existing, form=resume_form
+                )
+                await _reply(event.reply_token, reply)
+                return
+
+            if decision == "yes":
+                # Re-fetched rather than trusting the offer's own check --
+                # see reply_autofill_offer's docstring: no state is
+                # persisted between the offer and this tap.
+                try:
+                    last_answer = await fetch_last_answer(user_id=str(user_id), handler=handler)
+                except UpstreamServiceError:
+                    logger.warning(
+                        "fetch_last_answer failed for handler=%s on start_autofill -- "
+                        "starting fresh instead",
+                        handler,
+                        exc_info=True,
+                    )
+                    last_answer = None
+                if last_answer is not None:
+                    questions = service.questions_from_form(form)
+                    sanitized = reuse.sanitize_for_autofill(last_answer, questions)
+                    reply = await service.start_conversation_with_autofill(
+                        session,
+                        user_id=user_id,
+                        task_id=UUID(task_id),
+                        task_form_id=UUID(task_form_id),
+                        form=form,
+                        sanitized_answer=sanitized,
+                    )
+                    await _reply(event.reply_token, reply)
+                    return
+                # The last answer disappeared between the offer and this
+                # tap (race, or a second Go hiccup) -- fall through to a
+                # plain start below rather than leaving the farmer stuck
+                # on a "yes" that can no longer be honored.
+
+            reply = await service.start_conversation(
+                session,
+                user_id=user_id,
+                task_id=UUID(task_id),
+                task_form_id=UUID(task_form_id),
+                form=form,
             )
         await _reply(event.reply_token, reply)
     elif action == "confirm":

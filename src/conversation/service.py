@@ -34,6 +34,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.conversation import reuse
 from src.conversation.constants import ActiveSubstate, AnswerSource, ConversationStatus
 from src.conversation.exceptions import ConversationNotFound
 from src.conversation.models import Conversation, ConversationAnswer
@@ -356,6 +357,75 @@ async def start_conversation(
         )
 
     return _reply_for_question(conversation.conversation_id, first_question)
+
+
+async def start_conversation_with_autofill(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    task_id: UUID,
+    task_form_id: UUID,
+    form: FormDetail,
+    sanitized_answer: dict[str, Any],
+) -> ConversationReply:
+    """US2-4 ("offer reusing my last submission's answers") -- same shape as
+    start_conversation's no-parent path, except the new conversation's
+    answers are seeded from `sanitized_answer` (already run through
+    reuse.sanitize_for_autofill by the caller) instead of starting blank.
+
+    Never called for one of the 5 parent-picker handlers: router.py only
+    offers autofill when parent_kind is None (a submission's parent row --
+    which farm/harvest/batch -- is exactly the kind of thing that must be
+    picked fresh each time, never reused, so those handlers keep going
+    through plain start_conversation regardless of reuse history).
+    """
+    conversation = Conversation(
+        user_id=user_id,
+        task_id=task_id,
+        task_form_id=task_form_id,
+        status=ConversationStatus.ACTIVE,
+        current_question_id=None,
+    )
+    session.add(conversation)
+    await session.commit()
+    await session.refresh(conversation)
+
+    questions = questions_from_form(form)
+    answer_rows = reuse.build_answer_rows(conversation.conversation_id, sanitized_answer, questions)
+    for row in answer_rows:
+        session.add(row)
+
+    answered = {row.question_id for row in answer_rows}
+    next_question = _next_unanswered_required(questions, answered)
+    conversation.current_question_id = next_question.question_id if next_question else None
+    await session.commit()
+
+    if next_question is None:
+        # Every question was covered by the reused answer -- straight to
+        # confirmation, same as start_conversation's all-optional-form case.
+        # No separate recap prefix: _format_confirmation_summary already
+        # lists every answered field (see resume_conversation's identical
+        # reasoning for its own current_question_id-is-None branch).
+        return ConversationReply(
+            conversation_id=conversation.conversation_id,
+            substate=ActiveSubstate.AWAITING_CONFIRMATION,
+            text=_format_confirmation_summary(questions, answer_rows),
+        )
+
+    # Some questions were reused, but at least one still needs asking (a new
+    # field on the form, or one reuse.sanitize_for_autofill dropped as
+    # stale) -- recap what's already filled in before asking it, same
+    # "don't leave a farmer guessing what's already answered" reasoning as
+    # resume_conversation's recap.
+    recap = _format_resume_recap(questions, answer_rows)
+    return ConversationReply(
+        conversation_id=conversation.conversation_id,
+        substate=ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION,
+        text=recap + next_question.label,
+        choices=next_question.choices,
+        input_type=next_question.input_type,
+        validation_rule=next_question.validation_rule,
+    )
 
 
 async def _handle_parent_answer(

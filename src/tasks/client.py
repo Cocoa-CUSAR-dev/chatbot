@@ -9,6 +9,8 @@ merged in mobile-backend's feat/dissection-standalone-handlers. A successful
 call here does create a real domain row, not just a form.response one.
 """
 
+from typing import Any
+
 import httpx
 
 from src.exceptions import UpstreamServiceError
@@ -60,6 +62,39 @@ async def submit_task(submission: TaskSubmission) -> None:
             f"Go doesn't support automatic storage for this handler yet (501): {detail}"
         )
     raise UpstreamServiceError(f"Go backend returned {response.status_code}: {detail}")
+
+
+async def fetch_last_answer(*, user_id: str, handler: str) -> dict[str, Any] | None:
+    """GET Go's /service/tasks/last-answer (#100, US2-4) -- the raw answer
+    JSON from this farmer's most recent COMPLETED submission for `handler`,
+    or None if there isn't one yet. Deliberately unfiltered: task_id, stale
+    parent IDs (farm_activity_id/harvest_id/batch_id), and OPTION values
+    that may no longer resolve in the CURRENT form are all still in here --
+    src.conversation.reuse.sanitize_for_autofill is what strips those
+    before anything gets offered to a farmer, not this function.
+    """
+    async with httpx.AsyncClient(base_url=tasks_settings.GO_BACKEND_URL, timeout=30.0) as client:
+        response = await client.get(
+            "/service/tasks/last-answer",
+            params={"user_id": user_id, "handler": handler},
+            headers={"X-Service-Key": tasks_settings.GO_SERVICE_KEY},
+        )
+
+    if response.status_code == 404:
+        return None
+    if response.status_code >= 400:
+        raise UpstreamServiceError(
+            f"Go backend returned {response.status_code} for last-answer lookup: "
+            f"{_error_detail(response)}"
+        )
+
+    body = response.json()
+    answer = body.get("answer")
+    if not isinstance(answer, dict):
+        raise UpstreamServiceError(
+            f"Go's last-answer response had no usable 'answer' object: {body!r}"
+        )
+    return answer
 
 
 def _error_detail(response: httpx.Response) -> str:
