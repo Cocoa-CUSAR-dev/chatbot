@@ -54,17 +54,25 @@ async def reply_task_choices(reply_token: str, text: str, tasks: list["PendingTa
     """Quick Reply where each tap fires a Postback instead of re-sending its
     label as text -- used for the TEMPORARY task-picker keyword flow (see
     src/line/temp_task_picker.py; Sprint 5's real LIFF to-do list replaces
-    this). Each button's data is "start:<task_id>:<task_form_id>", which
-    router.py's _handle_postback already knows how to handle -- this is the
-    only new piece, not a new postback convention.
+    this). Each button's data is "start:<task_id>:<task_form_id>:<handler>" --
+    handler rides along so _handle_postback can warn the farmer before
+    starting a conversation for a form Go can't save yet, without a second
+    DB round-trip (well under LINE's 300-char limit on postback data).
     """
     quick_reply = QuickReply(
         items=[
             QuickReplyItem(
                 action=PostbackAction(
-                    label=task.title[:_QUICK_REPLY_LABEL_MAX],
-                    data=f"start:{task.task_id}:{task.task_form_id}",
-                    displayText=task.title,
+                    # US2-3: a short "🔄 " marker on the button itself
+                    # (label is truncated to 20 chars, so a longer prefix
+                    # would eat into an already-tight budget) -- the
+                    # unclipped displayText spells it out in full instead,
+                    # since that's what shows in the chat history.
+                    label=(f"🔄 {task.title}" if task.has_conversation else task.title)[
+                        :_QUICK_REPLY_LABEL_MAX
+                    ],
+                    data=f"start:{task.task_id}:{task.task_form_id}:{task.handler}",
+                    displayText=(f"ทำต่อ: {task.title}" if task.has_conversation else task.title),
                 )
             )
             for task in tasks

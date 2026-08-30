@@ -1,0 +1,659 @@
+"""Webhook-level tests for the guided-flow answer loop -- exercises
+src.line.router + src.conversation.service + a real Postgres session
+together through the actual /line/webhook route. Kotlin's forms endpoint is
+mocked with respx (it's httpx-based); LINE's reply call is mocked by
+patching AsyncMessagingApi.reply_message directly, since line-bot-sdk sends
+it over aiohttp, which respx cannot intercept.
+"""
+
+import uuid
+from typing import Any
+from unittest.mock import AsyncMock, patch
+
+import pytest
+import respx
+from httpx import AsyncClient, Response
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.forms.config import forms_settings
+from src.line.config import line_settings
+from tests.integration.helpers import (
+    build_form_response,
+    build_text_message_event,
+    question_json,
+    seed_active_conversation,
+    seed_question,
+    seed_task_form,
+    seed_user_with_line_identity,
+    sign_signature,
+)
+
+
+async def _current_question_id(
+    session: AsyncSession, conversation_id: uuid.UUID
+) -> uuid.UUID | None:
+    result = await session.execute(
+        text("SELECT current_question_id FROM chat.conversation WHERE conversation_id = :id"),
+        {"id": conversation_id},
+    )
+    return result.scalar_one()
+
+
+async def _send_answer(client: AsyncClient, *, line_user_id: str, text_content: str) -> AsyncMock:
+    body = build_text_message_event(line_user_id=line_user_id, text_content=text_content)
+    signature = sign_signature(body, line_settings.LINE_CHANNEL_SECRET)
+    with patch(
+        "src.line.service.AsyncMessagingApi.reply_message", new_callable=AsyncMock
+    ) as reply_message:
+        response = await client.post(
+            "/line/webhook", content=body, headers={"X-Line-Signature": signature}
+        )
+    assert response.status_code == 200
+    return reply_message
+
+
+class TestGuidedFlowRoundTrip:
+    async def test_valid_answer_advances_via_webhook(
+        self, db_session: AsyncSession, client: AsyncClient
+    ) -> None:
+        task_id, task_form_id = await seed_task_form(db_session)
+        question_1 = await seed_question(
+            db_session, task_id=task_id, field_name="notes", input_type="VARCHAR", sort_order=1
+        )
+        question_2 = await seed_question(
+            db_session,
+            task_id=task_id,
+            field_name="notes2",
+            input_type="VARCHAR",
+            label="คำถามที่สอง",
+            sort_order=2,
+        )
+        line_user_id = f"U{uuid.uuid4().hex}"
+        user_id = await seed_user_with_line_identity(db_session, line_user_id=line_user_id)
+        conversation_id = await seed_active_conversation(
+            db_session,
+            user_id=user_id,
+            task_id=task_id,
+            task_form_id=task_form_id,
+            current_question_id=question_1,
+        )
+
+        form_response = build_form_response(
+            task_form_id=task_form_id,
+            questions=[
+                question_json(
+                    question_id=question_1, field_name="notes", input_type="VARCHAR", sort_order=1
+                ),
+                question_json(
+                    question_id=question_2,
+                    field_name="notes2",
+                    input_type="VARCHAR",
+                    label="คำถามที่สอง",
+                    sort_order=2,
+                ),
+            ],
+        )
+
+        body = build_text_message_event(line_user_id=line_user_id, text_content="คำตอบที่ถูกต้อง")
+        signature = sign_signature(body, line_settings.LINE_CHANNEL_SECRET)
+
+        with respx.mock:
+            respx.get(f"{forms_settings.KOTLIN_BACKEND_URL}/service/forms/{task_form_id}").mock(
+                return_value=Response(200, json=form_response)
+            )
+            with patch(
+                "src.line.service.AsyncMessagingApi.reply_message", new_callable=AsyncMock
+            ) as reply_message:
+                response = await client.post(
+                    "/line/webhook",
+                    content=body,
+                    headers={"X-Line-Signature": signature},
+                )
+
+        assert response.status_code == 200
+        reply_message.assert_awaited_once()
+        sent_request = reply_message.await_args.args[0]
+        assert sent_request.messages[0].text == "คำถามที่สอง"
+
+        assert await _current_question_id(db_session, conversation_id) == question_2
+
+        answered = await db_session.execute(
+            text(
+                "SELECT answer FROM chat.conversation_answer "
+                "WHERE conversation_id = :conversation_id AND question_id = :question_id"
+            ),
+            {"conversation_id": conversation_id, "question_id": question_1},
+        )
+        assert answered.scalar_one()["text"] == "คำตอบที่ถูกต้อง"
+
+
+class TestReAskLoop:
+    _QUANTITY_RULE = {
+        "type": "FLOAT",
+        "min": 0,
+        "max": 5000,
+        "errorMessage": "กรุณากรอกปริมาณ 0-5,000 (กก.)",
+    }
+
+    async def _seed(
+        self, session: AsyncSession, *, line_user_id: str
+    ) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID]:
+        task_id, task_form_id = await seed_task_form(session)
+        question_1 = await seed_question(
+            session, task_id=task_id, field_name="quantity_kg", input_type="FLOAT"
+        )
+        question_2 = await seed_question(
+            session,
+            task_id=task_id,
+            field_name="notes2",
+            input_type="VARCHAR",
+            label="คำถามที่สอง",
+            sort_order=2,
+        )
+        user_id = await seed_user_with_line_identity(session, line_user_id=line_user_id)
+        conversation_id = await seed_active_conversation(
+            session,
+            user_id=user_id,
+            task_id=task_id,
+            task_form_id=task_form_id,
+            current_question_id=question_1,
+        )
+        return task_form_id, conversation_id, question_1, question_2
+
+    def _mock_form(
+        self, *, task_form_id: uuid.UUID, question_1: uuid.UUID, question_2: uuid.UUID
+    ) -> None:
+        respx.get(f"{forms_settings.KOTLIN_BACKEND_URL}/service/forms/{task_form_id}").mock(
+            return_value=Response(
+                200,
+                json=build_form_response(
+                    task_form_id=task_form_id,
+                    questions=[
+                        question_json(
+                            question_id=question_1,
+                            field_name="quantity_kg",
+                            input_type="FLOAT",
+                            validation_rule=self._QUANTITY_RULE,
+                        ),
+                        question_json(
+                            question_id=question_2,
+                            field_name="notes2",
+                            input_type="VARCHAR",
+                            label="คำถามที่สอง",
+                            sort_order=2,
+                        ),
+                    ],
+                ),
+            )
+        )
+
+    async def test_invalid_answer_reasks_then_valid_answer_advances(
+        self, db_session: AsyncSession, client: AsyncClient
+    ) -> None:
+        line_user_id = f"U{uuid.uuid4().hex}"
+        task_form_id, conversation_id, question_1, question_2 = await self._seed(
+            db_session, line_user_id=line_user_id
+        )
+
+        with respx.mock:
+            self._mock_form(task_form_id=task_form_id, question_1=question_1, question_2=question_2)
+
+            reply_message = await _send_answer(
+                client, line_user_id=line_user_id, text_content="abc"
+            )
+            reply_message.assert_awaited_once()
+            error_text = reply_message.await_args.args[0].messages[0].text
+            assert "กรุณากรอกปริมาณ" in error_text
+            assert await _current_question_id(db_session, conversation_id) == question_1
+
+            reply_message = await _send_answer(
+                client, line_user_id=line_user_id, text_content="120"
+            )
+            reply_message.assert_awaited_once()
+            next_text = reply_message.await_args.args[0].messages[0].text
+            assert next_text == "คำถามที่สอง"
+            assert await _current_question_id(db_session, conversation_id) == question_2
+
+        answered = await db_session.execute(
+            text("SELECT COUNT(*) FROM chat.conversation_answer WHERE conversation_id = :id"),
+            {"id": conversation_id},
+        )
+        assert answered.scalar_one() == 1
+
+    async def test_repeated_invalid_answers_do_not_advance(
+        self, db_session: AsyncSession, client: AsyncClient
+    ) -> None:
+        line_user_id = f"U{uuid.uuid4().hex}"
+        task_form_id, conversation_id, question_1, question_2 = await self._seed(
+            db_session, line_user_id=line_user_id
+        )
+
+        with respx.mock:
+            self._mock_form(task_form_id=task_form_id, question_1=question_1, question_2=question_2)
+
+            for bad_answer in ("abc", "-5", "99999"):
+                reply_message = await _send_answer(
+                    client, line_user_id=line_user_id, text_content=bad_answer
+                )
+                reply_message.assert_awaited_once()
+                assert await _current_question_id(db_session, conversation_id) == question_1
+
+        answered = await db_session.execute(
+            text("SELECT COUNT(*) FROM chat.conversation_answer WHERE conversation_id = :id"),
+            {"id": conversation_id},
+        )
+        assert answered.scalar_one() == 0
+
+
+class TestAdditionalFieldTypes:
+    @pytest.mark.parametrize(
+        ("input_type", "rule", "invalid_answer", "valid_answer"),
+        [
+            (
+                "VARCHAR",
+                {
+                    "type": "VARCHAR",
+                    "maxLength": 10,
+                    "errorMessage": "กรุณากรอกไม่เกิน 10 ตัวอักษร",
+                },
+                "ข้อความนี้ยาวเกินสิบตัวอักษร",
+                "สั้น",
+            ),
+            (
+                "INT",
+                {
+                    "type": "INT",
+                    "min": 0,
+                    "max": 50,
+                    "integerOnly": True,
+                    "errorMessage": "กรุณากรอกจำนวนเต็ม 0-50",
+                },
+                "5.5",
+                "10",
+            ),
+            (
+                "DATE",
+                {"type": "DATE", "maxDate": "today", "errorMessage": "ห้ามระบุวันที่ในอนาคต"},
+                "2099-01-01",
+                "2020-01-01",
+            ),
+            (
+                "DATETIME",
+                {
+                    "type": "DATETIME",
+                    "maxDate": "today",
+                    "errorMessage": "ห้ามระบุเวลาที่ยังไม่ถึง",
+                },
+                "2099-01-01T08:00:00",
+                "2020-01-01T08:00:00",
+            ),
+        ],
+    )
+    async def test_invalid_then_valid_answer_via_webhook(
+        self,
+        db_session: AsyncSession,
+        client: AsyncClient,
+        input_type: str,
+        rule: dict[str, Any],
+        invalid_answer: str,
+        valid_answer: str,
+    ) -> None:
+        task_id, task_form_id = await seed_task_form(db_session)
+        question_1 = await seed_question(
+            db_session, task_id=task_id, field_name="field_under_test", input_type=input_type
+        )
+        question_2 = await seed_question(
+            db_session,
+            task_id=task_id,
+            field_name="notes2",
+            input_type="VARCHAR",
+            label="คำถามที่สอง",
+            sort_order=2,
+        )
+        line_user_id = f"U{uuid.uuid4().hex}"
+        user_id = await seed_user_with_line_identity(db_session, line_user_id=line_user_id)
+        conversation_id = await seed_active_conversation(
+            db_session,
+            user_id=user_id,
+            task_id=task_id,
+            task_form_id=task_form_id,
+            current_question_id=question_1,
+        )
+
+        form_response = build_form_response(
+            task_form_id=task_form_id,
+            questions=[
+                question_json(
+                    question_id=question_1,
+                    field_name="field_under_test",
+                    input_type=input_type,
+                    validation_rule=rule,
+                ),
+                question_json(
+                    question_id=question_2,
+                    field_name="notes2",
+                    input_type="VARCHAR",
+                    label="คำถามที่สอง",
+                    sort_order=2,
+                ),
+            ],
+        )
+
+        with respx.mock:
+            respx.get(f"{forms_settings.KOTLIN_BACKEND_URL}/service/forms/{task_form_id}").mock(
+                return_value=Response(200, json=form_response)
+            )
+
+            reply_message = await _send_answer(
+                client, line_user_id=line_user_id, text_content=invalid_answer
+            )
+            reply_message.assert_awaited_once()
+            error_text = reply_message.await_args.args[0].messages[0].text
+            assert rule["errorMessage"] in error_text
+            assert await _current_question_id(db_session, conversation_id) == question_1
+
+            reply_message = await _send_answer(
+                client, line_user_id=line_user_id, text_content=valid_answer
+            )
+            reply_message.assert_awaited_once()
+            next_text = reply_message.await_args.args[0].messages[0].text
+            assert next_text == "คำถามที่สอง"
+            assert await _current_question_id(db_session, conversation_id) == question_2
+
+
+class TestChoiceResolution:
+    _SPRAY_CHOICES = [
+        {"id": "opt1", "name": "พ่นยา"},
+        {"id": "opt2", "name": "ไม่พ่นยา"},
+    ]
+
+    async def _seed(
+        self, session: AsyncSession, *, line_user_id: str, input_type: str
+    ) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID]:
+        task_id, task_form_id = await seed_task_form(session)
+        question_1 = await seed_question(
+            session, task_id=task_id, field_name="field_under_test", input_type=input_type
+        )
+        question_2 = await seed_question(
+            session,
+            task_id=task_id,
+            field_name="notes2",
+            input_type="VARCHAR",
+            label="คำถามที่สอง",
+            sort_order=2,
+        )
+        user_id = await seed_user_with_line_identity(session, line_user_id=line_user_id)
+        conversation_id = await seed_active_conversation(
+            session,
+            user_id=user_id,
+            task_id=task_id,
+            task_form_id=task_form_id,
+            current_question_id=question_1,
+        )
+        return task_form_id, conversation_id, question_1, question_2
+
+    def _mock_form(
+        self,
+        *,
+        task_form_id: uuid.UUID,
+        question_1: uuid.UUID,
+        question_2: uuid.UUID,
+        input_type: str,
+        choices: list[dict[str, str]] | None,
+    ) -> None:
+        respx.get(f"{forms_settings.KOTLIN_BACKEND_URL}/service/forms/{task_form_id}").mock(
+            return_value=Response(
+                200,
+                json=build_form_response(
+                    task_form_id=task_form_id,
+                    questions=[
+                        question_json(
+                            question_id=question_1,
+                            field_name="field_under_test",
+                            input_type=input_type,
+                            choices=choices,
+                        ),
+                        question_json(
+                            question_id=question_2,
+                            field_name="notes2",
+                            input_type="VARCHAR",
+                            label="คำถามที่สอง",
+                            sort_order=2,
+                        ),
+                    ],
+                ),
+            )
+        )
+
+    async def test_option_mismatch_reasks(
+        self, db_session: AsyncSession, client: AsyncClient
+    ) -> None:
+        line_user_id = f"U{uuid.uuid4().hex}"
+        task_form_id, conversation_id, question_1, question_2 = await self._seed(
+            db_session, line_user_id=line_user_id, input_type="OPTION"
+        )
+
+        with respx.mock:
+            self._mock_form(
+                task_form_id=task_form_id,
+                question_1=question_1,
+                question_2=question_2,
+                input_type="OPTION",
+                choices=self._SPRAY_CHOICES,
+            )
+
+            reply_message = await _send_answer(
+                client, line_user_id=line_user_id, text_content="อยากกินข้าว"
+            )
+            reply_message.assert_awaited_once()
+            error_text = reply_message.await_args.args[0].messages[0].text
+            assert "กรุณาเลือกคำตอบจากตัวเลือกที่กำหนดเท่านั้น" in error_text
+            assert await _current_question_id(db_session, conversation_id) == question_1
+
+    async def test_option_match_advances(
+        self, db_session: AsyncSession, client: AsyncClient
+    ) -> None:
+        line_user_id = f"U{uuid.uuid4().hex}"
+        task_form_id, conversation_id, question_1, question_2 = await self._seed(
+            db_session, line_user_id=line_user_id, input_type="OPTION"
+        )
+
+        with respx.mock:
+            self._mock_form(
+                task_form_id=task_form_id,
+                question_1=question_1,
+                question_2=question_2,
+                input_type="OPTION",
+                choices=self._SPRAY_CHOICES,
+            )
+
+            reply_message = await _send_answer(
+                client, line_user_id=line_user_id, text_content="พ่นยา"
+            )
+            reply_message.assert_awaited_once()
+            next_text = reply_message.await_args.args[0].messages[0].text
+            assert next_text == "คำถามที่สอง"
+            assert await _current_question_id(db_session, conversation_id) == question_2
+
+    async def test_boolean_mismatch_reasks(
+        self, db_session: AsyncSession, client: AsyncClient
+    ) -> None:
+        line_user_id = f"U{uuid.uuid4().hex}"
+        task_form_id, conversation_id, question_1, question_2 = await self._seed(
+            db_session, line_user_id=line_user_id, input_type="BOOLEAN"
+        )
+
+        with respx.mock:
+            self._mock_form(
+                task_form_id=task_form_id,
+                question_1=question_1,
+                question_2=question_2,
+                input_type="BOOLEAN",
+                choices=None,
+            )
+
+            reply_message = await _send_answer(
+                client, line_user_id=line_user_id, text_content="ไม่รู้"
+            )
+            reply_message.assert_awaited_once()
+            error_text = reply_message.await_args.args[0].messages[0].text
+            assert "กรุณาเลือกคำตอบจากตัวเลือกที่กำหนดเท่านั้น" in error_text
+            assert await _current_question_id(db_session, conversation_id) == question_1
+
+    async def test_boolean_match_advances(
+        self, db_session: AsyncSession, client: AsyncClient
+    ) -> None:
+        line_user_id = f"U{uuid.uuid4().hex}"
+        task_form_id, conversation_id, question_1, question_2 = await self._seed(
+            db_session, line_user_id=line_user_id, input_type="BOOLEAN"
+        )
+
+        with respx.mock:
+            self._mock_form(
+                task_form_id=task_form_id,
+                question_1=question_1,
+                question_2=question_2,
+                input_type="BOOLEAN",
+                choices=None,
+            )
+
+            reply_message = await _send_answer(client, line_user_id=line_user_id, text_content="ใช่")
+            reply_message.assert_awaited_once()
+            next_text = reply_message.await_args.args[0].messages[0].text
+            assert next_text == "คำถามที่สอง"
+            assert await _current_question_id(db_session, conversation_id) == question_2
+
+
+class TestSkipButton:
+    _SKIP_LABEL = "⏭️ ข้าม"
+    _NOTES_RULE = {
+        "type": "VARCHAR",
+        "maxLength": 10,
+        "errorMessage": "กรุณากรอกไม่เกิน 10 ตัวอักษร",
+    }
+
+    async def _seed(
+        self, session: AsyncSession, *, line_user_id: str
+    ) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID]:
+        task_id, task_form_id = await seed_task_form(session)
+        question_1 = await seed_question(
+            session,
+            task_id=task_id,
+            field_name="field_under_test",
+            input_type="VARCHAR",
+            is_mandatory=False,
+        )
+        question_2 = await seed_question(
+            session,
+            task_id=task_id,
+            field_name="notes2",
+            input_type="VARCHAR",
+            label="คำถามที่สอง",
+            sort_order=2,
+        )
+        user_id = await seed_user_with_line_identity(session, line_user_id=line_user_id)
+        conversation_id = await seed_active_conversation(
+            session,
+            user_id=user_id,
+            task_id=task_id,
+            task_form_id=task_form_id,
+            current_question_id=question_1,
+        )
+        return task_form_id, conversation_id, question_1, question_2
+
+    def _mock_form(
+        self,
+        *,
+        task_form_id: uuid.UUID,
+        question_1: uuid.UUID,
+        question_2: uuid.UUID,
+        validation_rule: dict[str, Any] | None,
+    ) -> None:
+        respx.get(f"{forms_settings.KOTLIN_BACKEND_URL}/service/forms/{task_form_id}").mock(
+            return_value=Response(
+                200,
+                json=build_form_response(
+                    task_form_id=task_form_id,
+                    questions=[
+                        question_json(
+                            question_id=question_1,
+                            field_name="field_under_test",
+                            input_type="VARCHAR",
+                            is_mandatory=False,
+                            validation_rule=validation_rule,
+                        ),
+                        question_json(
+                            question_id=question_2,
+                            field_name="notes2",
+                            input_type="VARCHAR",
+                            label="คำถามที่สอง",
+                            sort_order=2,
+                        ),
+                    ],
+                ),
+            )
+        )
+
+    async def test_skip_label_skips_without_validation(
+        self, db_session: AsyncSession, client: AsyncClient
+    ) -> None:
+        line_user_id = f"U{uuid.uuid4().hex}"
+        task_form_id, conversation_id, question_1, question_2 = await self._seed(
+            db_session, line_user_id=line_user_id
+        )
+
+        with respx.mock:
+            self._mock_form(
+                task_form_id=task_form_id,
+                question_1=question_1,
+                question_2=question_2,
+                validation_rule=self._NOTES_RULE,
+            )
+
+            reply_message = await _send_answer(
+                client, line_user_id=line_user_id, text_content=self._SKIP_LABEL
+            )
+            reply_message.assert_awaited_once()
+            next_text = reply_message.await_args.args[0].messages[0].text
+            assert next_text == "คำถามที่สอง"
+            assert await _current_question_id(db_session, conversation_id) == question_2
+
+        answer = await db_session.execute(
+            text(
+                "SELECT answer FROM chat.conversation_answer "
+                "WHERE conversation_id = :conversation_id AND question_id = :question_id"
+            ),
+            {"conversation_id": conversation_id, "question_id": question_1},
+        )
+        assert answer.scalar_one()["skipped"] is True
+
+    async def test_real_text_on_optional_question_still_validates(
+        self, db_session: AsyncSession, client: AsyncClient
+    ) -> None:
+        line_user_id = f"U{uuid.uuid4().hex}"
+        task_form_id, conversation_id, question_1, question_2 = await self._seed(
+            db_session, line_user_id=line_user_id
+        )
+
+        with respx.mock:
+            self._mock_form(
+                task_form_id=task_form_id,
+                question_1=question_1,
+                question_2=question_2,
+                validation_rule=self._NOTES_RULE,
+            )
+
+            reply_message = await _send_answer(
+                client, line_user_id=line_user_id, text_content="ข้อความนี้ยาวเกินสิบตัวอักษร"
+            )
+            reply_message.assert_awaited_once()
+            error_text = reply_message.await_args.args[0].messages[0].text
+            assert "กรุณากรอกไม่เกิน 10 ตัวอักษร" in error_text
+            assert await _current_question_id(db_session, conversation_id) == question_1
+
+            reply_message = await _send_answer(client, line_user_id=line_user_id, text_content="สั้น")
+            reply_message.assert_awaited_once()
+            next_text = reply_message.await_args.args[0].messages[0].text
+            assert next_text == "คำถามที่สอง"
+            assert await _current_question_id(db_session, conversation_id) == question_2

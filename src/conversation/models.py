@@ -53,6 +53,13 @@ class Conversation(Base):
     task_form_id: Mapped[uuid.UUID] = mapped_column()
     status: Mapped[str] = mapped_column(String)
     current_question_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
+    # Set once, by the parent-picker step for the 5 previously-blocked
+    # handlers (src/line/parent_picker.py), as {"field_name": ..., "value":
+    # ...}. Not a form.question answer -- that picker step has no real
+    # question_id to satisfy ConversationAnswer's FK below, so it's merged
+    # into the submission payload directly at confirm time instead. See
+    # database/migrations/V13__conversation_parent_answer.sql.
+    parent_answer: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
 
 class ConversationAnswer(Base):

@@ -47,6 +47,8 @@ def _to_response(reply: service.ConversationReply) -> ConversationReplyResponse:
             if reply.choices
             else None
         ),
+        input_type=reply.input_type,
+        validation_rule=reply.validation_rule,
     )
 
 

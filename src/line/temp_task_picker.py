@@ -29,18 +29,38 @@ class PendingTask:
     task_id: UUID
     task_form_id: UUID
     title: str
+    handler: str
+    # US2-3: true when this task already has a conversation that isn't done
+    # (ACTIVE or PAUSED) -- lets reply_task_choices label it "ทำต่อ" instead
+    # of "เริ่มทำ", and lets router.py's "start" postback resume it instead
+    # of starting a duplicate one (see service.find_resumable_conversation).
+    has_conversation: bool
 
 
 async def list_pending_tasks(session: AsyncSession, user_id: UUID) -> list[PendingTask]:
     """A task is "pending" if this user has no form.response row for it yet --
     mirrors mobile-backend's real GetTasks logic (form_handler.go), rather
     than form.assignment, which turns out to be unpopulated in this DB
-    despite existing in the schema.
+    despite existing in the schema. Deliberately blind to chat.conversation
+    status for this filter: a task with an ACTIVE/PAUSED-but-unconfirmed
+    conversation still has no form.response row yet, so it already shows up
+    here correctly -- has_conversation only changes how it's labeled/handled,
+    not whether it's listed at all.
+
+    handler is included so callers can warn the farmer before they invest
+    time answering a form Go can't save yet -- previously this picker had no
+    way to know that at all, and the farmer only found out after answering
+    every question and tapping confirm.
     """
     rows = await session.execute(
         text(
             """
-            SELECT t.task_id, tf.form_id AS task_form_id, t.title
+            SELECT t.task_id, tf.form_id AS task_form_id, t.title, tf.handler,
+                   EXISTS (
+                       SELECT 1 FROM chat.conversation c
+                       WHERE c.task_id = t.task_id AND c.user_id = :user_id
+                         AND c.status IN ('active', 'paused')
+                   ) AS has_conversation
             FROM form.task t
             JOIN form.task_form tf ON tf.task_id = t.task_id
             LEFT JOIN form.response r ON r.task_log_id = t.task_id AND r.user_id = :user_id
