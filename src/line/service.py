@@ -21,6 +21,7 @@ from src.line.config import line_settings
 from src.line.schemas import QuickReplyOption
 
 if TYPE_CHECKING:
+    from src.conversation.service import Question
     from src.line.temp_task_picker import PendingTask
 
 _configuration = Configuration(access_token=line_settings.LINE_CHANNEL_ACCESS_TOKEN)
@@ -86,14 +87,19 @@ async def reply_task_choices(reply_token: str, text: str, tasks: list["PendingTa
 
 
 async def reply_confirm_prompt(reply_token: str, text: str, conversation_id: UUID) -> None:
-    """Two Quick Reply buttons: "confirm" and "cancel" Postbacks.
+    """Three Quick Reply buttons: "confirm", "edit", and "cancel" Postbacks.
 
     Without this, AWAITING_CONFIRMATION has no way for a farmer to actually
     confirm via real LINE -- typing free text at that point raises
     ConversationNotFound in handle_answer (no open question left to answer
     against). Same Postback convention reply_task_choices already
     established for "start"; router.py's _handle_postback already knows
-    how to handle "confirm:<conversation_id>" and "cancel:<conversation_id>".
+    how to handle "confirm:<conversation_id>", "edit:<conversation_id>",
+    and "cancel:<conversation_id>".
+
+    Edit (US2-6) exists so a farmer who spots a mistake in the summary can
+    fix just that one field instead of cancelling and starting the whole
+    form over.
 
     Cancel exists because this same prompt is re-shown on a failed
     submission (CB-1) -- for a handler Go can't save yet, retrying can
@@ -112,6 +118,13 @@ async def reply_confirm_prompt(reply_token: str, text: str, conversation_id: UUI
             ),
             QuickReplyItem(
                 action=PostbackAction(
+                    label="แก้ไข",
+                    data=f"edit:{conversation_id}",
+                    displayText="แก้ไข",
+                )
+            ),
+            QuickReplyItem(
+                action=PostbackAction(
                     label="ยกเลิก",
                     data=f"cancel:{conversation_id}",
                     displayText="ยกเลิก",
@@ -120,6 +133,35 @@ async def reply_confirm_prompt(reply_token: str, text: str, conversation_id: UUI
         ]
     )
     message = TextMessage(text=text, quickReply=quick_reply)
+    async with AsyncApiClient(_configuration) as client:
+        await AsyncMessagingApi(client).reply_message(
+            ReplyMessageRequest(replyToken=reply_token, messages=[message])
+        )
+
+
+async def reply_edit_picker(
+    reply_token: str, *, conversation_id: UUID, questions: list["Question"]
+) -> None:
+    """US2-6: lists the questions a farmer can currently revisit (from
+    service.editable_questions -- already answered or skipped), one
+    Postback button each. Same "no state persisted between the message and
+    the tap" convention as reply_task_choices/reply_autofill_offer: the
+    button's own data carries everything router.py's "edit_pick" branch
+    needs (conversation_id + question_id) to re-open that exact question.
+    """
+    quick_reply = QuickReply(
+        items=[
+            QuickReplyItem(
+                action=PostbackAction(
+                    label=q.label[:_QUICK_REPLY_LABEL_MAX],
+                    data=f"edit_pick:{conversation_id}:{q.question_id}",
+                    displayText=q.label,
+                )
+            )
+            for q in questions
+        ]
+    )
+    message = TextMessage(text="เลือกข้อที่ต้องการแก้ไข:", quickReply=quick_reply)
     async with AsyncApiClient(_configuration) as client:
         await AsyncMessagingApi(client).reply_message(
             ReplyMessageRequest(replyToken=reply_token, messages=[message])

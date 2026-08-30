@@ -330,6 +330,36 @@ class TestHandleAnswer:
         assert reply.substate == ActiveSubstate.AWAITING_CONFIRMATION
         assert conversation.current_question_id is None
 
+    async def test_reanswering_an_already_answered_question_updates_it_in_place(self) -> None:
+        """The upsert US2-6 (edit-at-confirmation, begin_edit) depends on:
+        re-answering a question that already has a ConversationAnswer row
+        (begin_edit resets current_question_id back to an already-answered
+        question) must update that row, not add a second one for the same
+        question_id -- see handle_answer's own comment on why a duplicate
+        would corrupt both the confirmation summary and confirm_conversation's
+        submission payload.
+        """
+        form, (q1,) = _form(mandatory_flags=[True])
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=q1,
+        )
+        existing_answer = _answer(q1, text="old answer")
+        session = _mock_session(answers=[existing_answer], conversation=conversation)
+
+        reply = await service.handle_answer(
+            session, conversation_id=conversation_id, raw_text="new answer", form=form
+        )
+
+        assert reply is not None
+        session.add.assert_not_called()  # updated the existing row, not a new one
+        assert existing_answer.answer == {"text": "new answer"}
+
     async def test_confirmation_summary_lists_every_answer(self) -> None:
         """The actual "submission confirmation" deliverable -- a farmer
         should see what they answered before confirming, not a generic
@@ -384,9 +414,7 @@ class TestHandleAnswerWithChoices:
             status=ConversationStatus.ACTIVE,
             current_question_id=question_id,
         )
-        session = _mock_session(
-            answers=[_answer(question_id, text="ใช่")], conversation=conversation
-        )
+        session = _mock_session(answers=[], conversation=conversation)
 
         reply = await service.handle_answer(
             session, conversation_id=conversation_id, raw_text="ใช่", form=form
@@ -476,10 +504,7 @@ class TestHandleAnswerValidation:
             status=ConversationStatus.ACTIVE,
             current_question_id=question_id,
         )
-        # answers=[...] simulates the DB state the post-add re-query will see --
-        # the mock can't react to session.add() dynamically (see _mock_session's
-        # own docstring / test_reaches_confirmation_once_all_required_answered).
-        session = _mock_session(answers=[_answer(question_id, text="5")], conversation=conversation)
+        session = _mock_session(answers=[], conversation=conversation)
 
         reply = await service.handle_answer(
             session, conversation_id=conversation_id, raw_text="5", form=form
@@ -504,9 +529,7 @@ class TestHandleAnswerValidation:
             status=ConversationStatus.ACTIVE,
             current_question_id=q1,
         )
-        session = _mock_session(
-            answers=[_answer(q1, text="anything goes")], conversation=conversation
-        )
+        session = _mock_session(answers=[], conversation=conversation)
 
         reply = await service.handle_answer(
             session, conversation_id=conversation_id, raw_text="anything goes", form=form
@@ -972,3 +995,117 @@ class TestConfirmConversation:
         submission = submit_task_mock.call_args.args[0]
         assert submission.answer["batch_id"] == "batch-1"
         assert submission.answer["field_0"] == "คำตอบ"
+
+
+class TestEditableQuestions:
+    """US2-6: the picker "แก้ไข" shows -- every question with an existing
+    answer row, real or skipped, matching editable_questions' own docstring.
+    """
+
+    async def test_includes_both_answered_and_skipped_questions(self) -> None:
+        form, (q1, q2) = _form(mandatory_flags=[True, False])
+        conversation_id = uuid.uuid4()
+        skipped = ConversationAnswer(
+            conversation_id=conversation_id,
+            question_id=q2,
+            answer={"skipped": True},
+            source=AnswerSource.GUIDED_FLOW,
+        )
+        session = _mock_session(answers=[_answer(q1, text="คำตอบ"), skipped])
+
+        questions = await service.editable_questions(
+            session, conversation_id=conversation_id, form=form
+        )
+
+        assert [q.question_id for q in questions] == [q1, q2]
+
+    async def test_orders_by_sort_order_not_answer_insertion_order(self) -> None:
+        form, (q1, q2) = _form(mandatory_flags=[True, True])
+        conversation_id = uuid.uuid4()
+        # Answered out of order -- q2 first -- editable_questions must still
+        # return them sort_order-first, matching _format_answered_lines.
+        session = _mock_session(answers=[_answer(q2), _answer(q1)])
+
+        questions = await service.editable_questions(
+            session, conversation_id=conversation_id, form=form
+        )
+
+        assert [q.question_id for q in questions] == [q1, q2]
+
+    async def test_excludes_a_question_no_longer_on_the_current_form(self) -> None:
+        form, (q1,) = _form(mandatory_flags=[True])
+        conversation_id = uuid.uuid4()
+        stale_answer = ConversationAnswer(
+            conversation_id=conversation_id,
+            question_id=uuid.uuid4(),  # not on `form` at all
+            answer={"text": "x"},
+            source=AnswerSource.GUIDED_FLOW,
+        )
+        session = _mock_session(answers=[_answer(q1), stale_answer])
+
+        questions = await service.editable_questions(
+            session, conversation_id=conversation_id, form=form
+        )
+
+        assert [q.question_id for q in questions] == [q1]
+
+
+class TestBeginEdit:
+    """US2-6: begin_edit is what a farmer's tap on the edit picker resolves
+    to -- re-opens an already-answered question exactly like a fresh one.
+    """
+
+    async def test_reopens_the_picked_question(self) -> None:
+        form, (q1, q2) = _form(mandatory_flags=[True, True])
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=None,  # was at AWAITING_CONFIRMATION
+        )
+        session = _mock_session(answers=[], conversation=conversation)
+        session.get = AsyncMock(return_value=conversation)
+
+        reply = await service.begin_edit(
+            session, conversation_id=conversation_id, question_id=q1, form=form
+        )
+
+        assert conversation.current_question_id == q1
+        assert reply.substate == ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION
+        assert reply.text == "question 0"
+
+    async def test_raises_if_conversation_not_found(self) -> None:
+        form, (q1,) = _form(mandatory_flags=[True])
+        session = _mock_session(answers=[])
+        session.get = AsyncMock(return_value=None)
+
+        with pytest.raises(ConversationNotFound):
+            await service.begin_edit(
+                session, conversation_id=uuid.uuid4(), question_id=q1, form=form
+            )
+
+    async def test_raises_if_question_no_longer_on_the_current_form(self) -> None:
+        """Same "fail loudly" precedent as resume_conversation's own
+        current_question lookup -- the form changed out from under this
+        conversation between the picker being sent and the tap landing.
+        """
+        form, _ = _form(mandatory_flags=[True])  # only question 0 exists
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=None,
+        )
+        session = _mock_session(answers=[], conversation=conversation)
+        session.get = AsyncMock(return_value=conversation)
+
+        with pytest.raises(ConversationNotFound):
+            await service.begin_edit(
+                session, conversation_id=conversation_id, question_id=uuid.uuid4(), form=form
+            )

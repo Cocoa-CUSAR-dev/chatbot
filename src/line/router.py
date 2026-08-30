@@ -23,7 +23,12 @@ from src.forms.client import get_form
 from src.line import identity, parent_picker, temp_task_picker
 from src.line.dependencies import parse_line_events
 from src.line.schemas import QuickReplyOption
-from src.line.service import reply_confirm_prompt, reply_task_choices, reply_text
+from src.line.service import (
+    reply_confirm_prompt,
+    reply_edit_picker,
+    reply_task_choices,
+    reply_text,
+)
 
 router = APIRouter(prefix="/line", tags=["line"])
 logger = logging.getLogger(__name__)
@@ -261,6 +266,55 @@ async def _handle_postback(event: PostbackEvent) -> None:
         # so routing it through _reply() would attach a confirm button
         # pointing at an already-completed conversation.
         await reply_text(event.reply_token, reply.text)
+    elif action == "edit":
+        # US2-6: shows a picker of every already-answered (or skipped)
+        # question rather than asking which field by name -- same
+        # "buttons, not free text" reasoning as everywhere else in this
+        # flow (elderly farmers are the primary users).
+        (conversation_id,) = args
+        async with async_session_maker() as session:
+            conversation = await session.get(Conversation, UUID(conversation_id))
+            if conversation is None:
+                await reply_text(event.reply_token, "ไม่พบบทสนทนานี้แล้ว")
+                return
+            form = await get_form(str(conversation.task_form_id))
+            questions = await service.editable_questions(
+                session, conversation_id=conversation.conversation_id, form=form
+            )
+        if not questions:
+            # Shouldn't happen in practice -- reaching AWAITING_CONFIRMATION
+            # requires every required question to have an answer row -- but
+            # an honest message beats a Quick Reply with zero buttons.
+            await reply_text(event.reply_token, "ยังไม่มีคำตอบให้แก้ไขในตอนนี้")
+            return
+        await reply_edit_picker(
+            event.reply_token,
+            conversation_id=conversation.conversation_id,
+            questions=questions[:_QUICK_REPLY_LIMIT],
+        )
+    elif action == "edit_pick":
+        conversation_id, question_id = args
+        async with async_session_maker() as session:
+            conversation = await session.get(Conversation, UUID(conversation_id))
+            if conversation is None:
+                await reply_text(event.reply_token, "ไม่พบบทสนทนานี้แล้ว")
+                return
+            form = await get_form(str(conversation.task_form_id))
+            try:
+                reply = await service.begin_edit(
+                    session,
+                    conversation_id=UUID(conversation_id),
+                    question_id=UUID(question_id),
+                    form=form,
+                )
+            except ConversationNotFound:
+                await reply_text(event.reply_token, "ไม่พบคำถามนี้แล้ว")
+                return
+        # begin_edit's reply is substate=GUIDED_ASKING_FIXED_QUESTION with
+        # the question's own choices -- _reply() already knows how to
+        # render that as a Quick Reply, same as any normal guided-flow
+        # question.
+        await _reply(event.reply_token, reply)
     elif action == "cancel":
         (conversation_id,) = args
         async with async_session_maker() as session:

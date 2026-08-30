@@ -542,17 +542,39 @@ async def handle_answer(
     if resolved_value is not None:
         answer["value"] = resolved_value
 
-    session.add(
-        ConversationAnswer(
+    # Upsert, not a blind insert: US2-6's "แก้ไข" (edit-at-confirmation,
+    # begin_edit below) can re-open a question that's already been answered
+    # once, or skipped -- update that row in place rather than adding a
+    # second one for the same question_id, which _format_answered_lines and
+    # confirm_conversation's own dict-comprehension would otherwise both
+    # silently show/collapse in an order that isn't actually guaranteed (no
+    # ORDER BY on _answered_rows, and no unique constraint on
+    # (conversation_id, question_id) at the DB level). The normal
+    # forward-only flow never finds an existing row here -- current_question_id
+    # only ever advances to a not-yet-answered question -- so this is a
+    # no-op behavior change for every path except editing.
+    answer_rows = await _answered_rows(session, conversation_id)
+    existing_row = next(
+        (row for row in answer_rows if row.question_id == conversation.current_question_id),
+        None,
+    )
+    if existing_row is not None:
+        # Reassign, not mutate -- this column isn't wrapped in
+        # sqlalchemy.ext.mutable.MutableDict, so an in-place
+        # `existing_row.answer["text"] = ...` wouldn't be seen by the unit
+        # of work at commit time.
+        existing_row.answer = answer
+    else:
+        existing_row = ConversationAnswer(
             conversation_id=conversation_id,
             question_id=conversation.current_question_id,
             answer=answer,
             source=AnswerSource.GUIDED_FLOW,
         )
-    )
+        session.add(existing_row)
+        answer_rows.append(existing_row)
     await session.flush()
 
-    answer_rows = await _answered_rows(session, conversation_id)
     answered = {row.question_id for row in answer_rows}
     transition = on_guided_answer(all_slots_filled=_all_required_answered(questions, answered))
 
@@ -803,3 +825,54 @@ async def resume_conversation(
         text=recap + current_question.label,
         choices=current_question.choices,
     )
+
+
+async def editable_questions(
+    session: AsyncSession, *, conversation_id: UUID, form: FormDetail
+) -> list[Question]:
+    """Every question a farmer can currently pick to revisit via "แก้ไข"
+    (US2-6, edit-at-confirmation) -- both real answers AND intentionally-
+    skipped ones (picking a skipped one just means "answer it now"; skip
+    only ever meant "not right now", not "never"). Sorted the same way
+    _format_answered_lines already orders things, so the picker's order
+    matches what a farmer just read in the confirmation summary.
+    """
+    questions = questions_from_form(form)
+    question_by_id = {q.question_id: q for q in questions}
+    answer_rows = await _answered_rows(session, conversation_id)
+    answered_ids = {row.question_id for row in answer_rows if row.question_id in question_by_id}
+    ordered = sorted(answered_ids, key=lambda qid: question_by_id[qid].sort_order)
+    return [question_by_id[qid] for qid in ordered]
+
+
+async def begin_edit(
+    session: AsyncSession, *, conversation_id: UUID, question_id: UUID, form: FormDetail
+) -> ConversationReply:
+    """US2-6: re-opens an already-answered (or skipped) question for editing
+    from the confirmation step. Sets current_question_id back to it and
+    sends the exact same question UI a farmer saw the first time around
+    (same choices/skip/pause buttons) -- handle_answer needs no changes
+    beyond the upsert it already does to land back at AWAITING_CONFIRMATION
+    once it's answered again: every other required question is already
+    filled, so on_guided_answer's own "all slots filled" check does that
+    automatically, with no separate "am I editing" state to track.
+    """
+    conversation = await session.get(Conversation, conversation_id)
+    if conversation is None:
+        raise ConversationNotFound()
+
+    questions = questions_from_form(form)
+    question_by_id = {q.question_id: q for q in questions}
+    question = question_by_id.get(question_id)
+    if question is None:
+        # The form changed out from under this conversation between the
+        # picker being sent and the farmer tapping it -- same "fail loudly"
+        # precedent as resume_conversation's own current_question lookup.
+        raise ConversationNotFound(
+            f"conversation_id={conversation_id}: question_id={question_id} is no longer "
+            "part of the form"
+        )
+
+    conversation.current_question_id = question_id
+    await session.commit()
+    return _reply_for_question(conversation_id, question)
