@@ -84,6 +84,7 @@ CREATE TABLE chat.conversation (
     status character varying NOT NULL DEFAULT 'active',
     current_question_id uuid,
     parent_answer jsonb,
+    current_page integer NOT NULL DEFAULT 0,
     CONSTRAINT pk_chat_conversation PRIMARY KEY (conversation_id),
     CONSTRAINT fk_chat_conversation_user FOREIGN KEY (user_id) REFERENCES auth.user_account (user_id),
     CONSTRAINT fk_chat_conversation_task FOREIGN KEY (task_id) REFERENCES form.task (task_id),
