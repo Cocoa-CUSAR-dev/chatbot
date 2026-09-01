@@ -60,6 +60,13 @@ class Conversation(Base):
     # into the submission payload directly at confirm time instead. See
     # database/migrations/V13__conversation_parent_answer.sql.
     parent_answer: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    # Which page of the CURRENTLY open question's real choices the farmer is
+    # viewing -- only meaningful for an OPTION question with more real
+    # choices than fit in one Quick Reply message (see service.py's
+    # _paginate). Reset to 0 whenever current_question_id changes to a
+    # genuinely different question (service._advance_to). See
+    # database/migrations/V17__conversation_current_page.sql.
+    current_page: Mapped[int] = mapped_column(default=0, server_default="0")
 
 
 class ConversationAnswer(Base):

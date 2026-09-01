@@ -86,6 +86,26 @@ _PAUSE_CHOICE = Choice(id=_PAUSE_CHOICE_ID, label="⏸️ พักไว้ก�
 # make room for it rather than pushing the last real choice off the list.
 _QUICK_REPLY_LIMIT = 13
 
+# Pagination (the mandatory-OPTION regression PR #25's review caught was
+# exactly this problem, one slot short: real choices overflowing what's left
+# after pause/skip -- _choices_for's slicing below just drops the overflow
+# silently. These two sentinel choices, same pattern as pause/skip, let a
+# farmer actually reach the rest instead of losing it.
+_NEXT_PAGE_CHOICE_ID = "__next_page__"
+_NEXT_PAGE_CHOICE = Choice(id=_NEXT_PAGE_CHOICE_ID, label="» ถัดไป")
+_PREV_PAGE_CHOICE_ID = "__prev_page__"
+_PREV_PAGE_CHOICE = Choice(id=_PREV_PAGE_CHOICE_ID, label="« ก่อนหน้า")
+
+# Reserved together, only once a question's real choices don't fit in one
+# page at all alongside pause(/skip) -- see _paginate. Both slots exist on
+# EVERY page of a paginated question regardless of position (even page 1,
+# where prev is unused, or the last page, where next is unused), trading a
+# little button density for keeping the slot math trivially safe: the worst
+# case is always exactly _QUICK_REPLY_LIMIT total, never "depends which
+# page." Deliberately not repeating the review-caught mistake with
+# per-page-conditional sizing.
+_PAGE_NAV_RESERVED = 2
+
 
 @dataclass(frozen=True)
 class Question:
@@ -105,6 +125,12 @@ class Question:
     # upload (constrained another way already) or any field_name with no
     # rule row. See validation.py's own docstring for the key-casing wrinkle.
     validation_rule: dict[str, Any] | None = None
+    # The full, un-paginated real choice list (OPTION/BOOLEAN only, no
+    # pause/skip/nav prepended, no slicing) -- None for free text. _paginate
+    # slices this per page; `choices` above stays the page-0 rendering,
+    # unchanged, for every question that never needs more than one page
+    # (the vast majority) -- those call sites don't need to change at all.
+    all_real_choices: list[Choice] | None = None
 
 
 @dataclass(frozen=True)
@@ -201,6 +227,7 @@ def _question_from_dict(q: dict[str, Any]) -> Question:
         choices=choices,
         has_constrained_choices=has_constrained_choices,
         validation_rule=q.get("validation_rule"),
+        all_real_choices=_constrained_choices_for(q),
     )
 
 
@@ -276,15 +303,89 @@ def _format_resume_recap(questions: list[Question], answers: list[ConversationAn
     return "คำตอบที่บันทึกไว้:\n" + lines + "\n\n"
 
 
+def _leading_choices_for(question: Question) -> list[Choice]:
+    """Same pause(/skip) prefix _choices_for already computes -- re-derived
+    here from is_mandatory rather than threading it through separately,
+    since Question already carries it.
+    """
+    if question.is_mandatory:
+        return [_PAUSE_CHOICE]
+    return [_SKIP_CHOICE, _PAUSE_CHOICE]
+
+
+@dataclass(frozen=True)
+class _Page:
+    choices: list[Choice] | None
+    # "" for every non-paginated question (the vast majority) -- unchanged
+    # label text. " (หน้า 2/3)" once a question actually spans multiple
+    # pages, so a farmer knows there's more to see beyond this message.
+    indicator: str
+
+
+def _paginate(question: Question, page: int) -> _Page:
+    """Slices a question's real choices to whichever page the farmer is
+    currently viewing (conversation.current_page), re-prepending pause(/
+    skip) and appending prev/next nav choices only when actually needed.
+
+    The vast majority of questions never hit the paginated branch at all:
+    if every real choice already fits in one message alongside pause(/skip)
+    -- exactly what _choices_for already computed -- this returns
+    question.choices completely unchanged, `page` is irrelevant. Only once
+    real choices exceed that does this re-slice using the smaller,
+    nav-reserving budget, uniformly across every page of that question (see
+    _PAGE_NAV_RESERVED) rather than trying to reclaim the unused slot on
+    the first/last page -- deliberately simpler and safer than optimizing
+    density, given review already caught one off-by-one in this exact area.
+    """
+    if question.all_real_choices is None:
+        return _Page(choices=question.choices, indicator="")
+
+    leading = _leading_choices_for(question)
+    single_page_budget = _QUICK_REPLY_LIMIT - len(leading)
+    if len(question.all_real_choices) <= single_page_budget:
+        return _Page(choices=question.choices, indicator="")
+
+    page_budget = single_page_budget - _PAGE_NAV_RESERVED
+    total_pages = -(-len(question.all_real_choices) // page_budget)  # ceil division
+    page = max(0, min(page, total_pages - 1))  # defensively clamp a stale/bad value
+    start = page * page_budget
+    page_real_choices = question.all_real_choices[start : start + page_budget]
+
+    nav: list[Choice] = []
+    if page > 0:
+        nav.append(_PREV_PAGE_CHOICE)
+    if page < total_pages - 1:
+        nav.append(_NEXT_PAGE_CHOICE)
+
+    return _Page(
+        choices=[*leading, *page_real_choices, *nav],
+        indicator=f" (หน้า {page + 1}/{total_pages})",
+    )
+
+
+def _advance_to(conversation: Conversation, question_id: UUID | None) -> None:
+    """The only place current_question_id should ever be assigned outside
+    object construction -- always resets current_page alongside it, since a
+    page number only ever means something relative to whichever question is
+    currently open. Doesn't apply to next/prev-page handling itself, which
+    changes current_page WITHOUT touching current_question_id at all --
+    that's the whole point of paging within one question.
+    """
+    conversation.current_question_id = question_id
+    conversation.current_page = 0
+
+
 def _reply_for_question(
-    conversation_id: UUID, question: Question, *, error: str | None = None
+    conversation_id: UUID, question: Question, *, page: int = 0, error: str | None = None
 ) -> ConversationReply:
-    text = f"{error}\n\n{question.label}" if error else question.label
+    paginated = _paginate(question, page)
+    label = question.label + paginated.indicator
+    text = f"{error}\n\n{label}" if error else label
     return ConversationReply(
         conversation_id=conversation_id,
         substate=ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION,
         text=text,
-        choices=question.choices,
+        choices=paginated.choices,
         input_type=question.input_type,
         validation_rule=question.validation_rule,
     )
@@ -399,7 +500,7 @@ async def _handle_parent_answer(
 
     questions = questions_from_form(form)
     first_question = _next_unanswered_required(questions, answered=set())
-    conversation.current_question_id = first_question.question_id if first_question else None
+    _advance_to(conversation, first_question.question_id if first_question else None)
     await session.commit()
 
     if first_question is None:
@@ -494,17 +595,34 @@ async def handle_answer(
     resolved_value: str | None = None
     is_skip = False
     if current_question is not None and current_question.choices:
-        matched = next((c for c in current_question.choices if c.label == raw_text), None)
+        # Matched against whichever page is actually showing right now --
+        # NOT current_question.choices directly, which is always the page-0
+        # rendering. A stale/page-0 match here would accept a label the
+        # farmer can't actually see as a button on their current page (or
+        # reject one they're genuinely looking at).
+        page_choices = _paginate(current_question, conversation.current_page).choices
+        matched = next((c for c in page_choices or [] if c.label == raw_text), None)
+        if matched is not None and matched.id in (_NEXT_PAGE_CHOICE_ID, _PREV_PAGE_CHOICE_ID):
+            # Paging isn't answering -- current_question_id, every
+            # already-given answer, and the rest of this question stay
+            # exactly as they are. Only current_page moves.
+            conversation.current_page += 1 if matched.id == _NEXT_PAGE_CHOICE_ID else -1
+            await session.commit()
+            return _reply_for_question(
+                conversation_id, current_question, page=conversation.current_page
+            )
         if matched is not None and matched.id == _SKIP_CHOICE_ID:
             is_skip = True
         elif current_question.has_constrained_choices:
             if matched is None:
                 # Doesn't match any listed choice -- re-ask rather than store
                 # text that can't resolve to a real domain value later. Keeps
-                # the same question open, same choices offered again.
+                # the same question AND the same page open, same choices
+                # offered again.
                 return _reply_for_question(
                     conversation_id,
                     current_question,
+                    page=conversation.current_page,
                     error="กรุณาเลือกคำตอบจากตัวเลือกที่กำหนดเท่านั้น",
                 )
             resolved_value = matched.id
@@ -529,11 +647,14 @@ async def handle_answer(
             return _reply_for_question(
                 conversation_id,
                 current_question,
+                page=conversation.current_page,
                 error="กรุณาตอบคำถามนี้ ไม่สามารถเว้นว่างได้",
             )
         error = validate_answer(current_question.validation_rule, raw_text)
         if error is not None:
-            return _reply_for_question(conversation_id, current_question, error=error)
+            return _reply_for_question(
+                conversation_id, current_question, page=conversation.current_page, error=error
+            )
 
     if is_skip:
         answer: dict[str, Any] = {"skipped": True}
@@ -557,7 +678,7 @@ async def handle_answer(
     transition = on_guided_answer(all_slots_filled=_all_required_answered(questions, answered))
 
     if transition.next_state == ActiveSubstate.AWAITING_CONFIRMATION:
-        conversation.current_question_id = None
+        _advance_to(conversation, None)
         await session.commit()
         return ConversationReply(
             conversation_id=conversation_id,
@@ -576,7 +697,7 @@ async def handle_answer(
             "but no unanswered mandatory question was found"
         )
 
-    conversation.current_question_id = next_question.question_id
+    _advance_to(conversation, next_question.question_id)
     await session.commit()
     return _reply_for_question(conversation_id, next_question)
 
@@ -685,7 +806,7 @@ async def cancel_conversation(session: AsyncSession, *, conversation_id: UUID) -
         raise ConversationNotFound()
 
     conversation.status = ConversationStatus.CANCELLED
-    conversation.current_question_id = None
+    _advance_to(conversation, None)
     await session.commit()
 
     return ConversationReply(
@@ -797,9 +918,15 @@ async def resume_conversation(
             f"Resumed conversation_id={conversation.conversation_id}'s current question "
             "is no longer part of the form"
         )
+    # Page-aware: a farmer paused mid-pagination resumes on the exact page
+    # they left, not silently back at page 1 (conversation.current_page
+    # persists across pause/resume same as everything else).
+    paginated = _paginate(current_question, conversation.current_page)
     return ConversationReply(
         conversation_id=conversation.conversation_id,
         substate=ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION,
-        text=recap + current_question.label,
-        choices=current_question.choices,
+        text=recap + current_question.label + paginated.indicator,
+        choices=paginated.choices,
+        input_type=current_question.input_type,
+        validation_rule=current_question.validation_rule,
     )
