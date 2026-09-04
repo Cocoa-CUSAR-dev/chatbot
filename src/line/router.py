@@ -311,17 +311,31 @@ async def _handle_postback(event: PostbackEvent) -> None:
                     last_answer = None
                 if last_answer is not None:
                     questions = service.questions_from_form(form)
-                    sanitized = reuse.sanitize_for_autofill(last_answer, questions)
-                    reply = await service.start_conversation_with_autofill(
-                        session,
-                        user_id=user_id,
-                        task_id=UUID(task_id),
-                        task_form_id=UUID(task_form_id),
-                        form=form,
-                        sanitized_answer=sanitized,
-                    )
-                    await _reply(event.reply_token, reply)
-                    return
+                    try:
+                        sanitized = await reuse.sanitize_for_autofill(last_answer, questions)
+                    except UpstreamServiceError:
+                        # #105 (Go's /service/autofill/sanitize) hiccuped --
+                        # same "never block a plain start" reasoning as the
+                        # fetch_last_answer failure above. Nothing was
+                        # created yet, so falling through to a plain start
+                        # below is safe.
+                        logger.warning(
+                            "fetch_sanitized_autofill failed for handler=%s on "
+                            "start_autofill -- starting fresh instead",
+                            handler,
+                            exc_info=True,
+                        )
+                    else:
+                        reply = await service.start_conversation_with_autofill(
+                            session,
+                            user_id=user_id,
+                            task_id=UUID(task_id),
+                            task_form_id=UUID(task_form_id),
+                            form=form,
+                            sanitized_answer=sanitized,
+                        )
+                        await _reply(event.reply_token, reply)
+                        return
                 # The last answer disappeared between the offer and this
                 # tap (race, or a second Go hiccup) -- fall through to a
                 # plain start below rather than leaving the farmer stuck

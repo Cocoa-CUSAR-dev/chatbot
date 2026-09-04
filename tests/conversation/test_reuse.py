@@ -1,4 +1,5 @@
 import uuid
+from unittest.mock import AsyncMock, patch
 
 from src.conversation import reuse, service
 from src.conversation.constants import AnswerSource
@@ -46,81 +47,100 @@ def _boolean(field_name: str, *, sort_order: int = 0) -> dict[str, object]:
 
 
 class TestSanitizeForAutofill:
-    def test_drops_task_id_and_stale_parent_fields_unconditionally(self) -> None:
+    """The actual filtering rules (drop task_id/stale-parent-ids, drop a
+    stale OPTION/BOOLEAN value) now live in Go -- mobile-backend's
+    internal/validation/autofill_sanitizer.go (#105, US2-5) -- and are
+    tested there. This module's own job is just: build the right request
+    payload, and return whatever Go sends back. fetch_sanitized_autofill is
+    mocked throughout so these tests don't need a real Go backend.
+    """
+
+    async def test_returns_whatever_go_returns(self) -> None:
         questions = _form_with(_varchar("note"))
-        raw = {
-            "task_id": str(uuid.uuid4()),
-            "farm_activity_id": str(uuid.uuid4()),
-            "harvest_id": str(uuid.uuid4()),
-            "batch_id": str(uuid.uuid4()),
-            "note": "hello",
-        }
+        go_response = {"note": "hello"}
 
-        sanitized = reuse.sanitize_for_autofill(raw, questions)
+        with patch(
+            "src.conversation.reuse.fetch_sanitized_autofill",
+            new=AsyncMock(return_value=go_response),
+        ):
+            sanitized = await reuse.sanitize_for_autofill({"note": "hello"}, questions)
 
-        assert sanitized == {"note": "hello"}
+        assert sanitized == go_response
 
-    def test_free_text_field_passes_through_unchanged(self) -> None:
-        questions = _form_with(_varchar("note"))
-
-        sanitized = reuse.sanitize_for_autofill({"note": "ปุ๋ยอินทรีย์"}, questions)
-
-        assert sanitized == {"note": "ปุ๋ยอินทรีย์"}
-
-    def test_option_value_still_present_in_current_form_is_kept(self) -> None:
-        keep_id = str(uuid.uuid4())
-        questions = _form_with(_option("fertilizer_id", [keep_id]))
-
-        sanitized = reuse.sanitize_for_autofill({"fertilizer_id": keep_id}, questions)
-
-        assert sanitized == {"fertilizer_id": keep_id}
-
-    def test_option_value_no_longer_in_current_form_is_dropped(self) -> None:
-        # e.g. that fertilizer was deleted/renamed since the last submission --
-        # its old id no longer resolves to any real choice on this form.
-        stale_id = str(uuid.uuid4())
-        current_id = str(uuid.uuid4())
-        questions = _form_with(_option("fertilizer_id", [current_id]))
-
-        sanitized = reuse.sanitize_for_autofill({"fertilizer_id": stale_id}, questions)
-
-        assert sanitized == {}
-
-    def test_boolean_value_matching_synthesized_choice_is_kept(self) -> None:
-        questions = _form_with(_boolean("is_quality_damage"))
-
-        sanitized = reuse.sanitize_for_autofill({"is_quality_damage": "true"}, questions)
-
-        assert sanitized == {"is_quality_damage": "true"}
-
-    def test_field_name_not_on_current_form_at_all_passes_through(self) -> None:
-        # sanitize_for_autofill only knows to reject OPTION/BOOLEAN mismatches
-        # -- an unrecognized free-text-shaped field name is left for
-        # build_answer_rows to drop, since that's where the current form's
-        # question set is actually looked up by field_name.
-        questions = _form_with(_varchar("note"))
-
-        sanitized = reuse.sanitize_for_autofill({"retired_field": "x"}, questions)
-
-        assert sanitized == {"retired_field": "x"}
-
-    def test_mixed_answer_only_drops_what_it_should(self) -> None:
-        keep_option_id = str(uuid.uuid4())
-        stale_option_id = str(uuid.uuid4())
+    async def test_payload_carries_every_question_with_field_and_input_type(self) -> None:
         questions = _form_with(
-            _varchar("note", sort_order=0),
-            _option("fertilizer_id", [keep_option_id], sort_order=1),
+            _varchar("note", sort_order=0), _option("fertilizer_id", [], sort_order=1)
         )
-        raw = {
-            "task_id": str(uuid.uuid4()),
-            "batch_id": str(uuid.uuid4()),
-            "note": "ok",
-            "fertilizer_id": stale_option_id,
-        }
+        fetch_mock = AsyncMock(return_value={})
 
-        sanitized = reuse.sanitize_for_autofill(raw, questions)
+        with patch("src.conversation.reuse.fetch_sanitized_autofill", new=fetch_mock):
+            await reuse.sanitize_for_autofill({}, questions)
 
-        assert sanitized == {"note": "ok"}
+        sent_questions = fetch_mock.call_args.kwargs["questions"]
+        assert {q["fieldName"] for q in sent_questions} == {"note", "fertilizer_id"}
+        by_field = {q["fieldName"]: q for q in sent_questions}
+        assert by_field["note"]["inputType"] == "VARCHAR"
+        assert by_field["fertilizer_id"]["inputType"] == "OPTION"
+
+    async def test_payload_includes_real_choices_for_a_constrained_question(self) -> None:
+        choice_id = str(uuid.uuid4())
+        questions = _form_with(_option("fertilizer_id", [choice_id]))
+        fetch_mock = AsyncMock(return_value={})
+
+        with patch("src.conversation.reuse.fetch_sanitized_autofill", new=fetch_mock):
+            await reuse.sanitize_for_autofill({}, questions)
+
+        sent_questions = fetch_mock.call_args.kwargs["questions"]
+        assert sent_questions[0]["choices"] == [{"id": choice_id, "name": f"label-{choice_id}"}]
+
+    async def test_payload_strips_pause_and_skip_sentinels_from_choices(self) -> None:
+        # Question.choices always has pause (and skip, for non-mandatory)
+        # prepended -- see service.py's _choices_for. Purely a LINE UI
+        # concept, so Go should never see "__pause__"/"__skip__" as if they
+        # were real domain choices.
+        choice_id = str(uuid.uuid4())
+        questions = _form_with(_option("fertilizer_id", [choice_id]))
+        fetch_mock = AsyncMock(return_value={})
+
+        with patch("src.conversation.reuse.fetch_sanitized_autofill", new=fetch_mock):
+            await reuse.sanitize_for_autofill({}, questions)
+
+        sent_choice_ids = {c["id"] for c in fetch_mock.call_args.kwargs["questions"][0]["choices"]}
+        assert sent_choice_ids == {choice_id}
+
+    async def test_payload_includes_synthesized_choices_for_a_boolean_question(self) -> None:
+        # Kotlin never sends `choices` for BOOLEAN -- service.py's
+        # _constrained_choices_for synthesizes true/false locally, and
+        # _real_choices picks that up like any other constrained question.
+        questions = _form_with(_boolean("is_quality_damage"))
+        fetch_mock = AsyncMock(return_value={})
+
+        with patch("src.conversation.reuse.fetch_sanitized_autofill", new=fetch_mock):
+            await reuse.sanitize_for_autofill({}, questions)
+
+        sent_choice_ids = {c["id"] for c in fetch_mock.call_args.kwargs["questions"][0]["choices"]}
+        assert sent_choice_ids == {"true", "false"}
+
+    async def test_unconstrained_question_gets_an_empty_choices_list(self) -> None:
+        questions = _form_with(_varchar("note"))
+        fetch_mock = AsyncMock(return_value={})
+
+        with patch("src.conversation.reuse.fetch_sanitized_autofill", new=fetch_mock):
+            await reuse.sanitize_for_autofill({}, questions)
+
+        assert fetch_mock.call_args.kwargs["questions"][0]["choices"] == []
+
+    async def test_raw_answer_passed_through_unchanged_as_the_answer_kwarg(self) -> None:
+        questions = _form_with(_varchar("note"))
+        raw = {"note": "hello", "task_id": "t-1"}
+        fetch_mock = AsyncMock(return_value={})
+
+        with patch("src.conversation.reuse.fetch_sanitized_autofill", new=fetch_mock):
+            await reuse.sanitize_for_autofill(raw, questions)
+
+        # Go, not this module, decides what to drop -- the raw dict goes
+        # over the wire exactly as received.
+        assert fetch_mock.call_args.kwargs["answer"] == raw
 
 
 class TestBuildAnswerRows:
@@ -170,21 +190,31 @@ class TestBuildAnswerRows:
 
 
 class TestSanitizeThenBuildIntegration:
-    def test_full_pipeline_drops_stale_option_and_keeps_the_rest(self) -> None:
+    async def test_full_pipeline_from_go_response_to_answer_rows(self) -> None:
         keep_option_id = str(uuid.uuid4())
-        stale_option_id = str(uuid.uuid4())
         questions = _form_with(
             _varchar("note", sort_order=0),
             _option("fertilizer_id", [keep_option_id], sort_order=1),
         )
-        raw = {
-            "task_id": str(uuid.uuid4()),
-            "farm_activity_id": str(uuid.uuid4()),
-            "note": "sprayed at dawn",
-            "fertilizer_id": stale_option_id,
-        }
+        # What Go would actually return after dropping task_id/farm_activity_id
+        # and the stale fertilizer_id itself -- this test's job is just
+        # confirming build_answer_rows handles that shape correctly, not
+        # re-testing Go's own filtering rules.
+        go_response = {"note": "sprayed at dawn"}
 
-        sanitized = reuse.sanitize_for_autofill(raw, questions)
+        with patch(
+            "src.conversation.reuse.fetch_sanitized_autofill",
+            new=AsyncMock(return_value=go_response),
+        ):
+            sanitized = await reuse.sanitize_for_autofill(
+                {
+                    "task_id": str(uuid.uuid4()),
+                    "farm_activity_id": str(uuid.uuid4()),
+                    "note": "sprayed at dawn",
+                    "fertilizer_id": "stale",
+                },
+                questions,
+            )
         rows = reuse.build_answer_rows(uuid.uuid4(), sanitized, questions)
 
         assert len(rows) == 1

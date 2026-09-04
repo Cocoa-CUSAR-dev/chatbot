@@ -97,6 +97,40 @@ async def fetch_last_answer(*, user_id: str, handler: str) -> dict[str, Any] | N
     return answer
 
 
+async def fetch_sanitized_autofill(
+    *, answer: dict[str, Any], questions: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """POST Go's /service/autofill/sanitize (#105, US2-5) -- the ONE shared
+    filtering implementation both chat and any remaining static form call,
+    so the two channels can't drift apart on what's safe to prefill a
+    farmer with from a past submission. `questions` must already be in
+    mobile-backend's internal/validation.Question JSON shape
+    (fieldName/inputType/choices, choices as {id, name}) --
+    src.conversation.reuse.sanitize_for_autofill builds that from this
+    chatbot's own Question dataclasses; this function is just the HTTP call.
+    """
+    async with httpx.AsyncClient(base_url=tasks_settings.GO_BACKEND_URL, timeout=30.0) as client:
+        response = await client.post(
+            "/service/autofill/sanitize",
+            json={"answer": answer, "questions": questions},
+            headers={"X-Service-Key": tasks_settings.GO_SERVICE_KEY},
+        )
+
+    if response.status_code >= 400:
+        raise UpstreamServiceError(
+            f"Go backend returned {response.status_code} for autofill sanitize: "
+            f"{_error_detail(response)}"
+        )
+
+    body = response.json()
+    sanitized = body.get("answer")
+    if not isinstance(sanitized, dict):
+        raise UpstreamServiceError(
+            f"Go's autofill-sanitize response had no usable 'answer' object: {body!r}"
+        )
+    return sanitized
+
+
 def _error_detail(response: httpx.Response) -> str:
     try:
         return str(response.json().get("error", response.text))
