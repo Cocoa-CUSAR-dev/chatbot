@@ -68,6 +68,4 @@ async def test_link_rich_menu_to_user_calls_the_right_endpoint() -> None:
     ):
         await rich_menu.link_rich_menu_to_user("Uabc123", "richmenu-abc123")
 
-    messaging_api.link_rich_menu_id_to_user.assert_awaited_once_with(
-        "Uabc123", "richmenu-abc123"
-    )
+    messaging_api.link_rich_menu_id_to_user.assert_awaited_once_with("Uabc123", "richmenu-abc123")

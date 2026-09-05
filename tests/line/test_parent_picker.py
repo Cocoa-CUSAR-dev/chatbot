@@ -40,9 +40,7 @@ async def test_choices_for_farm_activity_builds_labelled_options() -> None:
 
     result = await choices_for(session, "farm_activity", uuid.uuid4())
 
-    assert result == [
-        ParentOption(id=str(rows[0].id), label="ใส่ปุ๋ย 01/08/2026 — สวนทดสอบ")
-    ]
+    assert result == [ParentOption(id=str(rows[0].id), label="ใส่ปุ๋ย 01/08/2026 — สวนทดสอบ")]
 
 
 async def test_choices_for_batch_builds_labelled_options() -> None:

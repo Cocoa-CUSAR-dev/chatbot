@@ -2,7 +2,7 @@ from datetime import datetime
 
 from sqlalchemy import DateTime
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped
 
 from src.models import TimestampMixin, uuid_pk
 

@@ -38,7 +38,11 @@ async def test_reply_task_choices_labels_resumable_tasks_differently() -> None:
     ctx1, ctx2, messaging_api = _patched_messaging_api()
     task_id, task_form_id = uuid.uuid4(), uuid.uuid4()
     resumable = PendingTask(
-        task_id=task_id, task_form_id=task_form_id, title="งานเก่า", handler="notes", has_conversation=True
+        task_id=task_id,
+        task_form_id=task_form_id,
+        title="งานเก่า",
+        handler="notes",
+        has_conversation=True,
     )
 
     with ctx1, ctx2:
