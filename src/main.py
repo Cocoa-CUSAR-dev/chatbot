@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from src.config import settings
 from src.exceptions import ServiceException
 from src.line.router import router as line_router
+from src.notifications.router import router as notifications_router
 from src.reminders.scheduler import configure_jobs, scheduler
 
 if not settings.ENVIRONMENT.is_deployed:
@@ -48,6 +49,7 @@ async def health() -> dict[str, str]:
 
 
 app.include_router(line_router)
+app.include_router(notifications_router)
 
 if not settings.ENVIRONMENT.is_deployed:
     app.include_router(conversation_test_router)
