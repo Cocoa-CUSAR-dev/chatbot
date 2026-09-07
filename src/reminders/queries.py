@@ -11,7 +11,7 @@ service owns outright (ADR 0005).
 
 import uuid
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import datetime, time
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -79,11 +79,18 @@ async def users_owing_task(
     return [row.user_id for row in rows]
 
 
-async def already_reminded_today(
-    session: AsyncSession, task_id: uuid.UUID, today: date
+async def already_reminded_since(
+    session: AsyncSession, task_id: uuid.UUID, since: datetime
 ) -> set[uuid.UUID]:
     """The idempotency check -- against the persisted notify.reminder_log, never
     APScheduler's in-memory state, so it survives a restart (ADR 0006).
+
+    Compares `sent_at >= since` rather than `sent_at::date = today`: the caller
+    writes sent_at and passes `since` in the *same* wall-clock frame (see
+    record_reminders / jobs.py), so this holds regardless of what timezone the
+    database session is in. The `::date` form silently broke near midnight
+    Bangkok when the DB stored UTC -- sent_at's date and "today" disagreed by
+    one day and every run re-sent.
     """
     rows = await session.execute(
         text(
@@ -91,10 +98,10 @@ async def already_reminded_today(
             SELECT user_id FROM notify.reminder_log
             WHERE task_id = :task_id
               AND channel = 'push'
-              AND sent_at::date = :today
+              AND sent_at >= :since
             """
         ),
-        {"task_id": str(task_id), "today": today},
+        {"task_id": str(task_id), "since": since},
     )
     return {row.user_id for row in rows}
 
@@ -105,16 +112,23 @@ async def record_reminders(
     task_id: uuid.UUID,
     user_ids: list[uuid.UUID],
     status: str,
+    sent_at: datetime,
 ) -> None:
     """One notify.reminder_log row per user we attempted, written AFTER the
-    push call returns. This is what already_reminded_today reads back.
+    push call returns. This is what already_reminded_since reads back.
+
+    sent_at is written explicitly (not left to the column's `now()` default)
+    so it lands in the same frame already_reminded_since compares against.
     """
     if not user_ids:
         return
     await session.execute(
         text(
-            "INSERT INTO notify.reminder_log (user_id, task_id, channel, status) "
-            "VALUES (:user_id, :task_id, 'push', :status)"
+            "INSERT INTO notify.reminder_log (user_id, task_id, sent_at, channel, status) "
+            "VALUES (:user_id, :task_id, :sent_at, 'push', :status)"
         ),
-        [{"user_id": str(uid), "task_id": str(task_id), "status": status} for uid in user_ids],
+        [
+            {"user_id": str(uid), "task_id": str(task_id), "sent_at": sent_at, "status": status}
+            for uid in user_ids
+        ],
     )

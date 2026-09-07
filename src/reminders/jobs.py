@@ -12,7 +12,7 @@ from src.database import async_session_maker
 from src.line.identity import lookup_line_user_ids
 from src.line.service import multicast_text
 from src.reminders.queries import (
-    already_reminded_today,
+    already_reminded_since,
     due_reminders,
     record_reminders,
     users_owing_task,
@@ -44,12 +44,16 @@ async def _run_reminder_check(session: AsyncSession, now: datetime) -> None:
         return
 
     naive_now = now.replace(tzinfo=None)  # form.task timestamps are tz-naive
+    # Dedup window: everything sent since midnight today, in the scheduler's own
+    # timezone. record_reminders writes sent_at in this same frame, so the
+    # comparison doesn't depend on the database session's timezone.
+    day_start = naive_now.replace(hour=0, minute=0, second=0, microsecond=0)
     for reminder in due:
         owing = await users_owing_task(session, reminder.task_id, naive_now)
         if not owing:
             continue
 
-        done_today = await already_reminded_today(session, reminder.task_id, now.date())
+        done_today = await already_reminded_since(session, reminder.task_id, day_start)
         targets = [uid for uid in owing if uid not in done_today]
         if not targets:
             continue
@@ -68,7 +72,13 @@ async def _run_reminder_check(session: AsyncSession, now: datetime) -> None:
             logger.exception("reminder push failed for task %s", reminder.task_id)
             status = "failed"
 
-        await record_reminders(session, task_id=reminder.task_id, user_ids=targets, status=status)
+        await record_reminders(
+            session,
+            task_id=reminder.task_id,
+            user_ids=targets,
+            status=status,
+            sent_at=naive_now,
+        )
         await session.commit()
         logger.info(
             "reminder task=%s recipients=%d status=%s",

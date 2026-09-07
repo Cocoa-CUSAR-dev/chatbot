@@ -15,7 +15,7 @@ async def _run(*, due, owing, done, id_map, multicast=None):
         patch("src.reminders.jobs.due_reminders", new=AsyncMock(return_value=due)),
         patch("src.reminders.jobs.users_owing_task", new=AsyncMock(return_value=owing)),
         patch(
-            "src.reminders.jobs.already_reminded_today",
+            "src.reminders.jobs.already_reminded_since",
             new=AsyncMock(return_value=done),
         ),
         patch(
