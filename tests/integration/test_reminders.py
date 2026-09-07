@@ -5,7 +5,7 @@ RUN_DB_TESTS is set (see tests/integration/conftest.py).
 """
 
 import uuid
-from datetime import datetime
+from datetime import datetime, time
 from unittest.mock import AsyncMock, patch
 
 from sqlalchemy import text
@@ -30,7 +30,7 @@ async def _seed_schedule(
     *,
     task_id: uuid.UUID,
     created_by: uuid.UUID,
-    time_of_day: str = "08:00",
+    time_of_day: time = time(8, 0),
     cadence: str = "DAILY",
     is_active: bool = True,
 ) -> uuid.UUID:
@@ -108,7 +108,7 @@ async def test_user_who_already_submitted_is_not_reminded(db_session: AsyncSessi
 async def test_schedule_time_not_yet_reached_is_not_due(db_session: AsyncSession) -> None:
     user_id = await seed_user_with_line_identity(db_session, line_user_id="Ureminder4")
     task_id, _ = await seed_task_form(db_session, open_at=_PAST)
-    await _seed_schedule(db_session, task_id=task_id, created_by=user_id, time_of_day="23:00")
+    await _seed_schedule(db_session, task_id=task_id, created_by=user_id, time_of_day=time(23, 0))
 
     with patch("src.reminders.jobs.multicast_text", new=AsyncMock()) as multicast:
         await _run_reminder_check(db_session, _NOW)
