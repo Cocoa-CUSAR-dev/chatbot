@@ -127,7 +127,7 @@ async def reply_confirm_prompt(reply_token: str, text: str, conversation_id: UUI
 
 
 async def reply_autofill_offer(
-    reply_token: str, *, task_id: str, task_form_id: str, handler: str
+    reply_token: str, *, task_id: str, task_form_id: str, handler: str, preview: str = ""
 ) -> None:
     """US2-4: offers reusing the farmer's last COMPLETED submission for this
     handler, before a fresh Conversation row exists. Two Postback buttons,
@@ -136,9 +136,15 @@ async def reply_autofill_offer(
     conversation itself doesn't exist until the farmer answers this. Same
     encode-everything-in-postback-data convention as reply_task_choices/
     reply_confirm_prompt: no extra state is persisted between this offer and
-    the tap -- router.py's "start_autofill" branch re-fetches the last
-    answer itself on "yes" rather than trusting whatever was true when this
-    was sent.
+    the tap -- router.py's "start_autofill" branch re-fetches (and
+    re-sanitizes) the last answer itself on "yes" rather than trusting
+    whatever was true when this was sent; `preview` is display-only,
+    computed by that same router.py call site purely to show here.
+
+    `preview` (from reuse.format_autofill_preview) is shown before the
+    yes/no question -- live-reported feedback: a blind "reuse old data?"
+    prompt with no content until AFTER agreeing left a farmer unable to
+    make an informed choice.
     """
     quick_reply = QuickReply(
         items=[
@@ -146,7 +152,7 @@ async def reply_autofill_offer(
                 action=PostbackAction(
                     label="ใช้ข้อมูลเดิม",
                     data=f"start_autofill:yes:{task_id}:{task_form_id}:{handler}",
-                    displayText="ใช้ข้อมูลเดิม",
+                    displayText="ใช้ข้อมูลเดิม (แก้ไขเพิ่มเติมได้ทีหลัง)",
                 )
             ),
             QuickReplyItem(
@@ -158,8 +164,12 @@ async def reply_autofill_offer(
             ),
         ]
     )
+    prefix = f"พบข้อมูลที่เคยกรอกไว้ก่อนหน้านี้:\n{preview}\n\n" if preview else "พบข้อมูลที่เคยกรอกไว้ก่อนหน้านี้ "
     message = TextMessage(
-        text="พบข้อมูลที่เคยกรอกไว้ก่อนหน้านี้ ต้องการนำมาใช้กรอกให้อัตโนมัติหรือไม่?",
+        text=(
+            f"{prefix}ต้องการนำมาใช้กรอกให้อัตโนมัติหรือไม่? "
+            '(เลือก "ใช้ข้อมูลเดิม" แล้วยังกลับมาแก้ไขทีละข้อได้ทีหลัง ผ่านปุ่ม "แก้ไข" ตอนสรุปคำตอบ)'
+        ),
         quickReply=quick_reply,
     )
     async with AsyncApiClient(_configuration) as client:

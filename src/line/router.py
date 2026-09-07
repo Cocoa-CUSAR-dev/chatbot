@@ -252,11 +252,31 @@ async def _handle_postback(event: PostbackEvent) -> None:
                     )
                     last_answer = None
                 if last_answer is not None:
+                    # Preview-only: router.py's own "start_autofill" branch
+                    # re-fetches and re-sanitizes on "yes" rather than
+                    # trusting this -- see reply_autofill_offer's docstring.
+                    preview = ""
+                    try:
+                        offer_questions = service.questions_from_form(form)
+                        sanitized_preview = await reuse.sanitize_for_autofill(
+                            last_answer, offer_questions
+                        )
+                        preview = reuse.format_autofill_preview(
+                            sanitized_preview, offer_questions
+                        )
+                    except UpstreamServiceError:
+                        logger.warning(
+                            "sanitize_for_autofill failed for handler=%s while building the "
+                            "offer preview -- showing the offer without one",
+                            handler,
+                            exc_info=True,
+                        )
                     await reply_autofill_offer(
                         event.reply_token,
                         task_id=task_id,
                         task_form_id=task_form_id,
                         handler=handler,
+                        preview=preview,
                     )
                     return
 

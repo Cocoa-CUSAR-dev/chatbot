@@ -66,6 +66,34 @@ async def sanitize_for_autofill(
     return await fetch_sanitized_autofill(answer=raw_answer, questions=questions_payload)
 
 
+def format_autofill_preview(sanitized_answer: dict[str, Any], questions: list["Question"]) -> str:
+    """US2-4: "label: value" lines for the offer message itself -- a farmer
+    should see what's actually being offered before deciding "ใช้ข้อมูลเดิม",
+    not just an abstract "reuse old data?" prompt with no content shown
+    until after they've already agreed. Same label/value resolution
+    build_answer_rows uses (an OPTION/BOOLEAN value shown by its current
+    label, not the raw id) -- sorted by sort_order, matching every other
+    answer listing in this codebase (_format_answered_lines et al).
+    """
+    question_by_field = {q.field_name: q for q in questions}
+    ordered_fields = sorted(
+        (f for f in sanitized_answer if f in question_by_field),
+        key=lambda f: question_by_field[f].sort_order,
+    )
+    lines = []
+    for field_name in ordered_fields:
+        question = question_by_field[field_name]
+        value = sanitized_answer[field_name]
+        if question.has_constrained_choices:
+            display_value = next(
+                (c.label for c in _real_choices(question) if c.id == str(value)), str(value)
+            )
+        else:
+            display_value = str(value)
+        lines.append(f"- {question.label}: {display_value}")
+    return "\n".join(lines)
+
+
 def build_answer_rows(
     conversation_id: UUID, sanitized_answer: dict[str, Any], questions: list["Question"]
 ) -> list[ConversationAnswer]:

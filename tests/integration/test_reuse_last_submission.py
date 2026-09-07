@@ -149,9 +149,12 @@ class TestReuseLastSubmission:
                 line_user_id=line_user_id,
                 data=f"start:{task_id}:{task_form_id}:notes",
             )
-            assert "ใช้ข้อมูลเดิม" in _reply_texts(reply_message)[0] or (
-                "ต้องการนำมาใช้กรอกให้อัตโนมัติ" in _reply_texts(reply_message)[0]
-            )
+            offer_text = _reply_texts(reply_message)[0]
+            assert "ต้องการนำมาใช้กรอกให้อัตโนมัติ" in offer_text
+            # The preview itself -- a farmer should see what's being offered
+            # before agreeing, not just find out after tapping "ใช้ข้อมูลเดิม".
+            assert "ค่าเดิม 1" in offer_text
+            assert "ค่าเดิม 2" in offer_text
             # No conversation should exist yet -- the offer is sent before
             # start_conversation_with_autofill is ever called.
             no_conversation = await db_session.execute(

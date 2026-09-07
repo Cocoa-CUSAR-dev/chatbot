@@ -189,6 +189,48 @@ class TestBuildAnswerRows:
         assert question_ids == {q.question_id for q in questions}
 
 
+class TestFormatAutofillPreview:
+    """The offer message itself shows this -- a farmer should see what's
+    being offered before agreeing, not just find out after tapping "ใช้
+    ข้อมูลเดิม" (live feedback: a blind yes/no prompt left no way to make an
+    informed choice).
+    """
+
+    def test_shows_label_and_value_per_field(self) -> None:
+        questions = _form_with(_varchar("note", sort_order=0))
+
+        preview = reuse.format_autofill_preview({"note": "สวัสดี"}, questions)
+
+        assert preview == "- note: สวัสดี"
+
+    def test_orders_by_sort_order_not_dict_order(self) -> None:
+        questions = _form_with(
+            _varchar("first", sort_order=0), _varchar("second", sort_order=1)
+        )
+        # Insert "second" first in the dict -- preview must still lead with
+        # "first", matching sort_order rather than iteration order.
+        sanitized = {"second": "b", "first": "a"}
+
+        preview = reuse.format_autofill_preview(sanitized, questions)
+
+        assert preview == "- first: a\n- second: b"
+
+    def test_option_value_shows_its_current_label_not_the_raw_id(self) -> None:
+        choice_id = str(uuid.uuid4())
+        questions = _form_with(_option("fertilizer_id", [choice_id]))
+
+        preview = reuse.format_autofill_preview({"fertilizer_id": choice_id}, questions)
+
+        assert preview == f"- fertilizer_id: label-{choice_id}"
+
+    def test_field_with_no_matching_question_is_skipped(self) -> None:
+        questions = _form_with(_varchar("note"))
+
+        preview = reuse.format_autofill_preview({"retired_field": "x"}, questions)
+
+        assert preview == ""
+
+
 class TestSanitizeThenBuildIntegration:
     async def test_full_pipeline_from_go_response_to_answer_rows(self) -> None:
         keep_option_id = str(uuid.uuid4())
