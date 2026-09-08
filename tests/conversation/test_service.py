@@ -71,10 +71,12 @@ def _boolean_form() -> tuple[FormDetail, uuid.UUID]:
     return FormDetail(task_form_id="tf-bool", sections=[{"questions": questions}]), question_id
 
 
-def _mandatory_option_form(choice_count: int) -> tuple[FormDetail, uuid.UUID]:
-    """A single mandatory OPTION question with `choice_count` real choices --
-    matches farm_id (backed by ref.farm_constant) on the harvest/farm_activity
-    forms, the field a reviewer caught actually hitting this at 13 real rows.
+def _option_form(*, choice_count: int, is_mandatory: bool = True) -> tuple[FormDetail, uuid.UUID]:
+    """A single OPTION question with `choice_count` real choices -- matches
+    farm_id (backed by ref.farm_constant) on the harvest/farm_activity
+    forms, the field a reviewer caught actually hitting the pause-slot
+    regression at 13 real rows, and now the shape used to exercise
+    pagination once choice_count exceeds a single page's budget.
     """
     question_id = uuid.uuid4()
     questions = [
@@ -83,7 +85,7 @@ def _mandatory_option_form(choice_count: int) -> tuple[FormDetail, uuid.UUID]:
             "label": "เลือกฟาร์ม",
             "field_name": "farm_id",
             "input_type": "OPTION",
-            "is_mandatory": True,
+            "is_mandatory": is_mandatory,
             "sort_order": 0,
             "choices": [
                 {"id": str(uuid.uuid4()), "name": f"farm {i}"} for i in range(choice_count)
@@ -91,6 +93,10 @@ def _mandatory_option_form(choice_count: int) -> tuple[FormDetail, uuid.UUID]:
         }
     ]
     return FormDetail(task_form_id="tf-option", sections=[{"questions": questions}]), question_id
+
+
+def _mandatory_option_form(choice_count: int) -> tuple[FormDetail, uuid.UUID]:
+    return _option_form(choice_count=choice_count, is_mandatory=True)
 
 
 def _answer(question_id: uuid.UUID, text: str = "some answer") -> ConversationAnswer:
@@ -189,6 +195,100 @@ def test_mandatory_option_well_under_quota_keeps_every_real_choice() -> None:
     assert choices is not None
     assert len(choices) == 4  # pause + all 3 real choices, nothing dropped
     assert [c.label for c in choices[1:]] == ["farm 0", "farm 1", "farm 2"]
+
+
+class TestPaginate:
+    """The follow-up to the mandatory-OPTION regression (test_mandatory_
+    option_at_quota_leaves_room_for_pause above): rather than silently
+    dropping overflow past one page, a question with too many real choices
+    to fit alongside pause(/skip) now pages through them. Exercised
+    directly against service._paginate rather than through handle_answer,
+    since this is where the actual slot math lives -- same lesson from
+    that regression: test the arithmetic directly, not just end-to-end.
+    """
+
+    def test_fits_on_one_page_ignores_page_argument(self) -> None:
+        """The vast majority of questions: real choices already fit
+        alongside pause in one message, exactly _choices_for's own output --
+        `page` must be completely irrelevant here, not just defaulted."""
+        form, question_id = _mandatory_option_form(choice_count=5)
+        question = service.questions_from_form(form)[0]
+
+        for page in (0, 1, 99):
+            paginated = service._paginate(question, page)
+            assert paginated.choices == question.choices
+            assert paginated.indicator == ""
+
+    def test_mandatory_first_page_has_next_but_no_prev(self) -> None:
+        # mandatory budget once paginated: 13 - 1(pause) - 2(nav) = 10 real/page
+        form, _ = _mandatory_option_form(choice_count=25)
+        question = service.questions_from_form(form)[0]
+
+        paginated = service._paginate(question, 0)
+
+        assert paginated.indicator == " (หน้า 1/3)"
+        # One under the cap here, not exactly at it -- only middle pages
+        # (both prev+next) hit the full reserved-nav budget; the first page
+        # only needs one nav slot (next), so it's pause(1) + 10 real + next(1).
+        assert len(paginated.choices) == service._QUICK_REPLY_LIMIT - 1
+        assert paginated.choices[0] == service._PAUSE_CHOICE
+        assert [c.label for c in paginated.choices[1:-1]] == [f"farm {i}" for i in range(10)]
+        assert paginated.choices[-1] == service._NEXT_PAGE_CHOICE
+        assert service._PREV_PAGE_CHOICE not in paginated.choices
+
+    def test_mandatory_middle_page_has_both_prev_and_next(self) -> None:
+        form, _ = _mandatory_option_form(choice_count=25)
+        question = service.questions_from_form(form)[0]
+
+        paginated = service._paginate(question, 1)
+
+        assert paginated.indicator == " (หน้า 2/3)"
+        assert len(paginated.choices) == service._QUICK_REPLY_LIMIT  # worst case, still exact
+        assert paginated.choices[0] == service._PAUSE_CHOICE
+        assert [c.label for c in paginated.choices[1:-2]] == [f"farm {i}" for i in range(10, 20)]
+        assert paginated.choices[-2] == service._PREV_PAGE_CHOICE
+        assert paginated.choices[-1] == service._NEXT_PAGE_CHOICE
+
+    def test_mandatory_last_page_has_prev_but_no_next(self) -> None:
+        form, _ = _mandatory_option_form(choice_count=25)
+        question = service.questions_from_form(form)[0]
+
+        paginated = service._paginate(question, 2)
+
+        assert paginated.indicator == " (หน้า 3/3)"
+        # Nav choices trail the real choices (see the middle-page test above,
+        # which already established this order): pause, then the 5 remaining
+        # real choices, then prev -- not prev wedged between pause and the
+        # real choices.
+        assert paginated.choices[0] == service._PAUSE_CHOICE
+        assert [c.label for c in paginated.choices[1:-1]] == [f"farm {i}" for i in range(20, 25)]
+        assert paginated.choices[-1] == service._PREV_PAGE_CHOICE
+        assert service._NEXT_PAGE_CHOICE not in paginated.choices
+
+    def test_non_mandatory_reserves_room_for_skip_too(self) -> None:
+        # non-mandatory budget once paginated: 13 - 2(skip+pause) - 2(nav) = 9 real/page
+        form, _ = _option_form(choice_count=20, is_mandatory=False)
+        question = service.questions_from_form(form)[0]
+
+        paginated = service._paginate(question, 0)
+
+        # One under the cap -- page 0 only needs the "next" nav slot, same
+        # reasoning as the mandatory first-page test above.
+        assert len(paginated.choices) == service._QUICK_REPLY_LIMIT - 1
+        assert paginated.choices[0] == service._SKIP_CHOICE
+        assert paginated.choices[1] == service._PAUSE_CHOICE
+        assert [c.label for c in paginated.choices[2:-1]] == [f"farm {i}" for i in range(9)]
+        assert paginated.choices[-1] == service._NEXT_PAGE_CHOICE
+
+    def test_out_of_range_page_is_clamped_not_crashed(self) -> None:
+        form, _ = _mandatory_option_form(choice_count=25)
+        question = service.questions_from_form(form)[0]
+
+        too_high = service._paginate(question, 99)
+        negative = service._paginate(question, -5)
+
+        assert too_high.indicator == " (หน้า 3/3)"  # clamped to the real last page
+        assert negative.indicator == " (หน้า 1/3)"  # clamped to the first page
 
 
 class TestStartConversation:
@@ -718,6 +818,111 @@ class TestHandleAnswerPause:
         assert conversation.status == ConversationStatus.PAUSED
 
 
+class TestHandleAnswerPagination:
+    """Tapping the pagination nav choices end to end through handle_answer --
+    not just service._paginate's own arithmetic (TestPaginate above), but
+    that a real conversation's current_page actually advances, nothing gets
+    written as an answer, and a real choice on a non-zero page still
+    resolves correctly (matched against THAT page, not page 0)."""
+
+    def _conversation(
+        self, conversation_id: uuid.UUID, question_id: uuid.UUID, *, page: int
+    ) -> Conversation:
+        return Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=question_id,
+            current_page=page,
+        )
+
+    async def test_next_page_advances_without_storing_an_answer(self) -> None:
+        form, question_id = _mandatory_option_form(choice_count=25)
+        conversation_id = uuid.uuid4()
+        conversation = self._conversation(conversation_id, question_id, page=0)
+        session = _mock_session(answers=[], conversation=conversation)
+
+        reply = await service.handle_answer(
+            session, conversation_id=conversation_id, raw_text="» ถัดไป", form=form
+        )
+
+        assert reply is not None
+        assert conversation.current_page == 1
+        assert conversation.current_question_id == question_id  # still the same question
+        assert reply.text.endswith("(หน้า 2/3)")
+        session.add.assert_not_called()  # paging isn't answering
+
+    async def test_prev_page_retreats_without_storing_an_answer(self) -> None:
+        form, question_id = _mandatory_option_form(choice_count=25)
+        conversation_id = uuid.uuid4()
+        conversation = self._conversation(conversation_id, question_id, page=1)
+        session = _mock_session(answers=[], conversation=conversation)
+
+        reply = await service.handle_answer(
+            session, conversation_id=conversation_id, raw_text="« ก่อนหน้า", form=form
+        )
+
+        assert reply is not None
+        assert conversation.current_page == 0
+        assert reply.text.endswith("(หน้า 1/3)")
+        session.add.assert_not_called()
+
+    async def test_picking_a_real_choice_on_page_two_resolves_correctly(self) -> None:
+        """The exact case a page-0-only match would get wrong: "farm 15"
+        only exists on page 1 (0-indexed), not page 0."""
+        form, question_id = _mandatory_option_form(choice_count=25)
+        conversation_id = uuid.uuid4()
+        conversation = self._conversation(conversation_id, question_id, page=1)
+        session = _mock_session(answers=[], conversation=conversation)
+
+        reply = await service.handle_answer(
+            session, conversation_id=conversation_id, raw_text="farm 15", form=form
+        )
+
+        assert reply is not None
+        added_answer = session.add.call_args.args[0]
+        assert added_answer.answer["value"] is not None  # resolved, not stored as stray free text
+
+    async def test_typing_a_different_pages_choice_reasks_current_page(self) -> None:
+        """ "farm 15" doesn't exist as a button on page 0 -- must re-ask
+        (same page), not silently accept it as free text or crash."""
+        form, question_id = _mandatory_option_form(choice_count=25)
+        conversation_id = uuid.uuid4()
+        conversation = self._conversation(conversation_id, question_id, page=0)
+        session = _mock_session(answers=[], conversation=conversation)
+
+        reply = await service.handle_answer(
+            session, conversation_id=conversation_id, raw_text="farm 15", form=form
+        )
+
+        assert reply is not None
+        assert reply.text.endswith("(หน้า 1/3)")  # stayed on the same page
+        session.add.assert_not_called()
+
+    async def test_advancing_to_a_new_question_resets_page_to_zero(self) -> None:
+        form, (q1, q2) = _form(mandatory_flags=[True, True])
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=q1,
+            current_page=2,  # simulates having paginated on q1 before answering it
+        )
+        session = _mock_session(answers=[_answer(q1)], conversation=conversation)
+
+        await service.handle_answer(
+            session, conversation_id=conversation_id, raw_text="answer 1", form=form
+        )
+
+        assert conversation.current_question_id == q2
+        assert conversation.current_page == 0  # reset -- page 2 belonged to q1, not q2
+
+
 class TestPauseActiveConversation:
     async def test_pauses_the_active_conversation(self) -> None:
         conversation = Conversation(
@@ -770,6 +975,30 @@ class TestFindResumableConversation:
 
 
 class TestResumeConversation:
+    async def test_resume_mid_pagination_shows_the_same_page_not_page_one(self) -> None:
+        """A farmer paused on page 2 of a long OPTION question resumes back
+        on page 2 -- current_page persists across pause/resume same as
+        everything else, not silently reset to the start."""
+        form, question_id = _mandatory_option_form(choice_count=25)
+        conversation = Conversation(
+            conversation_id=uuid.uuid4(),
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.PAUSED,
+            current_question_id=question_id,
+            current_page=1,
+        )
+        session = _mock_session(answers=[])
+
+        reply = await service.resume_conversation(session, conversation=conversation, form=form)
+
+        assert conversation.status == ConversationStatus.ACTIVE
+        assert reply.text.endswith("(หน้า 2/3)")
+        assert reply.choices is not None
+        assert service._PREV_PAGE_CHOICE in reply.choices
+        assert service._NEXT_PAGE_CHOICE in reply.choices
+
     async def test_mid_question_resume_recaps_answers_then_asks_next(self) -> None:
         form, (q1, q2) = _form(mandatory_flags=[True, True])
         conversation = Conversation(
