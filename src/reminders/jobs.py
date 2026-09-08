@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.database import async_session_maker
 from src.line.identity import lookup_line_user_ids
-from src.line.service import multicast_text
+from src.line.service import multicast_text_batched
 from src.reminders.queries import (
     already_reminded_since,
     due_reminders,
@@ -21,7 +21,6 @@ from src.reminders.queries import (
 logger = logging.getLogger(__name__)
 
 _BANGKOK = ZoneInfo("Asia/Bangkok")
-_MULTICAST_LIMIT = 500  # LINE's per-call recipient cap
 
 
 def _reminder_text(task_title: str | None) -> str:
@@ -59,30 +58,41 @@ async def _run_reminder_check(session: AsyncSession, now: datetime) -> None:
             continue
 
         id_map = await lookup_line_user_ids(session, targets)
-        line_user_ids = [id_map[uid] for uid in targets if uid in id_map]
+        line_id_to_user = {id_map[uid]: uid for uid in targets if uid in id_map}
+        line_user_ids = list(line_id_to_user)
 
-        status = "sent"
-        try:
-            for start in range(0, len(line_user_ids), _MULTICAST_LIMIT):
-                await multicast_text(
-                    line_user_ids[start : start + _MULTICAST_LIMIT],
-                    _reminder_text(reminder.task_title),
-                )
-        except Exception:
-            logger.exception("reminder push failed for task %s", reminder.task_id)
-            status = "failed"
-
-        await record_reminders(
-            session,
-            task_id=reminder.task_id,
-            user_ids=targets,
-            status=status,
-            sent_at=naive_now,
+        succeeded_line_ids, failed_line_ids = await multicast_text_batched(
+            line_user_ids, _reminder_text(reminder.task_title)
         )
+        succeeded_users = [line_id_to_user[lid] for lid in succeeded_line_ids]
+        failed_users = [line_id_to_user[lid] for lid in failed_line_ids]
+
+        # Two separate log calls, not one status for the whole batch --
+        # a later chunk failing must not retroactively mark an earlier,
+        # already-delivered chunk as failed too (or vice versa). Logging
+        # failed_users as status='failed' (rather than skipping them) is
+        # what lets already_reminded_since's status='sent' filter correctly
+        # allow a retry on the next tick instead of silently giving up.
+        if succeeded_users:
+            await record_reminders(
+                session,
+                task_id=reminder.task_id,
+                user_ids=succeeded_users,
+                status="sent",
+                sent_at=naive_now,
+            )
+        if failed_users:
+            await record_reminders(
+                session,
+                task_id=reminder.task_id,
+                user_ids=failed_users,
+                status="failed",
+                sent_at=naive_now,
+            )
         await session.commit()
         logger.info(
-            "reminder task=%s recipients=%d status=%s",
+            "reminder task=%s sent=%d failed=%d",
             reminder.task_id,
-            len(targets),
-            status,
+            len(succeeded_users),
+            len(failed_users),
         )

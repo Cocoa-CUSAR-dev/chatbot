@@ -11,13 +11,10 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.line.identity import lookup_line_user_ids
-from src.line.service import multicast_text, push_text
+from src.line.service import multicast_text_batched, push_text
 from src.notifications.schemas import FailedRecipient, SendNotificationResponse
 
 logger = logging.getLogger(__name__)
-
-# LINE's multicast endpoint accepts at most 500 recipients per call.
-_MULTICAST_LIMIT = 500
 
 
 def _dedupe(user_ids: Sequence[UUID]) -> list[UUID]:
@@ -30,12 +27,21 @@ def _dedupe(user_ids: Sequence[UUID]) -> list[UUID]:
     return ordered
 
 
-async def _deliver(line_user_ids: list[str], message: str) -> None:
+async def _deliver(line_user_ids: list[str], message: str) -> tuple[list[str], list[str]]:
+    """Returns (succeeded, failed) LINE user ids -- never all-or-nothing, so
+    one bad chunk of a large multicast doesn't get reported as a failure for
+    recipients an earlier chunk already reached. multicast_text_batched
+    handles the actual chunking/retry-tracking (shared with src/reminders/
+    jobs.py, which had this same loop duplicated before).
+    """
     if len(line_user_ids) == 1:
-        await push_text(line_user_ids[0], message)
-        return
-    for start in range(0, len(line_user_ids), _MULTICAST_LIMIT):
-        await multicast_text(line_user_ids[start : start + _MULTICAST_LIMIT], message)
+        try:
+            await push_text(line_user_ids[0], message)
+        except Exception:
+            logger.exception("push to 1 recipient failed")
+            return [], line_user_ids
+        return line_user_ids, []
+    return await multicast_text_batched(line_user_ids, message)
 
 
 async def send_notification(
@@ -54,14 +60,12 @@ async def send_notification(
     if not resolved:
         return SendNotificationResponse(sent=[], failed=failed)
 
-    try:
-        await _deliver([id_map[uid] for uid in resolved], message)
-    except Exception:
-        # One bad delivery shouldn't 500 the caller -- report it as failed
-        # recipients instead. LINE errors here are transient (rate limit,
-        # upstream) far more often than they're the caller's fault.
-        logger.exception("LINE delivery failed for %d recipient(s)", len(resolved))
-        failed.extend(FailedRecipient(user_id=uid, reason="line_api_error") for uid in resolved)
-        return SendNotificationResponse(sent=[], failed=failed)
+    line_id_to_user = {id_map[uid]: uid for uid in resolved}
+    succeeded_line_ids, failed_line_ids = await _deliver(list(line_id_to_user), message)
 
-    return SendNotificationResponse(sent=resolved, failed=failed)
+    sent = [line_id_to_user[lid] for lid in succeeded_line_ids]
+    failed.extend(
+        FailedRecipient(user_id=line_id_to_user[lid], reason="line_api_error")
+        for lid in failed_line_ids
+    )
+    return SendNotificationResponse(sent=sent, failed=failed)

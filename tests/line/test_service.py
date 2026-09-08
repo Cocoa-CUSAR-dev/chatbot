@@ -87,3 +87,46 @@ async def test_multicast_text_sends_to_every_recipient() -> None:
 
     request = messaging_api.multicast.await_args.args[0]
     assert request.to == ["U1", "U2"]
+
+
+async def test_multicast_text_batched_sends_one_chunk_under_the_limit() -> None:
+    ctx1, ctx2, messaging_api = _patched_messaging_api()
+
+    with ctx1, ctx2:
+        succeeded, failed = await service.multicast_text_batched(["U1", "U2"], "แจ้งเตือน")
+
+    messaging_api.multicast.assert_awaited_once()
+    assert succeeded == ["U1", "U2"]
+    assert failed == []
+
+
+async def test_multicast_text_batched_splits_over_the_limit_into_multiple_calls(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(service, "_MULTICAST_LIMIT", 2)
+    ctx1, ctx2, messaging_api = _patched_messaging_api()
+
+    with ctx1, ctx2:
+        succeeded, failed = await service.multicast_text_batched(["U1", "U2", "U3"], "แจ้งเตือน")
+
+    assert messaging_api.multicast.await_count == 2
+    assert succeeded == ["U1", "U2", "U3"]
+    assert failed == []
+
+
+async def test_multicast_text_batched_reports_a_failed_chunk_without_losing_earlier_successes(
+    monkeypatch,
+) -> None:
+    """The bug this whole helper exists to fix: an earlier chunk that
+    actually reached LINE must not be reported as failed just because a
+    later chunk raised.
+    """
+    monkeypatch.setattr(service, "_MULTICAST_LIMIT", 1)
+    ctx1, ctx2, messaging_api = _patched_messaging_api()
+    messaging_api.multicast = AsyncMock(side_effect=[None, RuntimeError("LINE 500"), None])
+
+    with ctx1, ctx2:
+        succeeded, failed = await service.multicast_text_batched(["U1", "U2", "U3"], "แจ้งเตือน")
+
+    assert succeeded == ["U1", "U3"]
+    assert failed == ["U2"]

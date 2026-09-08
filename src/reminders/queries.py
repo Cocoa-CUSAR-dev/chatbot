@@ -91,6 +91,11 @@ async def already_reminded_since(
     database session is in. The `::date` form silently broke near midnight
     Bangkok when the DB stored UTC -- sent_at's date and "today" disagreed by
     one day and every run re-sent.
+
+    Only counts status='sent' rows. A row logged 'failed' (LINE was down/
+    rate-limited for that recipient, see jobs.py) means the push never
+    actually reached them -- counting it here would permanently skip a real
+    retry for the rest of the day over a transient delivery failure.
     """
     rows = await session.execute(
         text(
@@ -98,6 +103,7 @@ async def already_reminded_since(
             SELECT user_id FROM notify.reminder_log
             WHERE task_id = :task_id
               AND channel = 'push'
+              AND status = 'sent'
               AND sent_at >= :since
             """
         ),
