@@ -1,3 +1,4 @@
+import logging
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
@@ -22,6 +23,11 @@ from src.line.schemas import QuickReplyOption
 
 if TYPE_CHECKING:
     from src.line.temp_task_picker import PendingTask
+
+logger = logging.getLogger(__name__)
+
+# LINE's multicast endpoint accepts at most 500 recipients per call.
+_MULTICAST_LIMIT = 500
 
 _configuration = Configuration(access_token=line_settings.LINE_CHANNEL_ACCESS_TOKEN)
 
@@ -167,9 +173,36 @@ async def push_flex(to: str, alt_text: str, contents: dict[str, Any]) -> None:
 async def multicast_text(to: list[str], text: str) -> None:
     """Same message to many farmers at once -- e.g. a reminder batch
     (ADR 0006) -- distinct from looping push_text per-recipient, and billed
-    differently by LINE.
+    differently by LINE. Callers with more than LINE's 500-recipient cap
+    should use multicast_text_batched instead of chunking themselves.
     """
     async with AsyncApiClient(_configuration) as client:
         await AsyncMessagingApi(client).multicast(
             MulticastRequest(to=to, messages=[TextMessage(text=text)])
         )
+
+
+async def multicast_text_batched(to: list[str], text: str) -> tuple[list[str], list[str]]:
+    """Chunks `to` into LINE's 500-recipient multicast limit and sends each
+    chunk independently, returning (succeeded, failed) LINE user ids.
+
+    The two previous call sites (src/reminders/jobs.py, src/notifications/
+    service.py) each hand-rolled this same chunking loop wrapped in one big
+    try/except around the whole thing -- so a later chunk failing marked
+    every recipient as failed, including ones from an earlier chunk that had
+    already been delivered. Tracking success per chunk here, in one place,
+    fixes both call sites at once and means a future change to LINE's limit
+    (or to this retry behavior) only has to happen here.
+    """
+    succeeded: list[str] = []
+    failed: list[str] = []
+    for start in range(0, len(to), _MULTICAST_LIMIT):
+        chunk = to[start : start + _MULTICAST_LIMIT]
+        try:
+            await multicast_text(chunk, text)
+        except Exception:
+            logger.exception("multicast chunk of %d recipient(s) failed", len(chunk))
+            failed.extend(chunk)
+        else:
+            succeeded.extend(chunk)
+    return succeeded, failed
