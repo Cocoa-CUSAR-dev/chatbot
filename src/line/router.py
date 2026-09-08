@@ -261,9 +261,7 @@ async def _handle_postback(event: PostbackEvent) -> None:
                         sanitized_preview = await reuse.sanitize_for_autofill(
                             last_answer, offer_questions
                         )
-                        preview = reuse.format_autofill_preview(
-                            sanitized_preview, offer_questions
-                        )
+                        preview = reuse.format_autofill_preview(sanitized_preview, offer_questions)
                     except UpstreamServiceError:
                         logger.warning(
                             "sanitize_for_autofill failed for handler=%s while building the "

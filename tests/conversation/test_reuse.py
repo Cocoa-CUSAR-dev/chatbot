@@ -204,9 +204,7 @@ class TestFormatAutofillPreview:
         assert preview == "- note: สวัสดี"
 
     def test_orders_by_sort_order_not_dict_order(self) -> None:
-        questions = _form_with(
-            _varchar("first", sort_order=0), _varchar("second", sort_order=1)
-        )
+        questions = _form_with(_varchar("first", sort_order=0), _varchar("second", sort_order=1))
         # Insert "second" first in the dict -- preview must still lead with
         # "first", matching sort_order rather than iteration order.
         sanitized = {"second": "b", "first": "a"}
