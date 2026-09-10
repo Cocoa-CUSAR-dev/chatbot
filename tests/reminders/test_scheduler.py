@@ -1,3 +1,6 @@
+import asyncio
+from unittest.mock import AsyncMock, patch
+
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
@@ -37,3 +40,24 @@ async def test_configure_jobs_is_idempotent_once_the_scheduler_is_running() -> N
         assert len(scheduler.get_jobs()) == 2
     finally:
         scheduler.shutdown(wait=False)
+
+
+async def test_check_and_send_reminders_job_actually_fires_when_its_interval_elapses() -> None:
+    """Every test above only checks that a job is *registered* with the
+    right trigger metadata -- none of them ever let the scheduler run and
+    prove APScheduler actually calls the function once real wall-clock time
+    passes. Reschedules the exact job configure_jobs() registers (same id,
+    same production code path) to a much shorter interval so the test
+    doesn't have to wait the real 15 minutes.
+    """
+    mock_job = AsyncMock()
+    with patch("src.reminders.scheduler.check_and_send_reminders", new=mock_job):
+        configure_jobs()
+        scheduler.reschedule_job("check_and_send_reminders", trigger=IntervalTrigger(seconds=0.1))
+        scheduler.start()
+        try:
+            await asyncio.sleep(0.35)
+        finally:
+            scheduler.shutdown(wait=False)
+
+    assert mock_job.await_count >= 1
