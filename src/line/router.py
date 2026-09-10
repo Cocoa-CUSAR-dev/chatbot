@@ -26,8 +26,8 @@ from src.line.dependencies import parse_line_events
 from src.line.schemas import QuickReplyOption
 from src.line.service import (
     reply_autofill_offer,
-    reply_edit_picker,
     reply_confirm_prompt,
+    reply_edit_picker,
     reply_task_choices,
     reply_text,
 )
