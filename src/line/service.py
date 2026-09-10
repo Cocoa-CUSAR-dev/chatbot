@@ -1,3 +1,4 @@
+import logging
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
@@ -23,6 +24,11 @@ from src.line.schemas import QuickReplyOption
 if TYPE_CHECKING:
     from src.conversation.service import Question
     from src.line.temp_task_picker import PendingTask
+
+logger = logging.getLogger(__name__)
+
+# LINE's multicast endpoint accepts at most 500 recipients per call.
+_MULTICAST_LIMIT = 500
 
 _configuration = Configuration(access_token=line_settings.LINE_CHANNEL_ACCESS_TOKEN)
 
@@ -139,6 +145,58 @@ async def reply_confirm_prompt(reply_token: str, text: str, conversation_id: UUI
         )
 
 
+async def reply_autofill_offer(
+    reply_token: str, *, task_id: str, task_form_id: str, handler: str, preview: str = ""
+) -> None:
+    """US2-4: offers reusing the farmer's last COMPLETED submission for this
+    handler, before a fresh Conversation row exists. Two Postback buttons,
+    not a guided-flow question -- there's no current_question_id yet for
+    handle_answer to resolve a typed "ใช่"/"ไม่" against, since the
+    conversation itself doesn't exist until the farmer answers this. Same
+    encode-everything-in-postback-data convention as reply_task_choices/
+    reply_confirm_prompt: no extra state is persisted between this offer and
+    the tap -- router.py's "start_autofill" branch re-fetches (and
+    re-sanitizes) the last answer itself on "yes" rather than trusting
+    whatever was true when this was sent; `preview` is display-only,
+    computed by that same router.py call site purely to show here.
+
+    `preview` (from reuse.format_autofill_preview) is shown before the
+    yes/no question -- live-reported feedback: a blind "reuse old data?"
+    prompt with no content until AFTER agreeing left a farmer unable to
+    make an informed choice.
+    """
+    quick_reply = QuickReply(
+        items=[
+            QuickReplyItem(
+                action=PostbackAction(
+                    label="ใช้ข้อมูลเดิม",
+                    data=f"start_autofill:yes:{task_id}:{task_form_id}:{handler}",
+                    displayText="ใช้ข้อมูลเดิม (แก้ไขเพิ่มเติมได้ทีหลัง)",
+                )
+            ),
+            QuickReplyItem(
+                action=PostbackAction(
+                    label="กรอกใหม่",
+                    data=f"start_autofill:no:{task_id}:{task_form_id}:{handler}",
+                    displayText="กรอกใหม่",
+                )
+            ),
+        ]
+    )
+    prefix = f"พบข้อมูลที่เคยกรอกไว้ก่อนหน้านี้:\n{preview}\n\n" if preview else "พบข้อมูลที่เคยกรอกไว้ก่อนหน้านี้ "
+    message = TextMessage(
+        text=(
+            f"{prefix}ต้องการนำมาใช้กรอกให้อัตโนมัติหรือไม่? "
+            '(เลือก "ใช้ข้อมูลเดิม" แล้วยังกลับมาแก้ไขทีละข้อได้ทีหลัง ผ่านปุ่ม "แก้ไข" ตอนสรุปคำตอบ)'
+        ),
+        quickReply=quick_reply,
+    )
+    async with AsyncApiClient(_configuration) as client:
+        await AsyncMessagingApi(client).reply_message(
+            ReplyMessageRequest(replyToken=reply_token, messages=[message])
+        )
+
+
 async def reply_edit_picker(
     reply_token: str, *, conversation_id: UUID, questions: list["Question"]
 ) -> None:
@@ -209,9 +267,36 @@ async def push_flex(to: str, alt_text: str, contents: dict[str, Any]) -> None:
 async def multicast_text(to: list[str], text: str) -> None:
     """Same message to many farmers at once -- e.g. a reminder batch
     (ADR 0006) -- distinct from looping push_text per-recipient, and billed
-    differently by LINE.
+    differently by LINE. Callers with more than LINE's 500-recipient cap
+    should use multicast_text_batched instead of chunking themselves.
     """
     async with AsyncApiClient(_configuration) as client:
         await AsyncMessagingApi(client).multicast(
             MulticastRequest(to=to, messages=[TextMessage(text=text)])
         )
+
+
+async def multicast_text_batched(to: list[str], text: str) -> tuple[list[str], list[str]]:
+    """Chunks `to` into LINE's 500-recipient multicast limit and sends each
+    chunk independently, returning (succeeded, failed) LINE user ids.
+
+    The two previous call sites (src/reminders/jobs.py, src/notifications/
+    service.py) each hand-rolled this same chunking loop wrapped in one big
+    try/except around the whole thing -- so a later chunk failing marked
+    every recipient as failed, including ones from an earlier chunk that had
+    already been delivered. Tracking success per chunk here, in one place,
+    fixes both call sites at once and means a future change to LINE's limit
+    (or to this retry behavior) only has to happen here.
+    """
+    succeeded: list[str] = []
+    failed: list[str] = []
+    for start in range(0, len(to), _MULTICAST_LIMIT):
+        chunk = to[start : start + _MULTICAST_LIMIT]
+        try:
+            await multicast_text(chunk, text)
+        except Exception:
+            logger.exception("multicast chunk of %d recipient(s) failed", len(chunk))
+            failed.extend(chunk)
+        else:
+            succeeded.extend(chunk)
+    return succeeded, failed
