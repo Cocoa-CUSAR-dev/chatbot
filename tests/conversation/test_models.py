@@ -13,6 +13,7 @@ def test_conversation_table_schema_and_columns() -> None:
         "status",
         "current_question_id",
         "parent_answer",
+        "current_page",
     }
     assert table.c.current_question_id.nullable is True
     assert table.c.parent_answer.nullable is True
