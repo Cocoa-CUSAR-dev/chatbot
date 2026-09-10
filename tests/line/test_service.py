@@ -54,7 +54,7 @@ async def test_reply_task_choices_labels_resumable_tasks_differently() -> None:
     assert action.data == f"start:{task_id}:{task_form_id}:notes"
 
 
-async def test_reply_confirm_prompt_offers_confirm_and_cancel() -> None:
+async def test_reply_confirm_prompt_offers_confirm_edit_and_cancel() -> None:
     ctx1, ctx2, messaging_api = _patched_messaging_api()
     conversation_id = uuid.uuid4()
 
@@ -64,6 +64,7 @@ async def test_reply_confirm_prompt_offers_confirm_and_cancel() -> None:
     items = messaging_api.reply_message.await_args.args[0].messages[0].quick_reply.items
     assert [item.action.data for item in items] == [
         f"confirm:{conversation_id}",
+        f"edit:{conversation_id}",
         f"cancel:{conversation_id}",
     ]
 
