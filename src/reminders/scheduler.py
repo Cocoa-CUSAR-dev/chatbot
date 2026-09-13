@@ -17,7 +17,7 @@ def configure_jobs() -> None:
     scheduler.add_job(
         check_and_send_reminders,
         trigger="interval",
-        minutes=15,
+        minutes=1,
         id="check_and_send_reminders",
         replace_existing=True,
     )
