@@ -7,16 +7,19 @@ RUN_DB_TESTS is set (see tests/integration/conftest.py).
 import uuid
 from datetime import datetime, time
 from unittest.mock import AsyncMock, patch
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.reminders.jobs import _run_reminder_check
+from src.reminders.jobs import _run_reminder_check, check_and_send_reminders
 from tests.integration.helpers import (
     seed_form_response,
     seed_task_form,
     seed_user_with_line_identity,
 )
+
+_BANGKOK = ZoneInfo("Asia/Bangkok")
 
 # A check running at 17:00; schedules with time_of_day <= 17:00 are "due".
 _NOW = datetime(2026, 9, 7, 17, 0)
@@ -165,3 +168,68 @@ async def test_a_failed_push_is_retried_on_the_next_run_the_same_day(
 
     second.assert_awaited_once()
     assert await _log_rows(db_session, task_id) == [("failed", "push"), ("sent", "push")]
+
+
+async def test_check_and_send_reminders_wrapper_reads_real_clock_and_own_session(
+    db_session: AsyncSession,
+) -> None:
+    """Every test above calls _run_reminder_check directly on the SAME
+    session the test seeded with, and hands it a hand-picked `now`. The real
+    entry point -- check_and_send_reminders, what the scheduler actually
+    calls every 15 minutes -- opens its OWN session via async_session_maker
+    and reads the real wall clock via datetime.now(Asia/Bangkok). Neither of
+    those was ever exercised by any existing test. Only "what time is it" is
+    mocked here; the write happens on a genuinely separate DB connection,
+    which is exactly why this test reads it back through db_session rather
+    than trusting an in-process return value.
+    """
+    user_id = await seed_user_with_line_identity(db_session, line_user_id="Ureminder7")
+    task_id, _ = await seed_task_form(db_session, open_at=_PAST)
+    await _seed_schedule(db_session, task_id=task_id, created_by=user_id, time_of_day=time(8, 0))
+
+    fixed_now = datetime(2026, 9, 7, 17, 0, tzinfo=_BANGKOK)
+    with (
+        patch("src.reminders.jobs.datetime") as mock_datetime,
+        patch("src.reminders.jobs.multicast_text_batched", new=_all_succeed()) as multicast,
+    ):
+        mock_datetime.now.return_value = fixed_now
+        await check_and_send_reminders()
+
+    multicast.assert_awaited_once()
+    assert await _log_rows(db_session, task_id) == [("sent", "push")]
+
+
+async def test_check_and_send_reminders_does_not_double_send_across_the_bangkok_midnight_gap(
+    db_session: AsyncSession,
+) -> None:
+    """Regression for the bug fixed in aede632 (already_reminded_since):
+    comparing sent_at::date to "today" broke between 00:00-07:00 Bangkok,
+    because sent_at is stored in UTC and that window is still "yesterday" in
+    UTC -- every 15-minute tick re-sent all night. Runs the real wrapper
+    (real clock read via the mocked "now", real separate session) twice
+    inside that window and asserts the second run sends nothing.
+    """
+    user_id = await seed_user_with_line_identity(db_session, line_user_id="Ureminder8")
+    task_id, _ = await seed_task_form(db_session, open_at=_PAST)
+    await _seed_schedule(db_session, task_id=task_id, created_by=user_id, time_of_day=time(0, 0))
+
+    first_tick = datetime(2026, 9, 7, 1, 0, tzinfo=_BANGKOK)
+    second_tick = datetime(2026, 9, 7, 1, 15, tzinfo=_BANGKOK)
+
+    with (
+        patch("src.reminders.jobs.datetime") as mock_datetime,
+        patch("src.reminders.jobs.multicast_text_batched", new=_all_succeed()) as first,
+    ):
+        mock_datetime.now.return_value = first_tick
+        await check_and_send_reminders()
+    first.assert_awaited_once()
+
+    with (
+        patch("src.reminders.jobs.datetime") as mock_datetime,
+        patch("src.reminders.jobs.multicast_text_batched", new=_all_succeed()) as second,
+    ):
+        mock_datetime.now.return_value = second_tick
+        await check_and_send_reminders()
+    second.assert_not_awaited()
+
+    assert await _log_rows(db_session, task_id) == [("sent", "push")]
