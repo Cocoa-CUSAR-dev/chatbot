@@ -12,14 +12,22 @@ fire on schedule; live-caught 2026-09: Vercel's logs showed nothing but
 run, because every wake-up happened to arrive well after the job's
 next_run_time had already passed.
 
-These endpoints sidestep that entirely: something OUTSIDE the process
-(Vercel Cron Jobs via vercel.json's `crons`, or a GitHub Actions scheduled
-workflow, or literally any external cron) sends a request on a real
-schedule, and that request IS the trigger -- no in-process timer required.
-Both endpoints call the exact same job bodies scheduler.py uses, so
-behavior (idempotency, Bangkok-time handling, etc.) is identical either way.
-On a persistent host, scheduler.py's own scheduling still works fine and
-these are just unused extra entry points -- harmless either way.
+These endpoints sidestep that entirely: something OUTSIDE the process sends
+a request on a real schedule, and that request IS the trigger -- no
+in-process timer required. Both endpoints call the exact same job bodies
+scheduler.py uses, so behavior (idempotency, Bangkok-time handling, etc.)
+is identical either way. On a persistent host, scheduler.py's own
+scheduling still works fine and these are just unused extra entry points --
+harmless either way.
+
+What actually calls these here: .github/workflows/cron-reminders.yml and
+cron-pause-idle-conversations.yml (a GitHub Actions `schedule:`), not
+Vercel Cron -- Vercel's own Cron Jobs are plan-gated to at most once a day
+on the Hobby tier (a deployment with a tighter vercel.json `crons` entry
+flat-out fails to deploy), which is too coarse for the reminders check.
+Vercel Cron becomes a viable *alternative* to the GitHub Actions workflows
+only on a paid plan; either way still points at these same two endpoints,
+so nothing here would need to change.
 """
 
 from fastapi import APIRouter, Depends
