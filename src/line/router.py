@@ -14,16 +14,24 @@ from linebot.v3.webhooks import (
 )
 from sqlalchemy import select
 
-from src.conversation import service
+from src.conversation import reuse, service
 from src.conversation.constants import ActiveSubstate, ConversationStatus
 from src.conversation.exceptions import ConversationNotFound
 from src.conversation.models import Conversation
 from src.database import async_session_maker
+from src.exceptions import UpstreamServiceError
 from src.forms.client import get_form
 from src.line import identity, parent_picker, temp_task_picker
 from src.line.dependencies import parse_line_events
 from src.line.schemas import QuickReplyOption
-from src.line.service import reply_confirm_prompt, reply_task_choices, reply_text
+from src.line.service import (
+    reply_autofill_offer,
+    reply_confirm_prompt,
+    reply_edit_picker,
+    reply_task_choices,
+    reply_text,
+)
+from src.tasks.client import fetch_last_answer
 
 router = APIRouter(prefix="/line", tags=["line"])
 logger = logging.getLogger(__name__)
@@ -228,6 +236,48 @@ async def _handle_postback(event: PostbackEvent) -> None:
                 if not parent_choices:
                     await reply_text(event.reply_token, parent_picker.EMPTY_PROMPT[parent_kind])
                     return
+            else:
+                # US2-4: offer reusing the farmer's last COMPLETED
+                # submission for this handler -- never for the 5
+                # parent-picker handlers above (which farm/harvest/batch a
+                # submission belongs to must always be picked fresh, never
+                # reused). A Go hiccup here must not block starting a plain
+                # conversation -- worst case, just no offer.
+                try:
+                    last_answer = await fetch_last_answer(user_id=str(user_id), handler=handler)
+                except UpstreamServiceError:
+                    logger.warning(
+                        "fetch_last_answer failed for handler=%s -- starting fresh, no offer",
+                        handler,
+                        exc_info=True,
+                    )
+                    last_answer = None
+                if last_answer is not None:
+                    # Preview-only: router.py's own "start_autofill" branch
+                    # re-fetches and re-sanitizes on "yes" rather than
+                    # trusting this -- see reply_autofill_offer's docstring.
+                    preview = ""
+                    try:
+                        offer_questions = service.questions_from_form(form)
+                        sanitized_preview = await reuse.sanitize_for_autofill(
+                            last_answer, offer_questions
+                        )
+                        preview = reuse.format_autofill_preview(sanitized_preview, offer_questions)
+                    except UpstreamServiceError:
+                        logger.warning(
+                            "sanitize_for_autofill failed for handler=%s while building the "
+                            "offer preview -- showing the offer without one",
+                            handler,
+                            exc_info=True,
+                        )
+                    await reply_autofill_offer(
+                        event.reply_token,
+                        task_id=task_id,
+                        task_form_id=task_form_id,
+                        handler=handler,
+                        preview=preview,
+                    )
+                    return
 
             reply = await service.start_conversation(
                 session,
@@ -237,6 +287,85 @@ async def _handle_postback(event: PostbackEvent) -> None:
                 form=form,
                 parent_kind=parent_kind,
                 parent_choices=parent_choices,
+            )
+        await _reply(event.reply_token, reply)
+    elif action == "start_autofill":
+        decision, task_id, task_form_id, handler = args
+        user_id = await _resolve_user_id(event.source.user_id)
+        if user_id is None:
+            await reply_text(event.reply_token, "บัญชี LINE นี้ยังไม่ได้เชื่อมกับบัญชีในระบบ")
+            return
+
+        form = await get_form(task_form_id)
+        async with async_session_maker() as session:
+            # Same double-tap/race guard as the "start" branch above --
+            # this offer can only have been sent for a task with no
+            # resumable conversation at the time, but time has passed
+            # since then (the farmer had to read the offer and tap a
+            # button), so re-check rather than trust that's still true.
+            existing = await service.find_resumable_conversation(
+                session, user_id=user_id, task_id=UUID(task_id)
+            )
+            if existing is not None:
+                resume_form = await get_form(str(existing.task_form_id))
+                reply = await service.resume_conversation(
+                    session, conversation=existing, form=resume_form
+                )
+                await _reply(event.reply_token, reply)
+                return
+
+            if decision == "yes":
+                # Re-fetched rather than trusting the offer's own check --
+                # see reply_autofill_offer's docstring: no state is
+                # persisted between the offer and this tap.
+                try:
+                    last_answer = await fetch_last_answer(user_id=str(user_id), handler=handler)
+                except UpstreamServiceError:
+                    logger.warning(
+                        "fetch_last_answer failed for handler=%s on start_autofill -- "
+                        "starting fresh instead",
+                        handler,
+                        exc_info=True,
+                    )
+                    last_answer = None
+                if last_answer is not None:
+                    questions = service.questions_from_form(form)
+                    try:
+                        sanitized = await reuse.sanitize_for_autofill(last_answer, questions)
+                    except UpstreamServiceError:
+                        # #105 (Go's /service/autofill/sanitize) hiccuped --
+                        # same "never block a plain start" reasoning as the
+                        # fetch_last_answer failure above. Nothing was
+                        # created yet, so falling through to a plain start
+                        # below is safe.
+                        logger.warning(
+                            "fetch_sanitized_autofill failed for handler=%s on "
+                            "start_autofill -- starting fresh instead",
+                            handler,
+                            exc_info=True,
+                        )
+                    else:
+                        reply = await service.start_conversation_with_autofill(
+                            session,
+                            user_id=user_id,
+                            task_id=UUID(task_id),
+                            task_form_id=UUID(task_form_id),
+                            form=form,
+                            sanitized_answer=sanitized,
+                        )
+                        await _reply(event.reply_token, reply)
+                        return
+                # The last answer disappeared between the offer and this
+                # tap (race, or a second Go hiccup) -- fall through to a
+                # plain start below rather than leaving the farmer stuck
+                # on a "yes" that can no longer be honored.
+
+            reply = await service.start_conversation(
+                session,
+                user_id=user_id,
+                task_id=UUID(task_id),
+                task_form_id=UUID(task_form_id),
+                form=form,
             )
         await _reply(event.reply_token, reply)
     elif action == "confirm":
@@ -261,6 +390,55 @@ async def _handle_postback(event: PostbackEvent) -> None:
         # so routing it through _reply() would attach a confirm button
         # pointing at an already-completed conversation.
         await reply_text(event.reply_token, reply.text)
+    elif action == "edit":
+        # US2-6: shows a picker of every already-answered (or skipped)
+        # question rather than asking which field by name -- same
+        # "buttons, not free text" reasoning as everywhere else in this
+        # flow (elderly farmers are the primary users).
+        (conversation_id,) = args
+        async with async_session_maker() as session:
+            conversation = await session.get(Conversation, UUID(conversation_id))
+            if conversation is None:
+                await reply_text(event.reply_token, "ไม่พบบทสนทนานี้แล้ว")
+                return
+            form = await get_form(str(conversation.task_form_id))
+            questions = await service.editable_questions(
+                session, conversation_id=conversation.conversation_id, form=form
+            )
+        if not questions:
+            # Shouldn't happen in practice -- reaching AWAITING_CONFIRMATION
+            # requires every required question to have an answer row -- but
+            # an honest message beats a Quick Reply with zero buttons.
+            await reply_text(event.reply_token, "ยังไม่มีคำตอบให้แก้ไขในตอนนี้")
+            return
+        await reply_edit_picker(
+            event.reply_token,
+            conversation_id=conversation.conversation_id,
+            questions=questions[:_QUICK_REPLY_LIMIT],
+        )
+    elif action == "edit_pick":
+        conversation_id, question_id = args
+        async with async_session_maker() as session:
+            conversation = await session.get(Conversation, UUID(conversation_id))
+            if conversation is None:
+                await reply_text(event.reply_token, "ไม่พบบทสนทนานี้แล้ว")
+                return
+            form = await get_form(str(conversation.task_form_id))
+            try:
+                reply = await service.begin_edit(
+                    session,
+                    conversation_id=UUID(conversation_id),
+                    question_id=UUID(question_id),
+                    form=form,
+                )
+            except ConversationNotFound:
+                await reply_text(event.reply_token, "ไม่พบคำถามนี้แล้ว")
+                return
+        # begin_edit's reply is substate=GUIDED_ASKING_FIXED_QUESTION with
+        # the question's own choices -- _reply() already knows how to
+        # render that as a Quick Reply, same as any normal guided-flow
+        # question.
+        await _reply(event.reply_token, reply)
     elif action == "cancel":
         (conversation_id,) = args
         async with async_session_maker() as session:
