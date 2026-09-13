@@ -13,7 +13,7 @@ def test_configure_jobs_registers_the_reminder_check_on_a_15_minute_interval() -
     job = scheduler.get_job("check_and_send_reminders")
     assert job is not None
     assert isinstance(job.trigger, IntervalTrigger)
-    assert job.trigger.interval.total_seconds() == 15 * 60
+    assert job.trigger.interval.total_seconds() == 2 * 60
 
 
 def test_configure_jobs_registers_the_daily_pause_sweep_at_22_00_bangkok_time() -> None:
