@@ -21,6 +21,7 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 CREATE SCHEMA auth;
 CREATE SCHEMA form;
 CREATE SCHEMA chat;
+CREATE SCHEMA notify;
 
 CREATE TABLE auth.user_account (
     user_id uuid DEFAULT gen_random_uuid() NOT NULL,
@@ -45,6 +46,7 @@ CREATE TABLE form.task (
     task_id uuid DEFAULT gen_random_uuid() NOT NULL,
     title character varying,
     open_at timestamp without time zone,
+    close_at timestamp without time zone,
     CONSTRAINT pk_task PRIMARY KEY (task_id)
 );
 
@@ -84,6 +86,7 @@ CREATE TABLE chat.conversation (
     status character varying NOT NULL DEFAULT 'active',
     current_question_id uuid,
     parent_answer jsonb,
+    current_page integer NOT NULL DEFAULT 0,
     CONSTRAINT pk_chat_conversation PRIMARY KEY (conversation_id),
     CONSTRAINT fk_chat_conversation_user FOREIGN KEY (user_id) REFERENCES auth.user_account (user_id),
     CONSTRAINT fk_chat_conversation_task FOREIGN KEY (task_id) REFERENCES form.task (task_id),
@@ -102,4 +105,31 @@ CREATE TABLE chat.conversation_answer (
     CONSTRAINT fk_conversation_answer_conversation FOREIGN KEY (conversation_id) REFERENCES chat.conversation (conversation_id),
     CONSTRAINT fk_conversation_answer_question FOREIGN KEY (question_id) REFERENCES form.question (question_id),
     CONSTRAINT ck_conversation_answer_source CHECK (source IN ('guided_flow', 'llm_extracted'))
+);
+
+-- notify.* -- reminder scheduling + delivery log (ADR 0005/0006). Mirrors
+-- src/reminders/models.py; the database repo's Flyway migration is the real
+-- source of this shape.
+CREATE TABLE notify.reminder_schedule (
+    schedule_id uuid NOT NULL DEFAULT gen_random_uuid(),
+    task_id uuid NOT NULL,
+    cadence character varying NOT NULL,
+    time_of_day time without time zone NOT NULL,
+    is_active boolean NOT NULL DEFAULT true,
+    created_by uuid NOT NULL,
+    CONSTRAINT pk_reminder_schedule PRIMARY KEY (schedule_id),
+    CONSTRAINT fk_reminder_schedule_task FOREIGN KEY (task_id) REFERENCES form.task (task_id),
+    CONSTRAINT fk_reminder_schedule_user FOREIGN KEY (created_by) REFERENCES auth.user_account (user_id)
+);
+
+CREATE TABLE notify.reminder_log (
+    log_id uuid NOT NULL DEFAULT gen_random_uuid(),
+    user_id uuid NOT NULL,
+    task_id uuid NOT NULL,
+    sent_at timestamp without time zone NOT NULL DEFAULT now(),
+    channel character varying NOT NULL,
+    status character varying NOT NULL,
+    CONSTRAINT pk_reminder_log PRIMARY KEY (log_id),
+    CONSTRAINT fk_reminder_log_user FOREIGN KEY (user_id) REFERENCES auth.user_account (user_id),
+    CONSTRAINT fk_reminder_log_task FOREIGN KEY (task_id) REFERENCES form.task (task_id)
 );

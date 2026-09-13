@@ -11,6 +11,7 @@ _resolve_user_id, the only caller.
 """
 
 import uuid
+from collections.abc import Sequence
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,3 +36,23 @@ async def lookup_user_id(session: AsyncSession, line_user_id: str) -> uuid.UUID 
         select(LineIdentity.user_id).where(LineIdentity.line_user_id == line_user_id)
     )
     return result.scalar_one_or_none()
+
+
+async def lookup_line_user_ids(
+    session: AsyncSession, user_ids: Sequence[uuid.UUID]
+) -> dict[uuid.UUID, str]:
+    """The forward direction of lookup_user_id: given internal user_ids, find
+    each one's LINE user_id so a proactive push can be addressed to them.
+
+    A user_id with no auth.line_identity row is simply absent from the result
+    -- callers decide what to do with the ones they can't reach (see
+    src/notifications/service.py, src/reminders/jobs.py).
+    """
+    if not user_ids:
+        return {}
+    result = await session.execute(
+        select(LineIdentity.user_id, LineIdentity.line_user_id).where(
+            LineIdentity.user_id.in_(list(user_ids))
+        )
+    )
+    return {row.user_id: row.line_user_id for row in result}

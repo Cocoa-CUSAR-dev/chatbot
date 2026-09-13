@@ -1,3 +1,4 @@
+import logging
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
@@ -21,7 +22,13 @@ from src.line.config import line_settings
 from src.line.schemas import QuickReplyOption
 
 if TYPE_CHECKING:
+    from src.conversation.service import Question
     from src.line.temp_task_picker import PendingTask
+
+logger = logging.getLogger(__name__)
+
+# LINE's multicast endpoint accepts at most 500 recipients per call.
+_MULTICAST_LIMIT = 500
 
 _configuration = Configuration(access_token=line_settings.LINE_CHANNEL_ACCESS_TOKEN)
 
@@ -86,14 +93,19 @@ async def reply_task_choices(reply_token: str, text: str, tasks: list["PendingTa
 
 
 async def reply_confirm_prompt(reply_token: str, text: str, conversation_id: UUID) -> None:
-    """Two Quick Reply buttons: "confirm" and "cancel" Postbacks.
+    """Three Quick Reply buttons: "confirm", "edit", and "cancel" Postbacks.
 
     Without this, AWAITING_CONFIRMATION has no way for a farmer to actually
     confirm via real LINE -- typing free text at that point raises
     ConversationNotFound in handle_answer (no open question left to answer
     against). Same Postback convention reply_task_choices already
     established for "start"; router.py's _handle_postback already knows
-    how to handle "confirm:<conversation_id>" and "cancel:<conversation_id>".
+    how to handle "confirm:<conversation_id>", "edit:<conversation_id>",
+    and "cancel:<conversation_id>".
+
+    Edit (US2-6) exists so a farmer who spots a mistake in the summary can
+    fix just that one field instead of cancelling and starting the whole
+    form over.
 
     Cancel exists because this same prompt is re-shown on a failed
     submission (CB-1) -- for a handler Go can't save yet, retrying can
@@ -108,6 +120,13 @@ async def reply_confirm_prompt(reply_token: str, text: str, conversation_id: UUI
                     label="ยืนยัน",
                     data=f"confirm:{conversation_id}",
                     displayText="ยืนยัน",
+                )
+            ),
+            QuickReplyItem(
+                action=PostbackAction(
+                    label="แก้ไข",
+                    data=f"edit:{conversation_id}",
+                    displayText="แก้ไข",
                 )
             ),
             QuickReplyItem(
@@ -178,6 +197,35 @@ async def reply_autofill_offer(
         )
 
 
+async def reply_edit_picker(
+    reply_token: str, *, conversation_id: UUID, questions: list["Question"]
+) -> None:
+    """US2-6: lists the questions a farmer can currently revisit (from
+    service.editable_questions -- already answered or skipped), one
+    Postback button each. Same "no state persisted between the message and
+    the tap" convention as reply_task_choices/reply_autofill_offer: the
+    button's own data carries everything router.py's "edit_pick" branch
+    needs (conversation_id + question_id) to re-open that exact question.
+    """
+    quick_reply = QuickReply(
+        items=[
+            QuickReplyItem(
+                action=PostbackAction(
+                    label=q.label[:_QUICK_REPLY_LABEL_MAX],
+                    data=f"edit_pick:{conversation_id}:{q.question_id}",
+                    displayText=q.label,
+                )
+            )
+            for q in questions
+        ]
+    )
+    message = TextMessage(text="เลือกข้อที่ต้องการแก้ไข:", quickReply=quick_reply)
+    async with AsyncApiClient(_configuration) as client:
+        await AsyncMessagingApi(client).reply_message(
+            ReplyMessageRequest(replyToken=reply_token, messages=[message])
+        )
+
+
 async def reply_flex(reply_token: str, alt_text: str, contents: dict[str, Any]) -> None:
     """Flex Message reply -- e.g. a confirmation summary (AwaitingConfirmation,
     target-architecture.md #4) with real layout instead of a wall of text.
@@ -219,9 +267,36 @@ async def push_flex(to: str, alt_text: str, contents: dict[str, Any]) -> None:
 async def multicast_text(to: list[str], text: str) -> None:
     """Same message to many farmers at once -- e.g. a reminder batch
     (ADR 0006) -- distinct from looping push_text per-recipient, and billed
-    differently by LINE.
+    differently by LINE. Callers with more than LINE's 500-recipient cap
+    should use multicast_text_batched instead of chunking themselves.
     """
     async with AsyncApiClient(_configuration) as client:
         await AsyncMessagingApi(client).multicast(
             MulticastRequest(to=to, messages=[TextMessage(text=text)])
         )
+
+
+async def multicast_text_batched(to: list[str], text: str) -> tuple[list[str], list[str]]:
+    """Chunks `to` into LINE's 500-recipient multicast limit and sends each
+    chunk independently, returning (succeeded, failed) LINE user ids.
+
+    The two previous call sites (src/reminders/jobs.py, src/notifications/
+    service.py) each hand-rolled this same chunking loop wrapped in one big
+    try/except around the whole thing -- so a later chunk failing marked
+    every recipient as failed, including ones from an earlier chunk that had
+    already been delivered. Tracking success per chunk here, in one place,
+    fixes both call sites at once and means a future change to LINE's limit
+    (or to this retry behavior) only has to happen here.
+    """
+    succeeded: list[str] = []
+    failed: list[str] = []
+    for start in range(0, len(to), _MULTICAST_LIMIT):
+        chunk = to[start : start + _MULTICAST_LIMIT]
+        try:
+            await multicast_text(chunk, text)
+        except Exception:
+            logger.exception("multicast chunk of %d recipient(s) failed", len(chunk))
+            failed.extend(chunk)
+        else:
+            succeeded.extend(chunk)
+    return succeeded, failed
