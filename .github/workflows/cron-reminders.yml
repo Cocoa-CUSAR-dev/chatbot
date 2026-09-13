@@ -1,0 +1,33 @@
+# Triggers the reminder check from OUTSIDE the process, on a real schedule --
+# needed because this service is deployed to Vercel, where a serverless
+# function is frozen between requests and can never run its own in-process
+# scheduler (src/reminders/scheduler.py) on time. See src/internal/router.py's
+# docstring for the full story.
+#
+# Requires two repo secrets (Settings > Secrets and variables > Actions):
+#   CHATBOT_URL   -- the deployed base URL, e.g. https://<project>.vercel.app
+#   CRON_SECRET   -- must match the CRON_SECRET env var set on the Vercel
+#                    project itself (src/internal/config.py)
+#
+# Not needed at all if this service is ever moved to a persistent host
+# (Render, a VM, ...) -- there, scheduler.py's own scheduling just works and
+# this workflow becomes a harmless no-op (still fine to leave running).
+name: Trigger reminder check
+
+on:
+  schedule:
+    # GitHub's own minimum granularity is 5 minutes, and scheduled runs are
+    # best-effort (can slip under load) -- harmless here: check_and_send_reminders
+    # is idempotent against notify.reminder_log, so a late or occasionally
+    # skipped tick just gets caught by the next one.
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call /internal/cron/reminders
+        run: |
+          curl -sf -X GET "${{ secrets.CHATBOT_URL }}/internal/cron/reminders" \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}"

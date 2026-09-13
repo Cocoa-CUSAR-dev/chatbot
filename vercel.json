@@ -1,0 +1,6 @@
+{
+  "crons": [
+    { "path": "/internal/cron/reminders", "schedule": "*/15 * * * *" },
+    { "path": "/internal/cron/pause-idle-conversations", "schedule": "0 15 * * *" }
+  ]
+}
