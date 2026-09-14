@@ -145,6 +145,41 @@ async def reply_confirm_prompt(reply_token: str, text: str, conversation_id: UUI
         )
 
 
+async def reply_add_another_prompt(reply_token: str, text: str, conversation_id: UUID) -> None:
+    """Multi-submit's loop prompt, shown after a successful confirm on a
+    form whose task expects several rows. Two Postback buttons:
+    "➕ เพิ่มอีกรายการ" starts the next submission with the parent selection
+    carried forward (router.py's "add_another"), "✅ จบ" just acknowledges.
+
+    Only the conversation_id rides along -- the conversation already knows
+    its task, its form, and the parent it resolved, so there is nothing else
+    to pack into the 300-char postback budget.
+    """
+    quick_reply = QuickReply(
+        items=[
+            QuickReplyItem(
+                action=PostbackAction(
+                    label="➕ เพิ่มอีกรายการ",
+                    data=f"add_another:{conversation_id}",
+                    displayText="เพิ่มอีกรายการ",
+                )
+            ),
+            QuickReplyItem(
+                action=PostbackAction(
+                    label="✅ จบ",
+                    data=f"finish_multi:{conversation_id}",
+                    displayText="จบ",
+                )
+            ),
+        ]
+    )
+    message = TextMessage(text=text, quickReply=quick_reply)
+    async with AsyncApiClient(_configuration) as client:
+        await AsyncMessagingApi(client).reply_message(
+            ReplyMessageRequest(replyToken=reply_token, messages=[message])
+        )
+
+
 async def reply_autofill_offer(
     reply_token: str, *, task_id: str, task_form_id: str, handler: str, preview: str = ""
 ) -> None:

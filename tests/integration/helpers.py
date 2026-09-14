@@ -88,6 +88,7 @@ async def seed_task_form(
     title: str | None = None,
     handler: str = "notes",
     open_at: datetime | None = None,
+    is_multiple_submit: bool = False,
 ) -> tuple[uuid.UUID, uuid.UUID]:
     task_id = uuid.uuid4()
     task_form_id = uuid.uuid4()
@@ -102,10 +103,15 @@ async def seed_task_form(
     )
     await session.execute(
         text(
-            "INSERT INTO form.task_form (form_id, task_id, handler) "
-            "VALUES (:form_id, :task_id, :handler)"
+            "INSERT INTO form.task_form (form_id, task_id, handler, is_multiple_submit) "
+            "VALUES (:form_id, :task_id, :handler, :is_multiple_submit)"
         ),
-        {"form_id": task_form_id, "task_id": task_id, "handler": handler},
+        {
+            "form_id": task_form_id,
+            "task_id": task_id,
+            "handler": handler,
+            "is_multiple_submit": is_multiple_submit,
+        },
     )
     await session.commit()
     return task_id, task_form_id
