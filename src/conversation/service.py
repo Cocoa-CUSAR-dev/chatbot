@@ -132,6 +132,11 @@ class Question:
     # unchanged, for every question that never needs more than one page
     # (the vast majority) -- those call sites don't need to change at all.
     all_real_choices: list[Choice] | None = None
+    # form.question.carry_forward (V21). When the farmer taps "➕ เพิ่มอีกรายการ"
+    # on a multi-submit form, start_next_submission copies this question's
+    # answer from the row just submitted instead of asking it again -- e.g.
+    # the plot on a farm_activity form, where only the activity changes.
+    carry_forward: bool = False
 
 
 @dataclass(frozen=True)
@@ -235,6 +240,7 @@ def _question_from_dict(q: dict[str, Any]) -> Question:
         has_constrained_choices=has_constrained_choices,
         validation_rule=q.get("validation_rule"),
         all_real_choices=_constrained_choices_for(q),
+        carry_forward=bool(q.get("carry_forward", False)),
     )
 
 
@@ -936,7 +942,23 @@ async def start_next_submission(
         parent_answer = None
 
     questions = questions_from_form(form)
-    first_question = _next_unanswered_required(questions, answered=set())
+
+    # Carry-forward: questions the form author flagged keep the answer from
+    # the submission just confirmed, so a farmer logging three activities on
+    # one plot picks the plot once. Only answers that actually exist are
+    # copied -- a flagged question the farmer skipped last time is asked.
+    flagged = {q.question_id for q in questions if q.carry_forward}
+    carried = (
+        [
+            row
+            for row in await _answered_rows(session, conversation_id)
+            if row.question_id in flagged
+        ]
+        if flagged
+        else []
+    )
+    answered = {row.question_id for row in carried}
+    first_question = _next_unanswered_required(questions, answered=answered)
 
     conversation = Conversation(
         user_id=previous.user_id,
@@ -947,6 +969,16 @@ async def start_next_submission(
         parent_answer=parent_answer,
     )
     session.add(conversation)
+    await session.flush()
+    for row in carried:
+        session.add(
+            ConversationAnswer(
+                conversation_id=conversation.conversation_id,
+                question_id=row.question_id,
+                answer=row.answer,
+                source=row.source,
+            )
+        )
     await session.commit()
     await session.refresh(conversation)
 

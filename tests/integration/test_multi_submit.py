@@ -13,6 +13,7 @@ Two things need a real database rather than a mock:
 """
 
 import uuid
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import respx
@@ -28,6 +29,7 @@ from tests.integration.helpers import (
     build_postback_event,
     question_json,
     seed_conversation,
+    seed_conversation_answer,
     seed_question,
     seed_task_form,
     seed_user_with_line_identity,
@@ -252,3 +254,187 @@ class TestAddAnotherCarriesParentForward:
             {"user_id": user_id},
         )
         assert rows.scalar_one() is None, "a pending_kind placeholder must not be copied forward"
+
+
+class TestAddAnotherCarriesFlaggedAnswersForward:
+    """form.question.carry_forward: one plot, several activities. The plot
+    question is flagged, so the next submission keeps its answer and starts
+    at the activity question instead.
+    """
+
+    async def _seed_two_question_form(
+        self, db_session: AsyncSession, *, plot_carries: bool
+    ) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID, dict[str, Any]]:
+        task_id, task_form_id = await seed_task_form(
+            db_session, handler="farm_activity", is_multiple_submit=True
+        )
+        plot_q = await seed_question(
+            db_session,
+            task_id=task_id,
+            field_name="plot_id",
+            input_type="VARCHAR",
+            label="แปลง",
+            sort_order=1,
+        )
+        activity_q = await seed_question(
+            db_session,
+            task_id=task_id,
+            field_name="description",
+            input_type="VARCHAR",
+            label="กิจกรรม",
+            sort_order=2,
+        )
+        form_response = build_form_response(
+            task_form_id=task_form_id,
+            questions=[
+                question_json(
+                    question_id=plot_q,
+                    field_name="plot_id",
+                    input_type="VARCHAR",
+                    label="แปลง",
+                    sort_order=1,
+                    carry_forward=plot_carries,
+                ),
+                question_json(
+                    question_id=activity_q,
+                    field_name="description",
+                    input_type="VARCHAR",
+                    label="กิจกรรม",
+                    sort_order=2,
+                ),
+            ],
+        )
+        return task_id, task_form_id, plot_q, activity_q, form_response
+
+    async def _add_another(
+        self,
+        client: AsyncClient,
+        *,
+        task_form_id: uuid.UUID,
+        line_user_id: str,
+        completed_id: uuid.UUID,
+        form_response: dict[str, Any],
+    ) -> str:
+        with respx.mock:
+            respx.get(f"{forms_settings.KOTLIN_BACKEND_URL}/service/forms/{task_form_id}").mock(
+                return_value=Response(200, json=form_response)
+            )
+            reply_message = await _send_postback(
+                client, line_user_id=line_user_id, data=f"add_another:{completed_id}"
+            )
+        return str(reply_message.await_args.args[0].messages[0].text)
+
+    async def test_flagged_answer_is_copied_and_skipped(
+        self, db_session: AsyncSession, client: AsyncClient
+    ) -> None:
+        (
+            task_id,
+            task_form_id,
+            plot_q,
+            activity_q,
+            form_response,
+        ) = await self._seed_two_question_form(db_session, plot_carries=True)
+        line_user_id = f"U{uuid.uuid4().hex}"
+        user_id = await seed_user_with_line_identity(db_session, line_user_id=line_user_id)
+        completed_id = await seed_conversation(
+            db_session,
+            user_id=user_id,
+            task_id=task_id,
+            task_form_id=task_form_id,
+            status="completed",
+        )
+        await seed_conversation_answer(
+            db_session, conversation_id=completed_id, question_id=plot_q, text_value="แปลง A"
+        )
+        await seed_conversation_answer(
+            db_session, conversation_id=completed_id, question_id=activity_q, text_value="ใส่ปุ๋ย"
+        )
+
+        sent = await self._add_another(
+            client,
+            task_form_id=task_form_id,
+            line_user_id=line_user_id,
+            completed_id=completed_id,
+            form_response=form_response,
+        )
+        assert sent == "กิจกรรม", f"plot should be skipped, got {sent!r}"
+
+        rows = await db_session.execute(
+            text(
+                "SELECT c.current_question_id, a.question_id, a.answer "
+                "FROM chat.conversation c "
+                "LEFT JOIN chat.conversation_answer a ON a.conversation_id = c.conversation_id "
+                "WHERE c.user_id = :user_id AND c.status = 'active'"
+            ),
+            {"user_id": user_id},
+        )
+        fresh = rows.mappings().all()
+        assert len(fresh) == 1, f"want exactly the plot answer copied, got {len(fresh)} rows"
+        assert fresh[0]["current_question_id"] == activity_q
+        assert fresh[0]["question_id"] == plot_q
+        assert fresh[0]["answer"] == {"text": "แปลง A"}
+
+    async def test_unflagged_answers_are_asked_again(
+        self, db_session: AsyncSession, client: AsyncClient
+    ) -> None:
+        """Default is off: a form nobody flagged behaves exactly as before."""
+        task_id, task_form_id, plot_q, _, form_response = await self._seed_two_question_form(
+            db_session, plot_carries=False
+        )
+        line_user_id = f"U{uuid.uuid4().hex}"
+        user_id = await seed_user_with_line_identity(db_session, line_user_id=line_user_id)
+        completed_id = await seed_conversation(
+            db_session,
+            user_id=user_id,
+            task_id=task_id,
+            task_form_id=task_form_id,
+            status="completed",
+        )
+        await seed_conversation_answer(
+            db_session, conversation_id=completed_id, question_id=plot_q, text_value="แปลง A"
+        )
+
+        sent = await self._add_another(
+            client,
+            task_form_id=task_form_id,
+            line_user_id=line_user_id,
+            completed_id=completed_id,
+            form_response=form_response,
+        )
+        assert sent == "แปลง"
+
+        count = await db_session.execute(
+            text(
+                "SELECT COUNT(a.*) FROM chat.conversation c "
+                "JOIN chat.conversation_answer a ON a.conversation_id = c.conversation_id "
+                "WHERE c.user_id = :user_id AND c.status = 'active'"
+            ),
+            {"user_id": user_id},
+        )
+        assert count.scalar_one() == 0
+
+    async def test_flagged_but_skipped_last_time_is_asked(
+        self, db_session: AsyncSession, client: AsyncClient
+    ) -> None:
+        """Nothing to copy means nothing is invented -- the question is asked."""
+        task_id, task_form_id, _, _, form_response = await self._seed_two_question_form(
+            db_session, plot_carries=True
+        )
+        line_user_id = f"U{uuid.uuid4().hex}"
+        user_id = await seed_user_with_line_identity(db_session, line_user_id=line_user_id)
+        completed_id = await seed_conversation(
+            db_session,
+            user_id=user_id,
+            task_id=task_id,
+            task_form_id=task_form_id,
+            status="completed",
+        )
+
+        sent = await self._add_another(
+            client,
+            task_form_id=task_form_id,
+            line_user_id=line_user_id,
+            completed_id=completed_id,
+            form_response=form_response,
+        )
+        assert sent == "แปลง"

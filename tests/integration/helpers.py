@@ -169,6 +169,7 @@ def question_json(
     sort_order: int = 1,
     validation_rule: dict[str, Any] | None = None,
     choices: list[dict[str, str]] | None = None,
+    carry_forward: bool = False,
 ) -> dict[str, Any]:
     """A question exactly as Kotlin's GET /service/forms/{formId} would spell
     it -- camelCase, matching web-backend's Question.Entity -- for respx to
@@ -190,6 +191,7 @@ def question_json(
         "inputType": input_type,
         "isMandatory": is_mandatory,
         "sortOrder": sort_order,
+        "carryForward": carry_forward,
     }
     if validation_rule is not None:
         question["validationRule"] = validation_rule
