@@ -602,6 +602,32 @@ class TestHandleAnswerWithChoices:
         added_answer = session.add.call_args.args[0]
         assert added_answer.answer == {"text": "ใช่", "value": "true"}
 
+    async def test_choice_with_trailing_particle_still_resolves(self) -> None:
+        """text_parsing.match_choice: "ใช่ครับ" resolves to the "ใช่" choice
+        same as an exact "ใช่" would -- the farmer's answer is normal
+        BOOLEAN-question phrasing, not free text that fails to resolve.
+        """
+        form, question_id = _boolean_form()
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=question_id,
+        )
+        session = _mock_session(answers=[], conversation=conversation)
+
+        reply = await service.handle_answer(
+            session, conversation_id=conversation_id, raw_text="ใช่ครับ", form=form
+        )
+
+        assert reply is not None
+        assert reply.substate == ActiveSubstate.AWAITING_CONFIRMATION
+        added_answer = session.add.call_args.args[0]
+        assert added_answer.answer == {"text": "ใช่ครับ", "value": "true"}
+
     async def test_non_matching_answer_reasks_same_question(self) -> None:
         form, question_id = _boolean_form()
         conversation_id = uuid.uuid4()
@@ -743,6 +769,87 @@ class TestHandleAnswerValidation:
         assert "เว้นว่าง" in reply.text
         session.add.assert_not_called()  # blank answer never gets persisted
         assert conversation.current_question_id == q1  # unchanged, still open
+
+    async def test_spelled_out_thai_number_is_normalized_before_storing(self) -> None:
+        """text_parsing's fixed-parse step (docs/plans/text-parsing-
+        pipeline.md): a spelled-out Thai number still has to pass the
+        field's own INT rule afterward, but what gets stored is the
+        normalized digit string, not the words the farmer typed.
+        """
+        form, question_id = _validated_field_form(_FAN_COUNT_RULE)
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=question_id,
+        )
+        session = _mock_session(answers=[], conversation=conversation)
+
+        reply = await service.handle_answer(
+            session, conversation_id=conversation_id, raw_text="ห้า", form=form
+        )
+
+        assert reply is not None
+        assert reply.substate == ActiveSubstate.AWAITING_CONFIRMATION
+        added_answer = session.add.call_args.args[0]
+        assert added_answer.answer == {"text": "5"}
+
+    async def test_unparseable_number_reasks_with_the_fields_own_error_message(self) -> None:
+        """No fixed parser (nor the plain int()/float() fast path) can make
+        sense of "กากๆ" -- text_for_validation falls back to raw_text
+        unchanged, so validate_answer rejects it on its own terms, with the
+        SAME error_message any other invalid answer to this field would
+        get. Deliberately not a different, generic "couldn't understand"
+        message -- see text_parsing.py's module docstring.
+        """
+        form, question_id = _validated_field_form(_FAN_COUNT_RULE)
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=question_id,
+        )
+        session = _mock_session(answers=[], conversation=conversation)
+
+        reply = await service.handle_answer(
+            session, conversation_id=conversation_id, raw_text="กากๆ", form=form
+        )
+
+        assert reply is not None
+        assert reply.substate == ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION
+        assert "กรุณากรอกจำนวนพัดลมเป็นจำนวนเต็ม 0-50" in reply.text
+        session.add.assert_not_called()
+        assert conversation.current_question_id == question_id
+
+    async def test_relative_thai_date_is_normalized_before_storing(self) -> None:
+        import datetime
+
+        form, question_id = _validated_field_form({"type": "DATE"})
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=question_id,
+        )
+        session = _mock_session(answers=[], conversation=conversation)
+
+        reply = await service.handle_answer(
+            session, conversation_id=conversation_id, raw_text="วันนี้", form=form
+        )
+
+        assert reply is not None
+        assert reply.substate == ActiveSubstate.AWAITING_CONFIRMATION
+        added_answer = session.add.call_args.args[0]
+        assert added_answer.answer == {"text": datetime.date.today().isoformat()}
 
     async def test_mandatory_question_with_rule_rejects_blank_answer(self) -> None:
         """Same as above but for a field that DOES have a validation_rule --

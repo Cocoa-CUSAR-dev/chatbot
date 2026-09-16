@@ -34,7 +34,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.conversation import reuse
+from src.conversation import reuse, text_parsing
 from src.conversation.constants import ActiveSubstate, AnswerSource, ConversationStatus
 from src.conversation.exceptions import ConversationNotFound
 from src.conversation.models import Conversation, ConversationAnswer
@@ -671,7 +671,10 @@ async def handle_answer(
         # farmer can't actually see as a button on their current page (or
         # reject one they're genuinely looking at).
         page_choices = _paginate(current_question, conversation.current_page).choices
-        matched = next((c for c in page_choices or [] if c.label == raw_text), None)
+        # Exact match first (unchanged from before text_parsing existed),
+        # then a conservative fuzzy fallback for a close-but-not-exact
+        # phrasing -- see match_choice's own docstring.
+        matched = text_parsing.match_choice(raw_text, page_choices or [])
         if matched is not None and matched.id in (_NEXT_PAGE_CHOICE_ID, _PREV_PAGE_CHOICE_ID):
             # Paging isn't answering -- current_question_id, every
             # already-given answer, and the rest of this question stay
@@ -705,6 +708,13 @@ async def handle_answer(
     # a resolved OPTION/BOOLEAN choice is already constrained to a
     # known-good value by construction (matched against current_question's
     # own choices above).
+    # What actually gets validated and stored -- raw_text unless a fixed
+    # parser below normalizes it (a spelled-out Thai number/date into the
+    # digit/ISO form validate_answer's own INT/FLOAT/DATE/DATETIME
+    # validators expect). Declared before the block below so it's always
+    # defined, including the is_skip/resolved_value/no-open-question cases
+    # that skip that block entirely.
+    text_for_validation = raw_text
     if not is_skip and resolved_value is None and current_question is not None:
         # A mandatory free-text question offers no skip button (see
         # _choices_for), so blank/whitespace-only text is never an
@@ -720,7 +730,31 @@ async def handle_answer(
                 page=conversation.current_page,
                 error="กรุณาตอบคำถามนี้ ไม่สามารถเว้นว่างได้",
             )
-        error = validate_answer(current_question.validation_rule, raw_text)
+
+        # (New) Fixed-parse step (docs/plans/text-parsing-pipeline.md):
+        # for a field whose rule is a type text_parsing knows how to
+        # pre-parse, try that BEFORE validate_answer -- "เก้าร้อย"/"วันนี้"
+        # normalized into "900"/an ISO date, so validate_answer only ever
+        # sees the same digit/ISO shapes it always has. An already-valid
+        # answer (the common case) round-trips through parse_number/
+        # parse_date unchanged -- see those functions' own "already valid"
+        # fast path -- so this never changes behavior for it. On a MISS
+        # (neither library could make sense of it), text_for_validation
+        # simply stays raw_text -- validate_answer rejects that on its own
+        # terms, with the field's own configured error_message, same as it
+        # always has for any other invalid answer. Deliberately NOT a
+        # separate "couldn't understand" message here: that would show
+        # different wording depending on WHY the field rejected the answer,
+        # and (live-caught by this module's own test suite) would override
+        # a field's own more specific guidance with a generic one.
+        rule = current_question.validation_rule
+        rule_type = (rule or {}).get("type")
+        if rule_type in text_parsing.FIXED_PARSE_TYPES:
+            parsed = text_parsing.try_fixed_parse(rule_type, raw_text)
+            if parsed is not None:
+                text_for_validation = parsed
+
+        error = validate_answer(rule, text_for_validation)
         if error is not None:
             return _reply_for_question(
                 conversation_id, current_question, page=conversation.current_page, error=error
@@ -729,7 +763,7 @@ async def handle_answer(
     if is_skip:
         answer: dict[str, Any] = {"skipped": True}
     else:
-        answer = {"text": raw_text}
+        answer = {"text": text_for_validation}
     if resolved_value is not None:
         answer["value"] = resolved_value
 
