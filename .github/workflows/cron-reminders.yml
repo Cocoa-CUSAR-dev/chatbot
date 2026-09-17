@@ -12,15 +12,14 @@
 # Not needed at all if this service is ever moved to a persistent host
 # (Render, a VM, ...) -- there, scheduler.py's own scheduling just works and
 # this workflow becomes a harmless no-op (still fine to leave running).
+#
+# `schedule:` is disabled -- production scheduling moved to cron-job.org,
+# which hits the same /internal/cron/reminders endpoint with the same
+# Authorization: Bearer CRON_SECRET header. Kept as workflow_dispatch only
+# so it's still available to run by hand if ever needed.
 name: Trigger reminder check
 
 on:
-  schedule:
-    # GitHub's own minimum granularity is 5 minutes, and scheduled runs are
-    # best-effort (can slip under load) -- harmless here: check_and_send_reminders
-    # is idempotent against notify.reminder_log, so a late or occasionally
-    # skipped tick just gets caught by the next one.
-    - cron: "*/15 * * * *"
   workflow_dispatch: {}
 
 jobs:
