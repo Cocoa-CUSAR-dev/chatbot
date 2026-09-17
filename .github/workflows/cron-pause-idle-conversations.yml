@@ -5,11 +5,15 @@
 #
 # Requires the same two repo secrets as cron-reminders.yml: CHATBOT_URL,
 # CRON_SECRET.
+#
+# `schedule:` is disabled -- production scheduling moved to cron-job.org,
+# which hits the same /internal/cron/pause-idle-conversations endpoint with
+# the same Authorization: Bearer CRON_SECRET header. Kept as
+# workflow_dispatch only so it's still available to run by hand if ever
+# needed.
 name: Trigger daily idle-conversation pause
 
 on:
-  schedule:
-    - cron: "0 15 * * *" # 22:00 Asia/Bangkok
   workflow_dispatch: {}
 
 jobs:
