@@ -112,6 +112,51 @@ async def already_reminded_since(
     return {row.user_id for row in rows}
 
 
+async def create_reminder_schedule(
+    session: AsyncSession,
+    *,
+    task_id: uuid.UUID,
+    time_of_day: time,
+    created_by: uuid.UUID,
+) -> uuid.UUID:
+    """Inserts a new notify.reminder_schedule row. cadence is hardcoded to
+    'DAILY' here, not accepted as a parameter -- due_reminders above only
+    ever recognizes that one value, and every other value would be a row
+    the job silently never picks up, with no error anywhere to say so. This
+    function structurally can't create that mismatch: nothing calling it
+    can pass a different cadence, because there's nowhere to pass one.
+    """
+    schedule_id = uuid.uuid4()
+    await session.execute(
+        text(
+            "INSERT INTO notify.reminder_schedule "
+            "(schedule_id, task_id, cadence, time_of_day, is_active, created_by) "
+            "VALUES (:schedule_id, :task_id, 'DAILY', :time_of_day, true, :created_by)"
+        ),
+        {
+            "schedule_id": schedule_id,
+            "task_id": str(task_id),
+            "time_of_day": time_of_day,
+            "created_by": str(created_by),
+        },
+    )
+    await session.commit()
+    return schedule_id
+
+
+async def deactivate_schedule(session: AsyncSession, schedule_id: uuid.UUID) -> None:
+    """Turns off a schedule -- used when nobody owes its task anymore (see
+    jobs.py's _run_reminder_check): there's no point checking it again every
+    day forever once every farmer who needed the reminder has submitted.
+    Not a delete -- the row (and its history in notify.reminder_log) stays,
+    only future checks stop considering it.
+    """
+    await session.execute(
+        text("UPDATE notify.reminder_schedule SET is_active = false WHERE schedule_id = :id"),
+        {"id": str(schedule_id)},
+    )
+
+
 async def record_reminders(
     session: AsyncSession,
     *,

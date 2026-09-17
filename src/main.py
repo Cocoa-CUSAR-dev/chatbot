@@ -11,6 +11,7 @@ from src.exceptions import ServiceException
 from src.internal.router import router as internal_router
 from src.line.router import router as line_router
 from src.notifications.router import router as notifications_router
+from src.reminders.router import router as reminders_router
 from src.reminders.scheduler import configure_jobs, scheduler
 
 if not settings.ENVIRONMENT.is_deployed:
@@ -65,6 +66,7 @@ async def health() -> dict[str, str]:
 
 app.include_router(line_router)
 app.include_router(notifications_router)
+app.include_router(reminders_router)
 app.include_router(internal_router)
 
 if not settings.ENVIRONMENT.is_deployed:

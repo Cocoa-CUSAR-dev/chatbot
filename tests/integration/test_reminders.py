@@ -13,6 +13,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.reminders.jobs import _run_reminder_check, check_and_send_reminders
+from src.reminders.queries import create_reminder_schedule
 from tests.integration.helpers import (
     seed_form_response,
     seed_task_form,
@@ -63,6 +64,14 @@ def _all_succeed() -> AsyncMock:
     MagicMock a plain AsyncMock() would return (which jobs.py can't unpack).
     """
     return AsyncMock(side_effect=lambda to, _msg: (to, []))
+
+
+async def _is_active(session: AsyncSession, schedule_id: uuid.UUID) -> bool:
+    result = await session.execute(
+        text("SELECT is_active FROM notify.reminder_schedule WHERE schedule_id = :sid"),
+        {"sid": schedule_id},
+    )
+    return bool(result.scalar_one())
 
 
 async def _log_rows(session: AsyncSession, task_id: uuid.UUID) -> list[tuple[str, str]]:
@@ -168,6 +177,65 @@ async def test_a_failed_push_is_retried_on_the_next_run_the_same_day(
 
     second.assert_awaited_once()
     assert await _log_rows(db_session, task_id) == [("failed", "push"), ("sent", "push")]
+
+
+async def test_create_reminder_schedule_writes_a_real_daily_active_row(
+    db_session: AsyncSession,
+) -> None:
+    user_id = await seed_user_with_line_identity(db_session, line_user_id="Ureminder-create")
+    task_id, _ = await seed_task_form(db_session, open_at=_PAST)
+
+    schedule_id = await create_reminder_schedule(
+        db_session, task_id=task_id, time_of_day=time(17, 0), created_by=user_id
+    )
+
+    row = await db_session.execute(
+        text(
+            "SELECT task_id, cadence, time_of_day, is_active, created_by "
+            "FROM notify.reminder_schedule WHERE schedule_id = :sid"
+        ),
+        {"sid": schedule_id},
+    )
+    result = row.mappings().one()
+    assert result["task_id"] == task_id
+    assert result["cadence"] == "DAILY"
+    assert result["time_of_day"] == time(17, 0)
+    assert result["is_active"] is True
+    assert result["created_by"] == user_id
+
+
+async def test_a_freshly_created_schedule_is_immediately_pickable_by_the_job(
+    db_session: AsyncSession,
+) -> None:
+    """End-to-end proof the write side (create_reminder_schedule, what
+    web-backend's ChatbotClient calls) and the read side (due_reminders,
+    users_owing_task) actually agree on the row shape -- not just each
+    individually mocked/tested in isolation.
+    """
+    user_id = await seed_user_with_line_identity(db_session, line_user_id="Ureminder-e2e")
+    task_id, _ = await seed_task_form(db_session, open_at=_PAST)
+    await create_reminder_schedule(
+        db_session, task_id=task_id, time_of_day=time(8, 0), created_by=user_id
+    )
+
+    with patch("src.reminders.jobs.multicast_text_batched", new=_all_succeed()) as multicast:
+        await _run_reminder_check(db_session, _NOW)
+
+    multicast.assert_awaited_once()
+    assert multicast.await_args.args[0] == ["Ureminder-e2e"]
+
+
+async def test_schedule_deactivates_once_nobody_owes_the_task(db_session: AsyncSession) -> None:
+    user_id = await seed_user_with_line_identity(db_session, line_user_id="Ureminder-done")
+    task_id, _ = await seed_task_form(db_session, open_at=_PAST)
+    await seed_form_response(db_session, task_id=task_id, user_id=user_id)
+    schedule_id = await _seed_schedule(db_session, task_id=task_id, created_by=user_id)
+
+    with patch("src.reminders.jobs.multicast_text_batched", new=_all_succeed()) as multicast:
+        await _run_reminder_check(db_session, _NOW)
+
+    multicast.assert_not_awaited()
+    assert await _is_active(db_session, schedule_id) is False
 
 
 async def test_check_and_send_reminders_wrapper_reads_real_clock_and_own_session(
