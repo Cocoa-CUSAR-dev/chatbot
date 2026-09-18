@@ -59,3 +59,40 @@ def build_quick_ack_flex(text: str) -> dict[str, Any]:
             ],
         },
     }
+
+
+def build_diary_flex(diary_text: str) -> dict[str, Any]:
+    """The diary card pushed once generation finishes -- see
+    src/line/router.py's _generate_and_push_diary. `diary_text` is already
+    fully generated (template + LLM polish) by web-backend's DiaryService;
+    this only lays it out, never edits it.
+    """
+    return {
+        "type": "bubble",
+        "size": "mega",
+        "header": {
+            "type": "box",
+            "layout": "vertical",
+            "backgroundColor": "#4A7C59",
+            "paddingAll": "md",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": "ไดอารี่วันนี้",
+                    "weight": "bold",
+                    "color": "#ffffff",
+                },
+            ],
+        },
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": diary_text,
+                    "wrap": True,
+                },
+            ],
+        },
+    }
