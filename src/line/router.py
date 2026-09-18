@@ -1,5 +1,7 @@
+import asyncio
 import logging
-from typing import Annotated
+from collections.abc import Coroutine
+from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends
@@ -19,6 +21,7 @@ from src.conversation.constants import ActiveSubstate, ConversationStatus
 from src.conversation.exceptions import ConversationNotFound
 from src.conversation.models import Conversation
 from src.database import async_session_maker
+from src.diary.client import generate_diary
 from src.exceptions import UpstreamServiceError
 from src.forms.client import get_form
 from src.line import identity, parent_picker, temp_task_picker
@@ -39,6 +42,33 @@ router = APIRouter(prefix="/line", tags=["line"])
 logger = logging.getLogger(__name__)
 
 _QUICK_REPLY_LIMIT = 13  # LINE's own cap on Quick Reply items per message
+
+# US2-6 (docs-and-plan#130): asyncio.create_task's result has no strong
+# reference by default, so Python is free to garbage-collect a fire-and-
+# forget task mid-execution -- this set is exactly what asyncio's own docs
+# recommend to prevent that, cleared via the done-callback once each task
+# actually finishes.
+_background_tasks: set[asyncio.Task[None]] = set()
+
+
+def _fire_and_forget(coro: Coroutine[Any, None, None]) -> None:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def _generate_and_push_diary(user_id: str) -> None:
+    """US2-6 (docs-and-plan#130, #132, #133): fired without awaiting from the
+    confirm postback handler below, so the quick ack (reply_flex) isn't
+    delayed by web-backend's LLM polish pass. Errors are logged and
+    swallowed -- confirm_conversation's own submit_task has already
+    succeeded by the time this runs, so a diary that fails to generate
+    means no follow-up card, not a failed submission.
+    """
+    try:
+        await generate_diary(user_id)
+    except Exception:
+        logger.exception("diary generation failed for user_id=%s", user_id)
 
 
 async def _reply(reply_token: str, reply: service.ConversationReply) -> None:
@@ -397,6 +427,7 @@ async def _handle_postback(event: PostbackEvent) -> None:
         # read as the same kind of message rather than plain text followed
         # by a Flex card.
         await reply_flex(event.reply_token, reply.text, build_quick_ack_flex(reply.text))
+        _fire_and_forget(_generate_and_push_diary(str(conversation.user_id)))
     elif action == "edit":
         # US2-6: shows a picker of every already-answered (or skipped)
         # question rather than asking which field by name -- same
