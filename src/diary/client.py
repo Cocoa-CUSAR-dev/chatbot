@@ -12,11 +12,15 @@ from src.exceptions import UpstreamServiceError
 
 
 async def generate_diary(user_id: str) -> str:
-    # Same 30s reasoning as src/forms/client.py's get_form and
-    # src/tasks/client.py's submit_task: this hits web-backend's own LLM
-    # call (DiaryLlmClient), which can run well past httpx's 5s default.
+    # 60s, not the 30s src/forms/client.py's get_form and
+    # src/tasks/client.py's submit_task use: this path does BOTH a cold-cache
+    # DB round-trip per resolved reference field (BE-5's same shape, one
+    # query per plot/fertilizer/activity answered today) AND a Gemini call,
+    # not just one or the other. Confirmed live 2026-09-18: a real diary
+    # with several answered forms took 33.8s end to end -- past the old 30s
+    # ceiling despite succeeding.
     async with httpx.AsyncClient(
-        base_url=diary_settings.KOTLIN_BACKEND_URL, timeout=30.0
+        base_url=diary_settings.KOTLIN_BACKEND_URL, timeout=60.0
     ) as client:
         response = await client.post(
             "/service/diaries/generate",
