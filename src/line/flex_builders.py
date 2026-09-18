@@ -61,11 +61,15 @@ def build_quick_ack_flex(text: str) -> dict[str, Any]:
     }
 
 
-def build_diary_flex(diary_text: str) -> dict[str, Any]:
+def build_diary_flex(diary_text: str, history_url: str) -> dict[str, Any]:
     """The diary card pushed once generation finishes -- see
     src/line/router.py's _generate_and_push_diary. `diary_text` is already
     fully generated (template + LLM polish) by web-backend's DiaryService;
     this only lays it out, never edits it.
+
+    `history_url` is a plain link (see line_settings.WEB_APP_URL's own
+    comment on why -- US3-2's real SSO isn't built yet), not a token-bearing
+    deep link.
     """
     return {
         "type": "bubble",
@@ -92,6 +96,22 @@ def build_diary_flex(diary_text: str) -> dict[str, Any]:
                     "type": "text",
                     "text": diary_text,
                     "wrap": True,
+                },
+            ],
+        },
+        "footer": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {
+                    "type": "button",
+                    "style": "primary",
+                    "color": "#4A7C59",
+                    "action": {
+                        "type": "uri",
+                        "label": "ดูประวัติทั้งหมด",
+                        "uri": history_url,
+                    },
                 },
             ],
         },
