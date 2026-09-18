@@ -38,6 +38,7 @@ from src.line.service import (
     reply_task_choices,
     reply_text,
 )
+from src.sso.client import mint_sso_token
 from src.tasks.client import fetch_last_answer
 
 router = APIRouter(prefix="/line", tags=["line"])
@@ -76,7 +77,16 @@ async def _generate_and_push_diary(user_id: str, line_user_id: str) -> None:
         logger.exception("diary generation failed for user_id=%s", user_id)
         return
 
-    history_url = f"{line_settings.WEB_APP_URL}/history"
+    # SSO is best-effort, same as the LLM polish pass -- a farmer without a
+    # working deep link should still get their diary card, just with a
+    # link that lands on the login page instead of straight into /history.
+    try:
+        token = await mint_sso_token(user_id)
+        history_url = f"{line_settings.WEB_APP_URL}/sso?token={token}"
+    except Exception:
+        logger.exception("SSO token mint failed for user_id=%s", user_id)
+        history_url = f"{line_settings.WEB_APP_URL}/history"
+
     await push_flex(line_user_id, "ไดอารี่วันนี้", build_diary_flex(diary_text, history_url))
 
 

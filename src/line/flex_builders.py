@@ -67,9 +67,10 @@ def build_diary_flex(diary_text: str, history_url: str) -> dict[str, Any]:
     fully generated (template + LLM polish) by web-backend's DiaryService;
     this only lays it out, never edits it.
 
-    `history_url` is a plain link (see line_settings.WEB_APP_URL's own
-    comment on why -- US3-2's real SSO isn't built yet), not a token-bearing
-    deep link.
+    `history_url` is usually a token-bearing SSO deep link (src/sso/client.py)
+    so tapping it opens the farmer's history already logged in; it falls
+    back to a plain link if minting that token failed (see
+    _generate_and_push_diary in src/line/router.py).
     """
     return {
         "type": "bubble",
