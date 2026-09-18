@@ -23,11 +23,13 @@ from src.exceptions import UpstreamServiceError
 from src.forms.client import get_form
 from src.line import identity, parent_picker, temp_task_picker
 from src.line.dependencies import parse_line_events
+from src.line.flex_builders import build_quick_ack_flex
 from src.line.schemas import QuickReplyOption
 from src.line.service import (
     reply_autofill_offer,
     reply_confirm_prompt,
     reply_edit_picker,
+    reply_flex,
     reply_task_choices,
     reply_text,
 )
@@ -389,7 +391,12 @@ async def _handle_postback(event: PostbackEvent) -> None:
         # conversation is COMPLETED by this point, not awaiting anything),
         # so routing it through _reply() would attach a confirm button
         # pointing at an already-completed conversation.
-        await reply_text(event.reply_token, reply.text)
+        #
+        # US2-6: sent via reply_flex, not reply_text, so this ack and the
+        # diary card pushed a few seconds later (once generation finishes)
+        # read as the same kind of message rather than plain text followed
+        # by a Flex card.
+        await reply_flex(event.reply_token, reply.text, build_quick_ack_flex(reply.text))
     elif action == "edit":
         # US2-6: shows a picker of every already-answered (or skipped)
         # question rather than asking which field by name -- same
