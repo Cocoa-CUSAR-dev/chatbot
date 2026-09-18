@@ -446,9 +446,7 @@ async def _handle_postback(event: PostbackEvent) -> None:
         # read as the same kind of message rather than plain text followed
         # by a Flex card.
         await reply_flex(event.reply_token, reply.text, build_quick_ack_flex(reply.text))
-        _fire_and_forget(
-            _generate_and_push_diary(str(conversation.user_id), event.source.user_id)
-        )
+        _fire_and_forget(_generate_and_push_diary(str(conversation.user_id), event.source.user_id))
     elif action == "edit":
         # US2-6: shows a picker of every already-answered (or skipped)
         # question rather than asking which field by name -- same

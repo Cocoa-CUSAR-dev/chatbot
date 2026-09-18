@@ -13,9 +13,7 @@ from src.sso.config import sso_settings
 
 
 async def mint_sso_token(user_id: str) -> str:
-    async with httpx.AsyncClient(
-        base_url=sso_settings.KOTLIN_BACKEND_URL, timeout=30.0
-    ) as client:
+    async with httpx.AsyncClient(base_url=sso_settings.KOTLIN_BACKEND_URL, timeout=30.0) as client:
         response = await client.post(
             "/service/sso/tokens",
             json={"userId": user_id},
