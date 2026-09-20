@@ -1,16 +1,15 @@
 # Companion to cron-reminders.yml -- see that file's header for why this
 # exists (Vercel serverless can't run src/reminders/scheduler.py's own
-# in-process CronTrigger). Fires once daily at 22:00 Asia/Bangkok, which is
-# 15:00 UTC (GitHub Actions `cron:` schedules are always UTC).
-#
-# Requires the same two repo secrets as cron-reminders.yml: CHATBOT_URL,
-# CRON_SECRET.
+# in-process CronTrigger). Manual trigger only.
 #
 # `schedule:` is disabled -- production scheduling moved to cron-job.org,
 # which hits the same /internal/cron/pause-idle-conversations endpoint with
-# the same Authorization: Bearer CRON_SECRET header. Kept as
-# workflow_dispatch only so it's still available to run by hand if ever
-# needed.
+# the same Authorization: Bearer CRON_SECRET header, once daily at 22:00
+# Asia/Bangkok (= 15:00 UTC). Kept as workflow_dispatch only so it's still
+# available to run by hand if ever needed.
+#
+# Requires the same two repo secrets as cron-reminders.yml: CHATBOT_URL,
+# CRON_SECRET (used only when this workflow is run by hand).
 name: Trigger daily idle-conversation pause
 
 on:
