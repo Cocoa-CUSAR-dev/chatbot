@@ -20,14 +20,17 @@ is identical either way. On a persistent host, scheduler.py's own
 scheduling still works fine and these are just unused extra entry points --
 harmless either way.
 
-What actually calls these here: .github/workflows/cron-reminders.yml and
-cron-pause-idle-conversations.yml (a GitHub Actions `schedule:`), not
-Vercel Cron -- Vercel's own Cron Jobs are plan-gated to at most once a day
-on the Hobby tier (a deployment with a tighter vercel.json `crons` entry
-flat-out fails to deploy), which is too coarse for the reminders check.
-Vercel Cron becomes a viable *alternative* to the GitHub Actions workflows
-only on a paid plan; either way still points at these same two endpoints,
-so nothing here would need to change.
+What actually calls these here: cron-job.org, sending GET requests with an
+`Authorization: Bearer <CRON_SECRET>` header (configured on cron-job.org
+itself, not in this repo). .github/workflows/cron-reminders.yml and
+cron-pause-idle-conversations.yml no longer have a `schedule:` -- they are
+kept as `workflow_dispatch` only, to trigger the same endpoints by hand.
+Not Vercel Cron -- Vercel's own Cron Jobs are plan-gated to at most once a
+day on the Hobby tier (a deployment with a tighter vercel.json `crons`
+entry flat-out fails to deploy), which is too coarse for the reminders
+check. Vercel Cron becomes a viable *alternative* to cron-job.org only on a
+paid plan; either way still points at these same two endpoints, so nothing
+here would need to change.
 """
 
 from fastapi import APIRouter, Depends
@@ -58,9 +61,9 @@ async def run_reminders() -> dict[str, str]:
 @router.get("/pause-idle-conversations")
 async def run_pause_idle_conversations() -> dict[str, str]:
     """Wire to fire once daily at 22:00 Asia/Bangkok = 15:00 UTC -- the
-    external scheduler is what decides *when*, so its schedule must already
-    be in UTC (Vercel Cron and GitHub Actions `schedule:` both are); this
-    endpoint itself does no time-of-day check of its own.
+    external scheduler is what decides *when*, so its job must be set to
+    22:00 Asia/Bangkok (or 15:00 if its timezone is UTC); this endpoint
+    itself does no time-of-day check of its own.
     """
     await pause_idle_conversations()
     return {"status": "ok"}
