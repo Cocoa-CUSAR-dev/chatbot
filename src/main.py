@@ -8,11 +8,16 @@ from fastapi.responses import JSONResponse
 from src.config import settings
 from src.exceptions import ServiceException
 from src.line.router import router as line_router
+from src.logging_config import configure_logging
 from src.notifications.router import router as notifications_router
 from src.reminders.scheduler import configure_jobs, scheduler
 
 if not settings.ENVIRONMENT.is_deployed:
     from src.conversation.router import router as conversation_test_router
+
+# X-2c: install the JSON log handler before uvicorn logs its own startup
+# lines or any router starts logging.
+configure_logging()
 
 
 @asynccontextmanager
