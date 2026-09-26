@@ -4,12 +4,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from src.config import settings
 from src.exceptions import ServiceException
 from src.line.router import router as line_router
 from src.notifications.router import router as notifications_router
 from src.reminders.scheduler import configure_jobs, scheduler
+from src.request_id import request_id_middleware
 
 if not settings.ENVIRONMENT.is_deployed:
     from src.conversation.router import router as conversation_test_router
@@ -36,6 +38,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# X-2e: added last so it's the outermost middleware (Starlette executes
+# middleware in reverse registration order) -- the request ID needs to be
+# set before CORS or anything else in the stack runs.
+app.add_middleware(BaseHTTPMiddleware, dispatch=request_id_middleware)
 
 
 @app.exception_handler(ServiceException)

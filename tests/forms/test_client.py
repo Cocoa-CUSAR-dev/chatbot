@@ -106,3 +106,22 @@ async def test_get_form_404_raises_form_not_found() -> None:
 
     with _patched_client(response), pytest.raises(FormNotFound):
         await get_form("missing-form")
+
+
+async def test_get_form_forwards_request_id() -> None:
+    """X-2e: a single farmer action must be traceable across chatbot's and
+    web-backend's logs -- confirms the header is actually sent, not just
+    accepted on the way in.
+    """
+    body = {"value": {"formId": "f1", "sections": []}, "error": None}
+    response = _mock_kotlin_response(200, body)
+
+    with (
+        _patched_client(response) as mock_client_cls,
+        patch("src.forms.client.get_request_id", return_value="test-request-id-abc"),
+    ):
+        await get_form("f1")
+
+    client = mock_client_cls.return_value
+    _, kwargs = client.get.call_args
+    assert kwargs["headers"]["X-Request-Id"] == "test-request-id-abc"

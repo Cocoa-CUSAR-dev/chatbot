@@ -9,6 +9,7 @@ of one already made.
 import httpx
 
 from src.exceptions import UpstreamServiceError
+from src.request_id import REQUEST_ID_HEADER, get_request_id
 from src.sso.config import sso_settings
 
 
@@ -17,7 +18,10 @@ async def mint_sso_token(user_id: str) -> str:
         response = await client.post(
             "/service/sso/tokens",
             json={"userId": user_id},
-            headers={"X-Service-Key": sso_settings.KOTLIN_SERVICE_KEY},
+            headers={
+                "X-Service-Key": sso_settings.KOTLIN_SERVICE_KEY,
+                REQUEST_ID_HEADER: get_request_id(),
+            },
         )
 
     if response.status_code == 401:
