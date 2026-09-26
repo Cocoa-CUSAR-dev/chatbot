@@ -55,6 +55,9 @@ CREATE TABLE form.task_form (
     task_id uuid NOT NULL,
     title character varying,
     handler character varying,
+    -- V1 baseline column. Nothing read or wrote it until multi-submit;
+    -- temp_task_picker's pending-task query now does, so the mirror needs it.
+    is_multiple_submit boolean NOT NULL DEFAULT false,
     CONSTRAINT pk_form PRIMARY KEY (form_id),
     CONSTRAINT fk_form_task FOREIGN KEY (task_id) REFERENCES form.task (task_id)
 );

@@ -132,6 +132,11 @@ class Question:
     # unchanged, for every question that never needs more than one page
     # (the vast majority) -- those call sites don't need to change at all.
     all_real_choices: list[Choice] | None = None
+    # form.question.carry_forward (V21). When the farmer taps "➕ เพิ่มอีกรายการ"
+    # on a multi-submit form, start_next_submission copies this question's
+    # answer from the row just submitted instead of asking it again -- e.g.
+    # the plot on a farm_activity form, where only the activity changes.
+    carry_forward: bool = False
 
 
 @dataclass(frozen=True)
@@ -144,6 +149,12 @@ class ConversationReply:
     # lets the caller re-attach the confirm button for a retry instead of
     # treating this as the terminal "saved" message.
     submission_failed: bool = False
+    # True only on a SUCCESSFUL confirm of a multiple-submit form: the
+    # submission saved, but this task expects more rows (three grades for
+    # one harvest), so the caller offers "add another" instead of the
+    # terminal thanks. Same "let the caller attach the right buttons"
+    # pattern as submission_failed above.
+    offer_another: bool = False
     # Debug-only passthrough of the open question's own shape -- None
     # whenever this reply isn't "here's a fixed question to answer" (e.g.
     # confirmation/completed/cancelled replies have no single open question).
@@ -229,6 +240,7 @@ def _question_from_dict(q: dict[str, Any]) -> Question:
         has_constrained_choices=has_constrained_choices,
         validation_rule=q.get("validation_rule"),
         all_real_choices=_constrained_choices_for(q),
+        carry_forward=bool(q.get("carry_forward", False)),
     )
 
 
@@ -877,11 +889,106 @@ async def confirm_conversation(
     conversation.status = ConversationStatus.COMPLETED
     await session.commit()
 
+    # This conversation is done either way -- the row is saved. A
+    # multiple-submit form just isn't finished with the TASK: the farmer is
+    # expected to file several rows against it (grade A, then B, then C), so
+    # offer another instead of closing the conversation out. The caller
+    # attaches the buttons; router.py's "add_another" postback starts the
+    # next one with the parent selection carried forward.
+    if form.is_multiple_submit:
+        return ConversationReply(
+            conversation_id=conversation_id,
+            substate=ActiveSubstate.AWAITING_CONFIRMATION,
+            text="บันทึกข้อมูลเรียบร้อยแล้ว ต้องการเพิ่มอีกรายการสำหรับงานนี้หรือไม่?",
+            offer_another=True,
+        )
+
     return ConversationReply(
         conversation_id=conversation_id,
         substate=ActiveSubstate.AWAITING_CONFIRMATION,
         text="บันทึกข้อมูลเรียบร้อยแล้ว ขอบคุณครับ",
     )
+
+
+async def start_next_submission(
+    session: AsyncSession, *, conversation_id: UUID, form: FormDetail
+) -> ConversationReply:
+    """The "➕ เพิ่มอีกรายการ" half of multi-submit: opens a FRESH conversation
+    on the same task and form as the one just confirmed.
+
+    The point of doing this here rather than routing back through
+    start_conversation is parent_answer. All five handlers that actually
+    want repeat submission are the child-row handlers whose parent FK is NOT
+    NULL, so every row needs its harvest_id/farm_activity_id/batch_id just
+    as much as the first did -- but re-running the parent picker would ask a
+    farmer to re-pick the same harvest before every single grade, which is
+    the difference between a feature and an annoyance. The already-resolved
+    parent_answer is copied forward instead, so the next row starts at the
+    form's first real question.
+
+    Deliberately a new Conversation row rather than reopening the completed
+    one: the finished submission stays exactly as it was submitted, and each
+    row keeps its own answer history.
+    """
+    previous = await session.get(Conversation, conversation_id)
+    if previous is None:
+        raise ConversationNotFound()
+
+    # Only a RESOLVED parent carries forward. A conversation still sitting
+    # on {"pending_kind": ...} never picked one, and copying that would
+    # start the next submission stuck at the picker step.
+    parent_answer = previous.parent_answer
+    if parent_answer is not None and "field_name" not in parent_answer:
+        parent_answer = None
+
+    questions = questions_from_form(form)
+
+    # Carry-forward: questions the form author flagged keep the answer from
+    # the submission just confirmed, so a farmer logging three activities on
+    # one plot picks the plot once. Only answers that actually exist are
+    # copied -- a flagged question the farmer skipped last time is asked.
+    flagged = {q.question_id for q in questions if q.carry_forward}
+    carried = (
+        [
+            row
+            for row in await _answered_rows(session, conversation_id)
+            if row.question_id in flagged
+        ]
+        if flagged
+        else []
+    )
+    answered = {row.question_id for row in carried}
+    first_question = _next_unanswered_required(questions, answered=answered)
+
+    conversation = Conversation(
+        user_id=previous.user_id,
+        task_id=previous.task_id,
+        task_form_id=previous.task_form_id,
+        status=ConversationStatus.ACTIVE,
+        current_question_id=first_question.question_id if first_question else None,
+        parent_answer=parent_answer,
+    )
+    session.add(conversation)
+    await session.flush()
+    for row in carried:
+        session.add(
+            ConversationAnswer(
+                conversation_id=conversation.conversation_id,
+                question_id=row.question_id,
+                answer=row.answer,
+                source=row.source,
+            )
+        )
+    await session.commit()
+    await session.refresh(conversation)
+
+    if first_question is None:
+        return ConversationReply(
+            conversation_id=conversation.conversation_id,
+            substate=ActiveSubstate.AWAITING_CONFIRMATION,
+            text="ไม่มีคำถามที่จำเป็นต้องตอบ ยืนยันการส่งข้อมูลหรือไม่?",
+        )
+    return _reply_for_question(conversation.conversation_id, first_question)
 
 
 async def cancel_conversation(session: AsyncSession, *, conversation_id: UUID) -> ConversationReply:

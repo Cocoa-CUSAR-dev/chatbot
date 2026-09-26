@@ -31,6 +31,7 @@ from src.line.flex_builders import build_diary_flex, build_quick_ack_flex
 from src.line.schemas import QuickReplyOption
 from src.line.service import (
     push_flex,
+    reply_add_another_prompt,
     reply_autofill_offer,
     reply_confirm_prompt,
     reply_edit_picker,
@@ -435,6 +436,11 @@ async def _handle_postback(event: PostbackEvent) -> None:
             # the conversation is still awaiting confirmation, not completed.
             await reply_confirm_prompt(event.reply_token, reply.text, reply.conversation_id)
             return
+        if reply.offer_another:
+            # Saved, but this task wants more rows (multi-submit) -- offer
+            # the next one instead of closing out.
+            await reply_add_another_prompt(event.reply_token, reply.text, reply.conversation_id)
+            return
         # Not _reply(): confirm_conversation's reply still carries substate
         # AWAITING_CONFIRMATION on its terminal "thanks" message (the
         # conversation is COMPLETED by this point, not awaiting anything),
@@ -447,6 +453,42 @@ async def _handle_postback(event: PostbackEvent) -> None:
         # by a Flex card.
         await reply_flex(event.reply_token, reply.text, build_quick_ack_flex(reply.text))
         _fire_and_forget(_generate_and_push_diary(str(conversation.user_id), event.source.user_id))
+    elif action == "add_another":
+        # Multi-submit loop: open the next submission on the same task and
+        # form, with the parent selection carried forward so the farmer
+        # isn't asked to re-pick the same harvest before every grade.
+        (conversation_id,) = args
+        async with async_session_maker() as session:
+            conversation = await session.get(Conversation, UUID(conversation_id))
+            if conversation is None:
+                await reply_text(event.reply_token, "ไม่พบบทสนทนานี้แล้ว")
+                return
+            form = await get_form(str(conversation.task_form_id))
+            try:
+                reply = await service.start_next_submission(
+                    session, conversation_id=conversation.conversation_id, form=form
+                )
+            except ConversationNotFound:
+                await reply_text(event.reply_token, "ไม่พบบทสนทนานี้แล้ว")
+                return
+        await _reply(event.reply_token, reply)
+    elif action == "finish_multi":
+        # Phase 1 has nowhere to record "the farmer is done adding rows" --
+        # that needs form.assignment, which is Phase 2. So this button only
+        # acknowledges; the task itself stays listed until close_at. Named
+        # as a known cost in the multi-submit design doc, not an oversight.
+        #
+        # The diary (US2-6) fires here rather than after every saved row: on
+        # a multi-submit task this is the farmer actually saying they're
+        # done, so it's the equivalent of the single-submit confirm above.
+        (conversation_id,) = args
+        async with async_session_maker() as session:
+            conversation = await session.get(Conversation, UUID(conversation_id))
+        await reply_text(event.reply_token, "บันทึกข้อมูลครบแล้ว ขอบคุณครับ")
+        if conversation is not None:
+            _fire_and_forget(
+                _generate_and_push_diary(str(conversation.user_id), event.source.user_id)
+            )
     elif action == "edit":
         # US2-6: shows a picker of every already-answered (or skipped)
         # question rather than asking which field by name -- same

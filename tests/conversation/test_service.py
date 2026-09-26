@@ -1232,8 +1232,54 @@ class TestConfirmConversation:
             )
 
         assert reply.submission_failed is False
+        assert reply.offer_another is False  # single-submit: terminal, as before
         assert "บันทึกข้อมูลเรียบร้อยแล้ว" in reply.text
         assert conversation.status == ConversationStatus.COMPLETED
+
+    async def test_multi_submit_form_offers_another_instead_of_ending(self) -> None:
+        """A multi-submit task isn't finished when one row saves -- the
+        farmer is expected to file several (three grades for one harvest),
+        so the reply asks rather than closing out.
+        """
+        form, (q1,) = _form(mandatory_flags=[True])
+        form.is_multiple_submit = True
+        conversation_id = uuid.uuid4()
+        conversation = self._conversation(conversation_id)
+        session = _mock_session(answers=[_answer(q1)], conversation=conversation)
+        session.get = AsyncMock(return_value=conversation)
+
+        with patch("src.conversation.service.submit_task", new=AsyncMock()):
+            reply = await service.confirm_conversation(
+                session, conversation_id=conversation_id, form=form
+            )
+
+        assert reply.offer_another is True
+        assert "เพิ่มอีกรายการ" in reply.text
+        # The submission itself still saved and this conversation is done --
+        # "offer another" is about the TASK, not this row.
+        assert reply.submission_failed is False
+        assert conversation.status == ConversationStatus.COMPLETED
+
+    async def test_multi_submit_failure_still_reports_failure_not_another(self) -> None:
+        """offer_another must never mask a failed submission -- otherwise a
+        farmer is invited to add a second row when the first never saved.
+        """
+        form, (q1,) = _form(mandatory_flags=[True])
+        form.is_multiple_submit = True
+        conversation_id = uuid.uuid4()
+        conversation = self._conversation(conversation_id)
+        session = _mock_session(answers=[_answer(q1)], conversation=conversation)
+        session.get = AsyncMock(return_value=conversation)
+
+        failing_submit = AsyncMock(side_effect=UpstreamServiceError("Go returned 500"))
+        with patch("src.conversation.service.submit_task", new=failing_submit):
+            reply = await service.confirm_conversation(
+                session, conversation_id=conversation_id, form=form
+            )
+
+        assert reply.submission_failed is True
+        assert reply.offer_another is False
+        assert conversation.status == ConversationStatus.ACTIVE
 
     async def test_stays_open_and_honest_on_generic_failure(self) -> None:
         form, (q1,) = _form(mandatory_flags=[True])

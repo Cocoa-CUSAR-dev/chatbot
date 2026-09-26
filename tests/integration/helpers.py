@@ -88,6 +88,7 @@ async def seed_task_form(
     title: str | None = None,
     handler: str = "notes",
     open_at: datetime | None = None,
+    is_multiple_submit: bool = False,
 ) -> tuple[uuid.UUID, uuid.UUID]:
     task_id = uuid.uuid4()
     task_form_id = uuid.uuid4()
@@ -102,10 +103,15 @@ async def seed_task_form(
     )
     await session.execute(
         text(
-            "INSERT INTO form.task_form (form_id, task_id, handler) "
-            "VALUES (:form_id, :task_id, :handler)"
+            "INSERT INTO form.task_form (form_id, task_id, handler, is_multiple_submit) "
+            "VALUES (:form_id, :task_id, :handler, :is_multiple_submit)"
         ),
-        {"form_id": task_form_id, "task_id": task_id, "handler": handler},
+        {
+            "form_id": task_form_id,
+            "task_id": task_id,
+            "handler": handler,
+            "is_multiple_submit": is_multiple_submit,
+        },
     )
     await session.commit()
     return task_id, task_form_id
@@ -163,6 +169,7 @@ def question_json(
     sort_order: int = 1,
     validation_rule: dict[str, Any] | None = None,
     choices: list[dict[str, str]] | None = None,
+    carry_forward: bool = False,
 ) -> dict[str, Any]:
     """A question exactly as Kotlin's GET /service/forms/{formId} would spell
     it -- camelCase, matching web-backend's Question.Entity -- for respx to
@@ -184,6 +191,7 @@ def question_json(
         "inputType": input_type,
         "isMandatory": is_mandatory,
         "sortOrder": sort_order,
+        "carryForward": carry_forward,
     }
     if validation_rule is not None:
         question["validationRule"] = validation_rule
