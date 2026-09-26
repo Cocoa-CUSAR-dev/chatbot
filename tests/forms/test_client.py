@@ -113,7 +113,8 @@ async def test_get_form_forwards_request_id() -> None:
     web-backend's logs -- confirms the header is actually sent, not just
     accepted on the way in.
     """
-    response = _mock_kotlin_response(200, {"value": {"formId": "f1", "sections": []}, "error": None})
+    body = {"value": {"formId": "f1", "sections": []}, "error": None}
+    response = _mock_kotlin_response(200, body)
 
     with (
         _patched_client(response) as mock_client_cls,
