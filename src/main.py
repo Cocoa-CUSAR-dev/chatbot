@@ -1,6 +1,7 @@
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
+import sentry_sdk
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -13,6 +14,14 @@ from src.reminders.scheduler import configure_jobs, scheduler
 
 if not settings.ENVIRONMENT.is_deployed:
     from src.conversation.router import router as conversation_test_router
+
+# X-2d: error tracking. An empty SENTRY_DSN (the default) disables the SDK
+# entirely -- no error, no events sent -- safe in local dev/CI.
+sentry_sdk.init(
+    dsn=settings.SENTRY_DSN,
+    environment=settings.SENTRY_ENVIRONMENT,
+    traces_sample_rate=settings.SENTRY_TRACES_SAMPLE_RATE,
+)
 
 
 @asynccontextmanager
