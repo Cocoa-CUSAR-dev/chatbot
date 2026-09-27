@@ -30,3 +30,19 @@ async def test_dev_conversation_router_is_registered_in_local_environment(
 async def test_openapi_is_exposed_when_not_deployed(client: AsyncClient) -> None:
     response = await client.get("/openapi.json")
     assert response.status_code == 200
+
+
+# ----------------------------------------------------------------------
+# request_id_middleware (X-2e)
+# ----------------------------------------------------------------------
+
+
+async def test_request_id_is_generated_when_not_provided(client: AsyncClient) -> None:
+    response = await client.get("/health")
+    assert response.status_code == 200
+    assert response.headers.get("X-Request-Id")
+
+
+async def test_request_id_is_echoed_back_when_provided(client: AsyncClient) -> None:
+    response = await client.get("/health", headers={"X-Request-Id": "test-request-id-123"})
+    assert response.headers.get("X-Request-Id") == "test-request-id-123"

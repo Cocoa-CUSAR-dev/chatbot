@@ -29,6 +29,7 @@ from src.exceptions import UpstreamServiceError
 from src.forms.config import forms_settings
 from src.forms.exceptions import FormNotFound
 from src.forms.schemas import FormDetail
+from src.request_id import REQUEST_ID_HEADER, get_request_id
 
 _CAMEL_BOUNDARY = re.compile(r"(?<!^)(?=[A-Z])")
 
@@ -59,7 +60,10 @@ async def get_form(form_id: str) -> FormDetail:
     ) as client:
         response = await client.get(
             f"/service/forms/{form_id}",
-            headers={"X-Service-Key": forms_settings.KOTLIN_SERVICE_KEY},
+            headers={
+                "X-Service-Key": forms_settings.KOTLIN_SERVICE_KEY,
+                REQUEST_ID_HEADER: get_request_id(),
+            },
         )
 
     if response.status_code == 404:
