@@ -1,0 +1,28 @@
+%% Free-text -> typed-value parsing pipeline (fixed parser first, LLM fallback second)
+%% Scope: INT / FLOAT / DATE / DATETIME / OPTION / BOOLEAN questions in the guided flow.
+%% VARCHAR and GEODATA skip this pipeline entirely (see decision node B).
+%% Everything tagged "(existing)" already exists in src/conversation -- this
+%% pipeline slots in BEFORE validate_answer, never replaces or bypasses it.
+
+flowchart TD
+    A["Farmer sends raw_text<br/>for conversation.current_question"] --> B{"question.input_type?"}
+
+    B -->|"VARCHAR or GEODATA<br/>(no parsing needed)"| V["validate_answer(rule, text)<br/>(existing -- validation.py)"]
+
+    B -->|"INT / FLOAT / DATE /<br/>DATETIME / OPTION / BOOLEAN"| F["Fixed parser (new, deterministic)<br/>Thai number words -> digits<br/>พ.ศ. -> ค.ศ., relative dates<br/>(วันนี้/พรุ่งนี้/เมื่อวาน)<br/>choice fuzzy/synonym match"]
+
+    F --> FD{"Parsed with<br/>confidence?"}
+    FD -->|"yes"| N1["normalized_text"] --> V
+    FD -->|"no -- pattern not covered"| R["Re-ask current question<br/>+ format guidance<br/>(existing -- _reply_for_question)"]
+
+    V --> VD{"Passes the field's<br/>validation_rule?"}
+    VD -->|"yes"| S["Save ConversationAnswer<br/>source=guided_flow (existing column)<br/>+ log which path handled it<br/>(fixed / llm) for observability"]
+    VD -->|"no"| R
+    S --> NXT["Advance state machine:<br/>next question or<br/>confirmation summary (existing)"]
+
+    R -.->|"farmer replies again"| A
+
+    classDef new fill:#fff3cd,stroke:#b8860b,color:#3a2f00
+    classDef existing fill:#e8f0fe,stroke:#4285f4,color:#1a3a6b
+    class F,R new
+    class V,VD,S,NXT existing

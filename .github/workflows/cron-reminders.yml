@@ -1,0 +1,26 @@
+# Manual-trigger-only companion to the real external trigger for
+# /internal/cron/reminders, which is cron-job.org, not GitHub Actions --
+# see src/internal/router.py's docstring for why an external trigger is
+# needed at all (Vercel serverless can't run src/reminders/scheduler.py's
+# own in-process scheduler on time). Kept as workflow_dispatch so this
+# endpoint can still be exercised by hand (e.g. while debugging) without
+# also running on its own schedule and double-firing alongside
+# cron-job.org.
+#
+# Requires two repo secrets (Settings > Secrets and variables > Actions):
+#   CHATBOT_URL   -- the deployed base URL, e.g. https://<project>.vercel.app
+#   CRON_SECRET   -- must match the CRON_SECRET env var set on the Vercel
+#                    project itself (src/internal/config.py)
+name: Trigger reminder check
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call /internal/cron/reminders
+        run: |
+          curl -sf -X GET "${{ secrets.CHATBOT_URL }}/internal/cron/reminders" \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}"
