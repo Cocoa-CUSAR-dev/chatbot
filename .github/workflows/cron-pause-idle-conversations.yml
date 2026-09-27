@@ -1,0 +1,19 @@
+# Manual-trigger-only companion to cron-reminders.yml -- see that file's
+# header for why this exists and why it's workflow_dispatch-only. The real
+# schedule (once daily) lives on cron-job.org, not here.
+#
+# Requires the same two repo secrets as cron-reminders.yml: CHATBOT_URL,
+# CRON_SECRET.
+name: Trigger daily idle-conversation pause
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call /internal/cron/pause-idle-conversations
+        run: |
+          curl -sf -X GET "${{ secrets.CHATBOT_URL }}/internal/cron/pause-idle-conversations" \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}"

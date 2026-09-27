@@ -133,6 +133,14 @@ async def fetch_sanitized_autofill(
 
 def _error_detail(response: httpx.Response) -> str:
     try:
-        return str(response.json().get("error", response.text))
+        body = response.json()
     except ValueError:
         return response.text
+    detail = str(body.get("error", response.text))
+    # Go's 400 validation failures put the per-field reasons in "details"
+    # (e.g. which field/why) -- without them the message is just a generic
+    # "validation failed" with no way to tell what to fix.
+    details = body.get("details")
+    if isinstance(details, list) and details:
+        detail += f" -- {'; '.join(str(d) for d in details)}"
+    return detail
