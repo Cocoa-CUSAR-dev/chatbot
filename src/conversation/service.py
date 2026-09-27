@@ -34,7 +34,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.conversation import reuse, text_parsing
+from src.conversation import llm_parsing, reuse, text_parsing
 from src.conversation.constants import ActiveSubstate, AnswerSource, ConversationStatus
 from src.conversation.exceptions import ConversationNotFound
 from src.conversation.models import Conversation, ConversationAnswer
@@ -751,8 +751,18 @@ async def handle_answer(
         rule_type = (rule or {}).get("type")
         if rule_type in text_parsing.FIXED_PARSE_TYPES:
             parsed = text_parsing.try_fixed_parse(rule_type, raw_text)
+            parse_path = "fixed"
+            if parsed is None:
+                # Fixed parser couldn't make sense of it -- last resort is
+                # the LLM (llm_parsing.py). Its result still goes through
+                # validate_answer below like any other answer.
+                parsed = await llm_parsing.try_llm_parse(rule_type, raw_text)
+                parse_path = "llm"
             if parsed is not None:
                 text_for_validation = parsed
+            else:
+                parse_path = "none"
+            logger.info("text parse rule_type=%s path=%s", rule_type, parse_path)
 
         error = validate_answer(rule, text_for_validation)
         if error is not None:

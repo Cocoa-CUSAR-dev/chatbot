@@ -9,6 +9,9 @@ class LLMConfig(BaseSettings):
     # (ADR 0004).
     LLM_MODEL: str = "gpt-4o-mini"
     LLM_API_KEY: str = ""
+    # A farmer is waiting in LINE for the reply, so a slow provider is treated
+    # the same as an unavailable one (LLMUnavailable) rather than waited on.
+    LLM_TIMEOUT_SECONDS: float = 6.0
 
 
 llm_settings = LLMConfig()

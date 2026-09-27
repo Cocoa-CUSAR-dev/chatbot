@@ -1,11 +1,9 @@
 # Free-text → typed-value parsing pipeline
 
-Implements [`text-parsing-pipeline copy.mmd`](<./text-parsing-pipeline%20copy.mmd>)
-— the fixed-parser-only flow actually built here (no LLM fallback in this
-phase). [`text-parsing-pipeline.mmd`](./text-parsing-pipeline.mmd) is the
-earlier, superseded draft that still has an LLM-fallback branch; kept
-alongside as a reasonable starting point for that future phase, not
-something this implementation follows.
+Implements the flow in [`text-parsing-pipeline.mmd`](./text-parsing-pipeline.mmd):
+fixed parser first, then an LLM fallback, then the existing validator.
+([`text-parsing-pipeline copy.mmd`](<./text-parsing-pipeline%20copy.mmd>) is
+the earlier fixed-parser-only phase.)
 
 ## Problem
 
@@ -26,13 +24,17 @@ normalized by this module — still passes through the exact same
 logic that existed before. This module never stores a value validation
 didn't approve, and never invents an answer the farmer didn't give.
 
-It is **not** an LLM step. Per the diagram, the LLM-fallback branch from the
-earlier design discussion was cut from this phase — when the fixed parser
-can't make sense of an answer, the farmer's original text falls through to
-the existing validator/matcher, which rejects it the same way it always
-has. That's a deliberate simplification, not an oversight: the LLM step
-remains a reasonable future phase, on a separate, currently-unwritten
-diagram.
+When the fixed parser can't make sense of an INT/FLOAT/DATE/DATETIME answer,
+`src/conversation/llm_parsing.py` asks the LLM to normalize it. The LLM's
+answer is only a proposal: it still goes through `validate_answer`, so a wrong
+guess is re-asked, never stored. OPTION/BOOLEAN never use the LLM -- they are
+buttons, so an unmatched typed answer is simply re-asked with the same buttons.
+
+LLM fallback rules: skipped when `LLM_API_KEY` is empty; `LLM_TIMEOUT_SECONDS`
+(default 6) bounds the wait; provider failure, timeout, a malformed response or
+a null answer all fall back to the farmer's original text (same as the
+fixed-parser-only behavior). Each parsed answer logs
+`text parse rule_type=... path=fixed|llm|none`.
 
 ## Scope
 
@@ -170,9 +172,6 @@ untouched by this change).
 
 ## Explicitly out of scope (this phase)
 
-- **LLM fallback** for text the fixed parser can't handle — cut from the
-  diagram this implements; a reasonable future phase, not designed further
-  here.
 - **Parent-picker choice matching** (`_handle_parent_answer`) — scoped out
   above; real domain-record labels are the wrong shape for even
   particle-stripping to be obviously safe against without real data to

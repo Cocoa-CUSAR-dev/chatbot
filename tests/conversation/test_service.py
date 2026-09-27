@@ -827,6 +827,80 @@ class TestHandleAnswerValidation:
         session.add.assert_not_called()
         assert conversation.current_question_id == question_id
 
+    async def test_llm_fallback_value_is_validated_and_stored_when_fixed_parse_misses(
+        self,
+    ) -> None:
+        form, question_id = _validated_field_form(_FAN_COUNT_RULE)
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=question_id,
+        )
+        session = _mock_session(answers=[], conversation=conversation)
+
+        with patch(
+            "src.conversation.service.llm_parsing.try_llm_parse",
+            new=AsyncMock(return_value="7"),
+        ) as llm:
+            reply = await service.handle_answer(
+                session, conversation_id=conversation_id, raw_text="กากๆ", form=form
+            )
+
+        llm.assert_awaited_once_with("INT", "กากๆ")
+        assert reply is not None
+        assert reply.substate == ActiveSubstate.AWAITING_CONFIRMATION
+        assert session.add.call_args.args[0].answer == {"text": "7"}
+
+    async def test_llm_value_that_fails_the_fields_rule_is_reasked_not_stored(self) -> None:
+        form, question_id = _validated_field_form(_FAN_COUNT_RULE)
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=question_id,
+        )
+        session = _mock_session(answers=[], conversation=conversation)
+
+        with patch(
+            "src.conversation.service.llm_parsing.try_llm_parse",
+            new=AsyncMock(return_value="999"),
+        ):
+            reply = await service.handle_answer(
+                session, conversation_id=conversation_id, raw_text="กากๆ", form=form
+            )
+
+        assert reply is not None
+        assert reply.substate == ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION
+        assert "กรุณากรอกจำนวนพัดลมเป็นจำนวนเต็ม 0-50" in reply.text
+        session.add.assert_not_called()
+
+    async def test_llm_is_not_called_when_the_fixed_parser_already_succeeded(self) -> None:
+        form, question_id = _validated_field_form(_FAN_COUNT_RULE)
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=question_id,
+        )
+        session = _mock_session(answers=[], conversation=conversation)
+
+        with patch("src.conversation.service.llm_parsing.try_llm_parse", new=AsyncMock()) as llm:
+            await service.handle_answer(
+                session, conversation_id=conversation_id, raw_text="ห้า", form=form
+            )
+
+        llm.assert_not_awaited()
+
     async def test_relative_thai_date_is_normalized_before_storing(self) -> None:
         import datetime
 

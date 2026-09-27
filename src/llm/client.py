@@ -17,19 +17,28 @@ from src.llm.config import llm_settings
 from src.llm.exceptions import LLMUnavailable
 
 
-async def extract_slots[SchemaT: BaseModel](text: str, schema: type[SchemaT]) -> SchemaT:
+async def extract_slots[SchemaT: BaseModel](
+    text: str, schema: type[SchemaT], *, instructions: str | None = None
+) -> SchemaT:
     """Extract whatever `schema`'s fields can be found in `text`.
+
+    `instructions`, when given, is sent as a system message telling the model
+    what it is extracting and how to format it.
 
     Fields the model can't find should come back unset (None) on the schema,
     not raise -- "some slots missing" is a normal, successful result. Only
     genuine provider failure/timeout should raise LLMUnavailable.
     """
+    messages = [{"role": "user", "content": text}]
+    if instructions:
+        messages.insert(0, {"role": "system", "content": instructions})
     try:
         response = await litellm.acompletion(
             model=llm_settings.LLM_MODEL,
             api_key=llm_settings.LLM_API_KEY,
-            messages=[{"role": "user", "content": text}],
+            messages=messages,
             response_format=schema,
+            timeout=llm_settings.LLM_TIMEOUT_SECONDS,
         )
     except Exception as exc:  # noqa: BLE001 -- provider errors are intentionally broad here
         raise LLMUnavailable from exc
