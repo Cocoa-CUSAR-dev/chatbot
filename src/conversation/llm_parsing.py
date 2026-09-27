@@ -53,8 +53,8 @@ async def try_llm_parse(rule_type: str, raw_text: str) -> str | None:
     )
     try:
         result = await extract_slots(raw_text, _ExtractedValue, instructions=instructions)
-    except LLMUnavailable:
-        logger.warning("llm parse unavailable rule_type=%s", rule_type)
+    except LLMUnavailable as exc:
+        logger.warning("llm parse unavailable rule_type=%s cause=%r", rule_type, exc.__cause__)
         return None
     except Exception:  # noqa: BLE001 -- a malformed model response must not break the answer flow
         logger.warning("llm parse returned an unusable response rule_type=%s", rule_type)
