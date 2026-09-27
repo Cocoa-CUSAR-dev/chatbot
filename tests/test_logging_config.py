@@ -26,7 +26,7 @@ def test_filter_puts_the_current_request_id_on_the_record() -> None:
     try:
         record = _record()
         assert RequestIdFilter().filter(record) is True
-        assert record.request_id == "test-request-id-abc"  # type: ignore[attr-defined]
+        assert record.request_id == "test-request-id-abc"
     finally:
         _request_id.reset(token)
 
@@ -36,7 +36,7 @@ def test_filter_falls_back_outside_a_request() -> None:
     # so they have no correlation ID and must still log.
     record = _record()
     assert RequestIdFilter().filter(record) is True
-    assert record.request_id == NO_REQUEST_ID  # type: ignore[attr-defined]
+    assert record.request_id == NO_REQUEST_ID
 
 
 def test_formatted_line_actually_contains_the_id() -> None:

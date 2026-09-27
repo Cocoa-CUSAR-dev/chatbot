@@ -34,7 +34,7 @@ class RequestIdFilter(logging.Filter):
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
-        record.request_id = get_request_id() or NO_REQUEST_ID  # type: ignore[attr-defined]
+        record.request_id = get_request_id() or NO_REQUEST_ID
         return True  # never actually filters anything out
 
 
