@@ -27,6 +27,18 @@ async def test_extract_slots_parses_the_model_response_into_the_schema() -> None
     assert result.plot_id is None
 
 
+async def test_extract_slots_sends_instructions_as_system_message_and_a_timeout() -> None:
+    response = _mock_completion('{"farm_name": null, "plot_id": null}')
+    mock = AsyncMock(return_value=response)
+    with patch("src.llm.client.litellm.acompletion", new=mock):
+        await extract_slots("ข้อความ", _FarmSlots, instructions="be careful")
+
+    kwargs = mock.await_args.kwargs
+    assert kwargs["messages"][0] == {"role": "system", "content": "be careful"}
+    assert kwargs["messages"][1] == {"role": "user", "content": "ข้อความ"}
+    assert kwargs["timeout"] > 0
+
+
 async def test_extract_slots_raises_llm_unavailable_on_provider_failure() -> None:
     with (
         patch(
