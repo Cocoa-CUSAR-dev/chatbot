@@ -9,9 +9,16 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from src.config import settings
 from src.exceptions import ServiceException
 from src.line.router import router as line_router
+from src.logging_config import configure_logging
 from src.notifications.router import router as notifications_router
 from src.reminders.scheduler import configure_jobs, scheduler
 from src.request_id import request_id_middleware
+
+# X-2e: must run before the app is built, and before uvicorn serves its
+# first request, so every log line carries the request ID (see
+# src/logging_config.py for why this has to happen after uvicorn's own
+# logging setup, which it does -- uvicorn imports this module).
+configure_logging()
 
 if not settings.ENVIRONMENT.is_deployed:
     from src.conversation.router import router as conversation_test_router
