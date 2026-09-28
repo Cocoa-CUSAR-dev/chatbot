@@ -1,4 +1,4 @@
-"""ORM models for notify.reminder_schedule / notify.reminder_log -- schema
+"""ORM models for notify.reminder_schedule / reminder_recipient / reminder_log -- schema
 owned by the `database` repo's Flyway migrations (ADR 0005), not created here.
 """
 
@@ -22,6 +22,27 @@ class ReminderSchedule(Base):
     time_of_day: Mapped[time] = mapped_column()
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("auth.user_account.user_id"))
+
+
+class ReminderRecipient(Base):
+    """One targeting rule for a schedule: a whole role (recipient_type
+    'ROLE') or one person ('USER'). A schedule with no rows here reminds
+    everyone who still owes the task -- see users_owing_task in queries.py.
+    """
+
+    __tablename__ = "reminder_recipient"
+    __table_args__ = {"schema": "notify"}
+
+    recipient_id: Mapped[uuid.UUID] = uuid_pk()
+    schedule_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("notify.reminder_schedule.schedule_id")
+    )
+    recipient_type: Mapped[str] = mapped_column(String)
+    role_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("auth.user_account.user_id"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column()
 
 
 class ReminderLog(Base):
