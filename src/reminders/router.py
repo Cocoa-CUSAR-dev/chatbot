@@ -65,15 +65,13 @@ async def create_reminder(
         created_by=body.created_by,
         recipients=body.recipients,
     )
-    return ReminderScheduleResponse(
-        schedule_id=schedule_id,
-        task_id=body.task_id,
-        cadence="DAILY",
-        time_of_day=body.time_of_day,
-        is_active=True,
-        created_by=body.created_by,
-        recipients=body.recipients,
-    )
+    # Read back what was actually persisted rather than echoing the request
+    # body -- create_reminder_schedule's own _dedupe can collapse duplicate
+    # recipient rules (same role/user sent twice), and a caller trusting this
+    # response as ground truth should see the real, deduplicated rows.
+    schedules = await list_schedules_for_task(session, body.task_id)
+    row = next(s for s in schedules if s.schedule_id == schedule_id)
+    return _to_response(row)
 
 
 @router.get("", response_model=list[ReminderScheduleResponse])
