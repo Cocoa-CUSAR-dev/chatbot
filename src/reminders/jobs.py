@@ -49,7 +49,9 @@ async def _run_reminder_check(session: AsyncSession, now: datetime) -> None:
     # comparison doesn't depend on the database session's timezone.
     day_start = naive_now.replace(hour=0, minute=0, second=0, microsecond=0)
     for reminder in due:
-        owing = await users_owing_task(session, reminder.task_id, naive_now)
+        owing = await users_owing_task(
+            session, reminder.task_id, naive_now, schedule_id=reminder.schedule_id
+        )
         if not owing:
             # Nobody left who hasn't submitted this task -- turn the
             # schedule off instead of checking it again every day forever.

@@ -30,6 +30,20 @@ CREATE TABLE auth.user_account (
     CONSTRAINT pk_user_account PRIMARY KEY (user_id)
 );
 
+CREATE TABLE auth.role (
+    role_id uuid DEFAULT gen_random_uuid() NOT NULL,
+    role_name character varying NOT NULL,
+    CONSTRAINT pk_role PRIMARY KEY (role_id)
+);
+
+CREATE TABLE auth.user_role (
+    user_id uuid NOT NULL,
+    role_id uuid NOT NULL,
+    CONSTRAINT pk_user_role PRIMARY KEY (user_id, role_id),
+    CONSTRAINT fk_user_role_user FOREIGN KEY (user_id) REFERENCES auth.user_account (user_id),
+    CONSTRAINT fk_user_role_role FOREIGN KEY (role_id) REFERENCES auth.role (role_id)
+);
+
 CREATE TABLE auth.line_identity (
     line_identity_id uuid NOT NULL DEFAULT gen_random_uuid(),
     user_id uuid NOT NULL,
@@ -120,6 +134,26 @@ CREATE TABLE notify.reminder_schedule (
     CONSTRAINT pk_reminder_schedule PRIMARY KEY (schedule_id),
     CONSTRAINT fk_reminder_schedule_task FOREIGN KEY (task_id) REFERENCES form.task (task_id),
     CONSTRAINT fk_reminder_schedule_user FOREIGN KEY (created_by) REFERENCES auth.user_account (user_id)
+);
+
+CREATE TABLE notify.reminder_recipient (
+    recipient_id uuid NOT NULL DEFAULT gen_random_uuid(),
+    schedule_id uuid NOT NULL,
+    recipient_type character varying NOT NULL,
+    role_id uuid,
+    user_id uuid,
+    created_at timestamp without time zone NOT NULL DEFAULT now(),
+    CONSTRAINT pk_reminder_recipient PRIMARY KEY (recipient_id),
+    CONSTRAINT fk_reminder_recipient_schedule FOREIGN KEY (schedule_id) REFERENCES notify.reminder_schedule (schedule_id) ON DELETE CASCADE,
+    CONSTRAINT fk_reminder_recipient_role FOREIGN KEY (role_id) REFERENCES auth.role (role_id),
+    CONSTRAINT fk_reminder_recipient_user FOREIGN KEY (user_id) REFERENCES auth.user_account (user_id),
+    CONSTRAINT ck_reminder_recipient_type CHECK (recipient_type IN ('ROLE', 'USER')),
+    CONSTRAINT ck_reminder_recipient_target CHECK (
+        (recipient_type = 'ROLE' AND role_id IS NOT NULL AND user_id IS NULL)
+        OR (recipient_type = 'USER' AND user_id IS NOT NULL AND role_id IS NULL)
+    ),
+    CONSTRAINT uq_reminder_recipient_role UNIQUE (schedule_id, role_id),
+    CONSTRAINT uq_reminder_recipient_user UNIQUE (schedule_id, user_id)
 );
 
 CREATE TABLE notify.reminder_log (

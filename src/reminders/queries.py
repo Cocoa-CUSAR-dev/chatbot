@@ -10,11 +10,17 @@ service owns outright (ADR 0005).
 """
 
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, time
 
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.reminders.exceptions import InvalidReminderReference, ReminderNotFound
+from src.reminders.schemas import RecipientRule
 
 
 @dataclass(frozen=True)
@@ -52,10 +58,19 @@ async def due_reminders(session: AsyncSession, now_time: time) -> list[DueRemind
 
 
 async def users_owing_task(
-    session: AsyncSession, task_id: uuid.UUID, now: datetime
+    session: AsyncSession,
+    task_id: uuid.UUID,
+    now: datetime,
+    schedule_id: uuid.UUID | None = None,
 ) -> list[uuid.UUID]:
     """LINE-reachable users who have no form.response for this task, while the
     task is inside its open/close window.
+
+    With a `schedule_id`, also narrowed to the people that schedule is aimed
+    at (notify.reminder_recipient): anyone holding a targeted role, plus any
+    individually targeted user. A schedule with no recipient rows -- every
+    schedule created before recipients existed -- is aimed at everyone, so
+    this behaves exactly as it always did for those.
 
     Scoped to auth.line_identity on purpose: a LINE push is the only delivery
     channel in the MVP (ADR 0006), so users with no linked LINE account are
@@ -72,9 +87,31 @@ async def users_owing_task(
             WHERE r.response_id IS NULL
               AND (t.open_at IS NULL OR t.open_at <= :now)
               AND (t.close_at IS NULL OR t.close_at >= :now)
+              AND (
+                CAST(:schedule_id AS uuid) IS NULL
+                OR NOT EXISTS (
+                  SELECT 1 FROM notify.reminder_recipient rr
+                  WHERE rr.schedule_id = CAST(:schedule_id AS uuid)
+                )
+                OR EXISTS (
+                  SELECT 1 FROM notify.reminder_recipient rr
+                  WHERE rr.schedule_id = CAST(:schedule_id AS uuid)
+                    AND (
+                      rr.user_id = li.user_id
+                      OR rr.role_id IN (
+                        SELECT ur.role_id FROM auth.user_role ur
+                        WHERE ur.user_id = li.user_id
+                      )
+                    )
+                )
+              )
             """
         ),
-        {"task_id": str(task_id), "now": now},
+        {
+            "task_id": str(task_id),
+            "now": now,
+            "schedule_id": str(schedule_id) if schedule_id else None,
+        },
     )
     return [row.user_id for row in rows]
 
@@ -118,8 +155,10 @@ async def create_reminder_schedule(
     task_id: uuid.UUID,
     time_of_day: time,
     created_by: uuid.UUID,
+    recipients: list[RecipientRule] | None = None,
 ) -> uuid.UUID:
-    """Inserts a new notify.reminder_schedule row. cadence is hardcoded to
+    """Inserts a new notify.reminder_schedule row (and its recipient rules,
+    in the same transaction). cadence is hardcoded to
     'DAILY' here, not accepted as a parameter -- due_reminders above only
     ever recognizes that one value, and every other value would be a row
     the job silently never picks up, with no error anywhere to say so. This
@@ -127,21 +166,157 @@ async def create_reminder_schedule(
     can pass a different cadence, because there's nowhere to pass one.
     """
     schedule_id = uuid.uuid4()
+    async with _invalid_reference_guard(session):
+        await session.execute(
+            text(
+                "INSERT INTO notify.reminder_schedule "
+                "(schedule_id, task_id, cadence, time_of_day, is_active, created_by) "
+                "VALUES (:schedule_id, :task_id, 'DAILY', :time_of_day, true, :created_by)"
+            ),
+            {
+                "schedule_id": schedule_id,
+                "task_id": str(task_id),
+                "time_of_day": time_of_day,
+                "created_by": str(created_by),
+            },
+        )
+        await _insert_recipients(session, schedule_id, recipients or [])
+        await session.commit()
+    return schedule_id
+
+
+def _dedupe(recipients: list[RecipientRule]) -> list[RecipientRule]:
+    # notify.reminder_recipient is UNIQUE per (schedule, role) and
+    # (schedule, user) -- collapse repeats here instead of failing on them.
+    return list({(r.type, r.id): r for r in recipients}.values())
+
+
+async def _insert_recipients(
+    session: AsyncSession, schedule_id: uuid.UUID, recipients: list[RecipientRule]
+) -> None:
+    rows = [
+        {
+            "schedule_id": str(schedule_id),
+            "type": r.type,
+            "role_id": str(r.id) if r.type == "ROLE" else None,
+            "user_id": str(r.id) if r.type == "USER" else None,
+        }
+        for r in _dedupe(recipients)
+    ]
+    if not rows:
+        return
     await session.execute(
         text(
-            "INSERT INTO notify.reminder_schedule "
-            "(schedule_id, task_id, cadence, time_of_day, is_active, created_by) "
-            "VALUES (:schedule_id, :task_id, 'DAILY', :time_of_day, true, :created_by)"
+            "INSERT INTO notify.reminder_recipient "
+            "(schedule_id, recipient_type, role_id, user_id) "
+            "VALUES (:schedule_id, :type, CAST(:role_id AS uuid), CAST(:user_id AS uuid))"
         ),
-        {
-            "schedule_id": schedule_id,
-            "task_id": str(task_id),
-            "time_of_day": time_of_day,
-            "created_by": str(created_by),
-        },
+        rows,
     )
-    await session.commit()
-    return schedule_id
+
+
+@asynccontextmanager
+async def _invalid_reference_guard(session: AsyncSession) -> AsyncIterator[None]:
+    """A foreign-key failure (a task/role/user id that doesn't exist) can
+    surface at any INSERT or at commit -- either way, undo the whole write
+    and report it as a bad request rather than a 500.
+    """
+    try:
+        yield
+    except IntegrityError as exc:
+        await session.rollback()
+        raise InvalidReminderReference from exc
+
+
+@dataclass(frozen=True)
+class ScheduleRow:
+    schedule_id: uuid.UUID
+    task_id: uuid.UUID
+    cadence: str
+    time_of_day: time
+    is_active: bool
+    created_by: uuid.UUID
+    recipients: list[RecipientRule]
+
+
+async def _recipients_for(
+    session: AsyncSession, schedule_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, list[RecipientRule]]:
+    if not schedule_ids:
+        return {}
+    rows = await session.execute(
+        text(
+            "SELECT schedule_id, recipient_type, role_id, user_id "
+            "FROM notify.reminder_recipient "
+            "WHERE schedule_id = ANY(CAST(:ids AS uuid[])) "
+            "ORDER BY created_at, recipient_id"
+        ),
+        {"ids": [str(i) for i in schedule_ids]},
+    )
+    grouped: dict[uuid.UUID, list[RecipientRule]] = {}
+    for row in rows:
+        target = row.role_id if row.recipient_type == "ROLE" else row.user_id
+        grouped.setdefault(row.schedule_id, []).append(
+            RecipientRule(type=row.recipient_type, id=target)
+        )
+    return grouped
+
+
+async def list_schedules_for_task(session: AsyncSession, task_id: uuid.UUID) -> list[ScheduleRow]:
+    rows = await session.execute(
+        text(
+            "SELECT schedule_id, task_id, cadence, time_of_day, is_active, created_by "
+            "FROM notify.reminder_schedule WHERE task_id = :task_id ORDER BY schedule_id"
+        ),
+        {"task_id": str(task_id)},
+    )
+    found = [dict(r._mapping) for r in rows]
+    recipients = await _recipients_for(session, [f["schedule_id"] for f in found])
+    return [ScheduleRow(**f, recipients=recipients.get(f["schedule_id"], [])) for f in found]
+
+
+async def update_reminder_schedule(
+    session: AsyncSession,
+    schedule_id: uuid.UUID,
+    *,
+    time_of_day: time | None = None,
+    is_active: bool | None = None,
+    recipients: list[RecipientRule] | None = None,
+) -> ScheduleRow:
+    """Changes only what is passed. `recipients` replaces the whole rule list
+    (empty list = everyone again). Raises ReminderNotFound for an unknown id.
+    """
+    found = await session.execute(
+        text("SELECT task_id FROM notify.reminder_schedule WHERE schedule_id = :id"),
+        {"id": str(schedule_id)},
+    )
+    task_id = found.scalar_one_or_none()
+    if task_id is None:
+        raise ReminderNotFound
+
+    async with _invalid_reference_guard(session):
+        if time_of_day is not None:
+            await session.execute(
+                text(
+                    "UPDATE notify.reminder_schedule SET time_of_day = :t WHERE schedule_id = :id"
+                ),
+                {"t": time_of_day, "id": str(schedule_id)},
+            )
+        if is_active is not None:
+            await session.execute(
+                text("UPDATE notify.reminder_schedule SET is_active = :a WHERE schedule_id = :id"),
+                {"a": is_active, "id": str(schedule_id)},
+            )
+        if recipients is not None:
+            await session.execute(
+                text("DELETE FROM notify.reminder_recipient WHERE schedule_id = :id"),
+                {"id": str(schedule_id)},
+            )
+            await _insert_recipients(session, schedule_id, recipients)
+        await session.commit()
+
+    schedules = await list_schedules_for_task(session, task_id)
+    return next(s for s in schedules if s.schedule_id == schedule_id)
 
 
 async def deactivate_schedule(session: AsyncSession, schedule_id: uuid.UUID) -> None:
