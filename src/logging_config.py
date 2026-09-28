@@ -35,8 +35,20 @@ class JsonFormatter(logging.Formatter):
         }
 
         for key, value in record.__dict__.items():
-            if key not in _RESERVED_ATTRS:
-                payload[key] = value
+            if key in _RESERVED_ATTRS:
+                continue
+            # litellm (src/llm/client.py) stamps a bare `object()` sentinel
+            # (`record.litellm_redacted`) on LogRecords it has already
+            # redacted secrets from -- an internal `is`-identity marker for
+            # its own use, never meant to be read. `type(value) is object`
+            # catches that (and any other library doing the same sentinel
+            # trick) generically, rather than blocklisting attribute names
+            # one at a time: a bare `object()` instance carries no data at
+            # all, so there's nothing to promote either way -- its
+            # json.dumps(default=str) fallback is just its memory address.
+            if type(value) is object:
+                continue
+            payload[key] = value
 
         if record.exc_info:
             payload["exception"] = self.formatException(record.exc_info)
