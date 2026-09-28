@@ -13,6 +13,7 @@ from src.database import async_session_maker
 
 _CLEANUP_TABLES = (
     "notify.reminder_log",
+    "notify.reminder_recipient",
     "notify.reminder_schedule",
     "chat.conversation_answer",
     "chat.conversation",
@@ -21,6 +22,8 @@ _CLEANUP_TABLES = (
     "form.question",
     "form.task_form",
     "form.task",
+    "auth.user_role",
+    "auth.role",
     "auth.user_account",
 )
 

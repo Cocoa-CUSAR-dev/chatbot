@@ -9,6 +9,7 @@ import httpx
 from src.diary.config import diary_settings
 from src.diary.exceptions import DiaryNotAvailable
 from src.exceptions import UpstreamServiceError
+from src.request_id import REQUEST_ID_HEADER, get_request_id
 
 
 async def generate_diary(user_id: str) -> str:
@@ -25,7 +26,10 @@ async def generate_diary(user_id: str) -> str:
         response = await client.post(
             "/service/diaries/generate",
             json={"userId": user_id},
-            headers={"X-Service-Key": diary_settings.KOTLIN_SERVICE_KEY},
+            headers={
+                "X-Service-Key": diary_settings.KOTLIN_SERVICE_KEY,
+                REQUEST_ID_HEADER: get_request_id(),
+            },
         )
 
     if response.status_code == 404:

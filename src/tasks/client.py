@@ -14,6 +14,7 @@ from typing import Any
 import httpx
 
 from src.exceptions import UpstreamServiceError
+from src.request_id import REQUEST_ID_HEADER, get_request_id
 from src.tasks.config import tasks_settings
 from src.tasks.exceptions import HandlerNotSupported
 from src.tasks.schemas import TaskSubmission
@@ -34,7 +35,10 @@ async def submit_task(submission: TaskSubmission) -> None:
         response = await client.post(
             "/service/tasks",
             json=submission.model_dump(),
-            headers={"X-Service-Key": tasks_settings.GO_SERVICE_KEY},
+            headers={
+                "X-Service-Key": tasks_settings.GO_SERVICE_KEY,
+                REQUEST_ID_HEADER: get_request_id(),
+            },
         )
 
     if response.status_code < 400:
@@ -77,7 +81,10 @@ async def fetch_last_answer(*, user_id: str, handler: str) -> dict[str, Any] | N
         response = await client.get(
             "/service/tasks/last-answer",
             params={"user_id": user_id, "handler": handler},
-            headers={"X-Service-Key": tasks_settings.GO_SERVICE_KEY},
+            headers={
+                "X-Service-Key": tasks_settings.GO_SERVICE_KEY,
+                REQUEST_ID_HEADER: get_request_id(),
+            },
         )
 
     if response.status_code == 404:
@@ -113,7 +120,10 @@ async def fetch_sanitized_autofill(
         response = await client.post(
             "/service/autofill/sanitize",
             json={"answer": answer, "questions": questions},
-            headers={"X-Service-Key": tasks_settings.GO_SERVICE_KEY},
+            headers={
+                "X-Service-Key": tasks_settings.GO_SERVICE_KEY,
+                REQUEST_ID_HEADER: get_request_id(),
+            },
         )
 
     if response.status_code >= 400:
