@@ -2,6 +2,7 @@ import os
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
+import sentry_sdk
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -26,9 +27,13 @@ configure_logging()
 if not settings.ENVIRONMENT.is_deployed:
     from src.conversation.router import router as conversation_test_router
 
-# X-2c: install the JSON log handler before uvicorn logs its own startup
-# lines or any router starts logging.
-configure_logging()
+# X-2d: error tracking. An empty SENTRY_DSN (the default) disables the SDK
+# entirely -- no error, no events sent -- safe in local dev/CI.
+sentry_sdk.init(
+    dsn=settings.SENTRY_DSN,
+    environment=settings.SENTRY_ENVIRONMENT,
+    traces_sample_rate=settings.SENTRY_TRACES_SAMPLE_RATE,
+)
 
 # Vercel sets this env var on every deployment automatically. A serverless
 # function there is frozen between requests -- APScheduler's own in-process
