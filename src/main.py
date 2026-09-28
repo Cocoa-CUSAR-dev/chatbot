@@ -26,6 +26,10 @@ configure_logging()
 if not settings.ENVIRONMENT.is_deployed:
     from src.conversation.router import router as conversation_test_router
 
+# X-2c: install the JSON log handler before uvicorn logs its own startup
+# lines or any router starts logging.
+configure_logging()
+
 # Vercel sets this env var on every deployment automatically. A serverless
 # function there is frozen between requests -- APScheduler's own in-process
 # timers never get a chance to fire on schedule (live-caught 2026-09: nothing
