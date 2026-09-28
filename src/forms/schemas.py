@@ -16,4 +16,10 @@ class FormDetail(BaseModel):
     model_config = {"extra": "allow"}
 
     task_form_id: str
+    # form.task_form.is_multiple_submit, reaching us via Kotlin's
+    # Form.Detail. Declared rather than left to extra="allow" so it is typed
+    # and, more importantly, so the default is explicit: a web-backend that
+    # predates the field simply omits it, and False is the safe reading --
+    # one submission per task, exactly as before.
+    is_multiple_submit: bool = False
     sections: list[dict[str, Any]] = []

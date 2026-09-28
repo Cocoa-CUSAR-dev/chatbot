@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from src.config import settings
 from src.exceptions import ServiceException
@@ -12,7 +13,15 @@ from src.internal.router import router as internal_router
 from src.line.router import router as line_router
 from src.logging_config import configure_logging
 from src.notifications.router import router as notifications_router
+from src.reminders.router import router as reminders_router
 from src.reminders.scheduler import configure_jobs, scheduler
+from src.request_id import request_id_middleware
+
+# X-2e: must run before the app is built, and before uvicorn serves its
+# first request, so every log line carries the request ID (see
+# src/logging_config.py for why this has to happen after uvicorn's own
+# logging setup, which it does -- uvicorn imports this module).
+configure_logging()
 
 if not settings.ENVIRONMENT.is_deployed:
     from src.conversation.router import router as conversation_test_router
@@ -56,6 +65,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# X-2e: added last so it's the outermost middleware (Starlette executes
+# middleware in reverse registration order) -- the request ID needs to be
+# set before CORS or anything else in the stack runs.
+app.add_middleware(BaseHTTPMiddleware, dispatch=request_id_middleware)
 
 
 @app.exception_handler(ServiceException)
@@ -70,6 +83,7 @@ async def health() -> dict[str, str]:
 
 app.include_router(line_router)
 app.include_router(notifications_router)
+app.include_router(reminders_router)
 app.include_router(internal_router)
 
 if not settings.ENVIRONMENT.is_deployed:

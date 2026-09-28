@@ -32,6 +32,21 @@ async def test_submit_task_returns_on_success() -> None:
         await submit_task(_SUBMISSION)  # no exception -- success
 
 
+async def test_submit_task_forwards_request_id() -> None:
+    """X-2e: a single farmer action must be traceable across chatbot's and
+    mobile-backend's logs -- confirms the header is actually sent.
+    """
+    with (
+        _patched_client(_mock_response(200)) as mock_client_cls,
+        patch("src.tasks.client.get_request_id", return_value="test-request-id-xyz"),
+    ):
+        await submit_task(_SUBMISSION)
+
+    client = mock_client_cls.return_value
+    _, kwargs = client.post.call_args
+    assert kwargs["headers"]["X-Request-Id"] == "test-request-id-xyz"
+
+
 async def test_submit_task_401_raises_upstream_service_error() -> None:
     with (
         _patched_client(_mock_response(401, {"error": "bad key"})),

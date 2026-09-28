@@ -38,8 +38,10 @@ class PendingTask:
 
 
 async def list_pending_tasks(session: AsyncSession, user_id: UUID) -> list[PendingTask]:
-    """A task is "pending" if this user has no form.response row for it yet --
-    mirrors mobile-backend's real GetTasks logic (form_handler.go), rather
+    """A task is "pending" if this user has no form.response row for it yet,
+    OR its form is multiple-submit (in which case it stays listed no matter
+    how many responses exist -- see the WHERE clause) -- mirrors
+    mobile-backend's real GetTasks logic (form_handler.go), rather
     than form.assignment, which turns out to be unpopulated in this DB
     despite existing in the schema. Deliberately blind to chat.conversation
     status for this filter: a task with an ACTIVE/PAUSED-but-unconfirmed
@@ -63,8 +65,18 @@ async def list_pending_tasks(session: AsyncSession, user_id: UUID) -> list[Pendi
                    ) AS has_conversation
             FROM form.task t
             JOIN form.task_form tf ON tf.task_id = t.task_id
-            LEFT JOIN form.response r ON r.task_log_id = t.task_id AND r.user_id = :user_id
-            WHERE r.response_id IS NULL
+            WHERE (
+                -- A multiple-submit form is the whole point of this change:
+                -- it stays listed after the first submission, because the
+                -- farmer is expected to file several rows against it (three
+                -- grades for one harvest). Dropping it the moment one
+                -- response existed made the second one unreachable.
+                tf.is_multiple_submit
+                OR NOT EXISTS (
+                    SELECT 1 FROM form.response r
+                    WHERE r.task_log_id = t.task_id AND r.user_id = :user_id
+                )
+            )
             ORDER BY t.open_at DESC
             LIMIT :limit
             """
