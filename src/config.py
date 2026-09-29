@@ -28,5 +28,11 @@ class Settings(BaseSettings):
 
     APP_VERSION: str = "0.1.0"
 
+    # Error tracking (X-2d). Blank DSN (the default) disables the SDK
+    # entirely -- safe to leave unset in local dev/CI.
+    SENTRY_DSN: str = ""
+    SENTRY_ENVIRONMENT: str = "local"
+    SENTRY_TRACES_SAMPLE_RATE: float = 0.0
+
 
 settings = Settings()  # type: ignore[call-arg]

@@ -34,7 +34,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.conversation import reuse
+from src.conversation import llm_parsing, reuse, text_parsing
 from src.conversation.constants import ActiveSubstate, AnswerSource, ConversationStatus
 from src.conversation.exceptions import ConversationNotFound
 from src.conversation.models import Conversation, ConversationAnswer
@@ -132,6 +132,11 @@ class Question:
     # unchanged, for every question that never needs more than one page
     # (the vast majority) -- those call sites don't need to change at all.
     all_real_choices: list[Choice] | None = None
+    # form.question.carry_forward (V21). When the farmer taps "➕ เพิ่มอีกรายการ"
+    # on a multi-submit form, start_next_submission copies this question's
+    # answer from the row just submitted instead of asking it again -- e.g.
+    # the plot on a farm_activity form, where only the activity changes.
+    carry_forward: bool = False
 
 
 @dataclass(frozen=True)
@@ -144,6 +149,12 @@ class ConversationReply:
     # lets the caller re-attach the confirm button for a retry instead of
     # treating this as the terminal "saved" message.
     submission_failed: bool = False
+    # True only on a SUCCESSFUL confirm of a multiple-submit form: the
+    # submission saved, but this task expects more rows (three grades for
+    # one harvest), so the caller offers "add another" instead of the
+    # terminal thanks. Same "let the caller attach the right buttons"
+    # pattern as submission_failed above.
+    offer_another: bool = False
     # Debug-only passthrough of the open question's own shape -- None
     # whenever this reply isn't "here's a fixed question to answer" (e.g.
     # confirmation/completed/cancelled replies have no single open question).
@@ -229,6 +240,7 @@ def _question_from_dict(q: dict[str, Any]) -> Question:
         has_constrained_choices=has_constrained_choices,
         validation_rule=q.get("validation_rule"),
         all_real_choices=_constrained_choices_for(q),
+        carry_forward=bool(q.get("carry_forward", False)),
     )
 
 
@@ -671,7 +683,10 @@ async def handle_answer(
         # farmer can't actually see as a button on their current page (or
         # reject one they're genuinely looking at).
         page_choices = _paginate(current_question, conversation.current_page).choices
-        matched = next((c for c in page_choices or [] if c.label == raw_text), None)
+        # Exact match first (unchanged from before text_parsing existed),
+        # then a conservative fuzzy fallback for a close-but-not-exact
+        # phrasing -- see match_choice's own docstring.
+        matched = text_parsing.match_choice(raw_text, page_choices or [])
         if matched is not None and matched.id in (_NEXT_PAGE_CHOICE_ID, _PREV_PAGE_CHOICE_ID):
             # Paging isn't answering -- current_question_id, every
             # already-given answer, and the rest of this question stay
@@ -705,6 +720,13 @@ async def handle_answer(
     # a resolved OPTION/BOOLEAN choice is already constrained to a
     # known-good value by construction (matched against current_question's
     # own choices above).
+    # What actually gets validated and stored -- raw_text unless a fixed
+    # parser below normalizes it (a spelled-out Thai number/date into the
+    # digit/ISO form validate_answer's own INT/FLOAT/DATE/DATETIME
+    # validators expect). Declared before the block below so it's always
+    # defined, including the is_skip/resolved_value/no-open-question cases
+    # that skip that block entirely.
+    text_for_validation = raw_text
     if not is_skip and resolved_value is None and current_question is not None:
         # A mandatory free-text question offers no skip button (see
         # _choices_for), so blank/whitespace-only text is never an
@@ -720,7 +742,41 @@ async def handle_answer(
                 page=conversation.current_page,
                 error="กรุณาตอบคำถามนี้ ไม่สามารถเว้นว่างได้",
             )
-        error = validate_answer(current_question.validation_rule, raw_text)
+
+        # (New) Fixed-parse step (docs/plans/text-parsing-pipeline.md):
+        # for a field whose rule is a type text_parsing knows how to
+        # pre-parse, try that BEFORE validate_answer -- "เก้าร้อย"/"วันนี้"
+        # normalized into "900"/an ISO date, so validate_answer only ever
+        # sees the same digit/ISO shapes it always has. An already-valid
+        # answer (the common case) round-trips through parse_number/
+        # parse_date unchanged -- see those functions' own "already valid"
+        # fast path -- so this never changes behavior for it. On a MISS
+        # (neither library could make sense of it), text_for_validation
+        # simply stays raw_text -- validate_answer rejects that on its own
+        # terms, with the field's own configured error_message, same as it
+        # always has for any other invalid answer. Deliberately NOT a
+        # separate "couldn't understand" message here: that would show
+        # different wording depending on WHY the field rejected the answer,
+        # and (live-caught by this module's own test suite) would override
+        # a field's own more specific guidance with a generic one.
+        rule = current_question.validation_rule
+        rule_type = (rule or {}).get("type")
+        if rule_type in text_parsing.FIXED_PARSE_TYPES:
+            parsed = text_parsing.try_fixed_parse(rule_type, raw_text)
+            parse_path = "fixed"
+            if parsed is None:
+                # Fixed parser couldn't make sense of it -- last resort is
+                # the LLM (llm_parsing.py). Its result still goes through
+                # validate_answer below like any other answer.
+                parsed = await llm_parsing.try_llm_parse(rule_type, raw_text)
+                parse_path = "llm"
+            if parsed is not None:
+                text_for_validation = parsed
+            else:
+                parse_path = "none"
+            logger.info("text parse rule_type=%s path=%s", rule_type, parse_path)
+
+        error = validate_answer(rule, text_for_validation)
         if error is not None:
             return _reply_for_question(
                 conversation_id, current_question, page=conversation.current_page, error=error
@@ -729,7 +785,7 @@ async def handle_answer(
     if is_skip:
         answer: dict[str, Any] = {"skipped": True}
     else:
-        answer = {"text": raw_text}
+        answer = {"text": text_for_validation}
     if resolved_value is not None:
         answer["value"] = resolved_value
 
@@ -877,11 +933,106 @@ async def confirm_conversation(
     conversation.status = ConversationStatus.COMPLETED
     await session.commit()
 
+    # This conversation is done either way -- the row is saved. A
+    # multiple-submit form just isn't finished with the TASK: the farmer is
+    # expected to file several rows against it (grade A, then B, then C), so
+    # offer another instead of closing the conversation out. The caller
+    # attaches the buttons; router.py's "add_another" postback starts the
+    # next one with the parent selection carried forward.
+    if form.is_multiple_submit:
+        return ConversationReply(
+            conversation_id=conversation_id,
+            substate=ActiveSubstate.AWAITING_CONFIRMATION,
+            text="บันทึกข้อมูลเรียบร้อยแล้ว ต้องการเพิ่มอีกรายการสำหรับงานนี้หรือไม่?",
+            offer_another=True,
+        )
+
     return ConversationReply(
         conversation_id=conversation_id,
         substate=ActiveSubstate.AWAITING_CONFIRMATION,
         text="บันทึกข้อมูลเรียบร้อยแล้ว ขอบคุณครับ",
     )
+
+
+async def start_next_submission(
+    session: AsyncSession, *, conversation_id: UUID, form: FormDetail
+) -> ConversationReply:
+    """The "➕ เพิ่มอีกรายการ" half of multi-submit: opens a FRESH conversation
+    on the same task and form as the one just confirmed.
+
+    The point of doing this here rather than routing back through
+    start_conversation is parent_answer. All five handlers that actually
+    want repeat submission are the child-row handlers whose parent FK is NOT
+    NULL, so every row needs its harvest_id/farm_activity_id/batch_id just
+    as much as the first did -- but re-running the parent picker would ask a
+    farmer to re-pick the same harvest before every single grade, which is
+    the difference between a feature and an annoyance. The already-resolved
+    parent_answer is copied forward instead, so the next row starts at the
+    form's first real question.
+
+    Deliberately a new Conversation row rather than reopening the completed
+    one: the finished submission stays exactly as it was submitted, and each
+    row keeps its own answer history.
+    """
+    previous = await session.get(Conversation, conversation_id)
+    if previous is None:
+        raise ConversationNotFound()
+
+    # Only a RESOLVED parent carries forward. A conversation still sitting
+    # on {"pending_kind": ...} never picked one, and copying that would
+    # start the next submission stuck at the picker step.
+    parent_answer = previous.parent_answer
+    if parent_answer is not None and "field_name" not in parent_answer:
+        parent_answer = None
+
+    questions = questions_from_form(form)
+
+    # Carry-forward: questions the form author flagged keep the answer from
+    # the submission just confirmed, so a farmer logging three activities on
+    # one plot picks the plot once. Only answers that actually exist are
+    # copied -- a flagged question the farmer skipped last time is asked.
+    flagged = {q.question_id for q in questions if q.carry_forward}
+    carried = (
+        [
+            row
+            for row in await _answered_rows(session, conversation_id)
+            if row.question_id in flagged
+        ]
+        if flagged
+        else []
+    )
+    answered = {row.question_id for row in carried}
+    first_question = _next_unanswered_required(questions, answered=answered)
+
+    conversation = Conversation(
+        user_id=previous.user_id,
+        task_id=previous.task_id,
+        task_form_id=previous.task_form_id,
+        status=ConversationStatus.ACTIVE,
+        current_question_id=first_question.question_id if first_question else None,
+        parent_answer=parent_answer,
+    )
+    session.add(conversation)
+    await session.flush()
+    for row in carried:
+        session.add(
+            ConversationAnswer(
+                conversation_id=conversation.conversation_id,
+                question_id=row.question_id,
+                answer=row.answer,
+                source=row.source,
+            )
+        )
+    await session.commit()
+    await session.refresh(conversation)
+
+    if first_question is None:
+        return ConversationReply(
+            conversation_id=conversation.conversation_id,
+            substate=ActiveSubstate.AWAITING_CONFIRMATION,
+            text="ไม่มีคำถามที่จำเป็นต้องตอบ ยืนยันการส่งข้อมูลหรือไม่?",
+        )
+    return _reply_for_question(conversation.conversation_id, first_question)
 
 
 async def cancel_conversation(session: AsyncSession, *, conversation_id: UUID) -> ConversationReply:

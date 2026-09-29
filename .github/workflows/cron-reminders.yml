@@ -1,8 +1,11 @@
-# Manually triggers the reminder check from OUTSIDE the process -- needed
-# because this service is deployed to Vercel, where a serverless function is
-# frozen between requests and can never run its own in-process scheduler
-# (src/reminders/scheduler.py) on time. See src/internal/router.py's
-# docstring for the full story.
+# Manual-trigger-only companion to the real external trigger for
+# /internal/cron/reminders, which is cron-job.org, not GitHub Actions --
+# see src/internal/router.py's docstring for why an external trigger is
+# needed at all (Vercel serverless can't run src/reminders/scheduler.py's
+# own in-process scheduler on time). Kept as workflow_dispatch so this
+# endpoint can still be exercised by hand (e.g. while debugging) without
+# also running on its own schedule and double-firing alongside
+# cron-job.org.
 #
 # `schedule:` is disabled -- production scheduling moved to cron-job.org,
 # which hits the same /internal/cron/reminders endpoint with the same

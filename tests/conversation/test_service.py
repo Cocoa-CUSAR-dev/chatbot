@@ -602,6 +602,32 @@ class TestHandleAnswerWithChoices:
         added_answer = session.add.call_args.args[0]
         assert added_answer.answer == {"text": "ใช่", "value": "true"}
 
+    async def test_choice_with_trailing_particle_still_resolves(self) -> None:
+        """text_parsing.match_choice: "ใช่ครับ" resolves to the "ใช่" choice
+        same as an exact "ใช่" would -- the farmer's answer is normal
+        BOOLEAN-question phrasing, not free text that fails to resolve.
+        """
+        form, question_id = _boolean_form()
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=question_id,
+        )
+        session = _mock_session(answers=[], conversation=conversation)
+
+        reply = await service.handle_answer(
+            session, conversation_id=conversation_id, raw_text="ใช่ครับ", form=form
+        )
+
+        assert reply is not None
+        assert reply.substate == ActiveSubstate.AWAITING_CONFIRMATION
+        added_answer = session.add.call_args.args[0]
+        assert added_answer.answer == {"text": "ใช่ครับ", "value": "true"}
+
     async def test_non_matching_answer_reasks_same_question(self) -> None:
         form, question_id = _boolean_form()
         conversation_id = uuid.uuid4()
@@ -743,6 +769,161 @@ class TestHandleAnswerValidation:
         assert "เว้นว่าง" in reply.text
         session.add.assert_not_called()  # blank answer never gets persisted
         assert conversation.current_question_id == q1  # unchanged, still open
+
+    async def test_spelled_out_thai_number_is_normalized_before_storing(self) -> None:
+        """text_parsing's fixed-parse step (docs/plans/text-parsing-
+        pipeline.md): a spelled-out Thai number still has to pass the
+        field's own INT rule afterward, but what gets stored is the
+        normalized digit string, not the words the farmer typed.
+        """
+        form, question_id = _validated_field_form(_FAN_COUNT_RULE)
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=question_id,
+        )
+        session = _mock_session(answers=[], conversation=conversation)
+
+        reply = await service.handle_answer(
+            session, conversation_id=conversation_id, raw_text="ห้า", form=form
+        )
+
+        assert reply is not None
+        assert reply.substate == ActiveSubstate.AWAITING_CONFIRMATION
+        added_answer = session.add.call_args.args[0]
+        assert added_answer.answer == {"text": "5"}
+
+    async def test_unparseable_number_reasks_with_the_fields_own_error_message(self) -> None:
+        """No fixed parser (nor the plain int()/float() fast path) can make
+        sense of "กากๆ" -- text_for_validation falls back to raw_text
+        unchanged, so validate_answer rejects it on its own terms, with the
+        SAME error_message any other invalid answer to this field would
+        get. Deliberately not a different, generic "couldn't understand"
+        message -- see text_parsing.py's module docstring.
+        """
+        form, question_id = _validated_field_form(_FAN_COUNT_RULE)
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=question_id,
+        )
+        session = _mock_session(answers=[], conversation=conversation)
+
+        reply = await service.handle_answer(
+            session, conversation_id=conversation_id, raw_text="กากๆ", form=form
+        )
+
+        assert reply is not None
+        assert reply.substate == ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION
+        assert "กรุณากรอกจำนวนพัดลมเป็นจำนวนเต็ม 0-50" in reply.text
+        session.add.assert_not_called()
+        assert conversation.current_question_id == question_id
+
+    async def test_llm_fallback_value_is_validated_and_stored_when_fixed_parse_misses(
+        self,
+    ) -> None:
+        form, question_id = _validated_field_form(_FAN_COUNT_RULE)
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=question_id,
+        )
+        session = _mock_session(answers=[], conversation=conversation)
+
+        with patch(
+            "src.conversation.service.llm_parsing.try_llm_parse",
+            new=AsyncMock(return_value="7"),
+        ) as llm:
+            reply = await service.handle_answer(
+                session, conversation_id=conversation_id, raw_text="กากๆ", form=form
+            )
+
+        llm.assert_awaited_once_with("INT", "กากๆ")
+        assert reply is not None
+        assert reply.substate == ActiveSubstate.AWAITING_CONFIRMATION
+        assert session.add.call_args.args[0].answer == {"text": "7"}
+
+    async def test_llm_value_that_fails_the_fields_rule_is_reasked_not_stored(self) -> None:
+        form, question_id = _validated_field_form(_FAN_COUNT_RULE)
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=question_id,
+        )
+        session = _mock_session(answers=[], conversation=conversation)
+
+        with patch(
+            "src.conversation.service.llm_parsing.try_llm_parse",
+            new=AsyncMock(return_value="999"),
+        ):
+            reply = await service.handle_answer(
+                session, conversation_id=conversation_id, raw_text="กากๆ", form=form
+            )
+
+        assert reply is not None
+        assert reply.substate == ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION
+        assert "กรุณากรอกจำนวนพัดลมเป็นจำนวนเต็ม 0-50" in reply.text
+        session.add.assert_not_called()
+
+    async def test_llm_is_not_called_when_the_fixed_parser_already_succeeded(self) -> None:
+        form, question_id = _validated_field_form(_FAN_COUNT_RULE)
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=question_id,
+        )
+        session = _mock_session(answers=[], conversation=conversation)
+
+        with patch("src.conversation.service.llm_parsing.try_llm_parse", new=AsyncMock()) as llm:
+            await service.handle_answer(
+                session, conversation_id=conversation_id, raw_text="ห้า", form=form
+            )
+
+        llm.assert_not_awaited()
+
+    async def test_relative_thai_date_is_normalized_before_storing(self) -> None:
+        import datetime
+
+        form, question_id = _validated_field_form({"type": "DATE"})
+        conversation_id = uuid.uuid4()
+        conversation = Conversation(
+            conversation_id=conversation_id,
+            user_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            task_form_id=uuid.uuid4(),
+            status=ConversationStatus.ACTIVE,
+            current_question_id=question_id,
+        )
+        session = _mock_session(answers=[], conversation=conversation)
+
+        reply = await service.handle_answer(
+            session, conversation_id=conversation_id, raw_text="วันนี้", form=form
+        )
+
+        assert reply is not None
+        assert reply.substate == ActiveSubstate.AWAITING_CONFIRMATION
+        added_answer = session.add.call_args.args[0]
+        assert added_answer.answer == {"text": datetime.date.today().isoformat()}
 
     async def test_mandatory_question_with_rule_rejects_blank_answer(self) -> None:
         """Same as above but for a field that DOES have a validation_rule --
@@ -1232,8 +1413,54 @@ class TestConfirmConversation:
             )
 
         assert reply.submission_failed is False
+        assert reply.offer_another is False  # single-submit: terminal, as before
         assert "บันทึกข้อมูลเรียบร้อยแล้ว" in reply.text
         assert conversation.status == ConversationStatus.COMPLETED
+
+    async def test_multi_submit_form_offers_another_instead_of_ending(self) -> None:
+        """A multi-submit task isn't finished when one row saves -- the
+        farmer is expected to file several (three grades for one harvest),
+        so the reply asks rather than closing out.
+        """
+        form, (q1,) = _form(mandatory_flags=[True])
+        form.is_multiple_submit = True
+        conversation_id = uuid.uuid4()
+        conversation = self._conversation(conversation_id)
+        session = _mock_session(answers=[_answer(q1)], conversation=conversation)
+        session.get = AsyncMock(return_value=conversation)
+
+        with patch("src.conversation.service.submit_task", new=AsyncMock()):
+            reply = await service.confirm_conversation(
+                session, conversation_id=conversation_id, form=form
+            )
+
+        assert reply.offer_another is True
+        assert "เพิ่มอีกรายการ" in reply.text
+        # The submission itself still saved and this conversation is done --
+        # "offer another" is about the TASK, not this row.
+        assert reply.submission_failed is False
+        assert conversation.status == ConversationStatus.COMPLETED
+
+    async def test_multi_submit_failure_still_reports_failure_not_another(self) -> None:
+        """offer_another must never mask a failed submission -- otherwise a
+        farmer is invited to add a second row when the first never saved.
+        """
+        form, (q1,) = _form(mandatory_flags=[True])
+        form.is_multiple_submit = True
+        conversation_id = uuid.uuid4()
+        conversation = self._conversation(conversation_id)
+        session = _mock_session(answers=[_answer(q1)], conversation=conversation)
+        session.get = AsyncMock(return_value=conversation)
+
+        failing_submit = AsyncMock(side_effect=UpstreamServiceError("Go returned 500"))
+        with patch("src.conversation.service.submit_task", new=failing_submit):
+            reply = await service.confirm_conversation(
+                session, conversation_id=conversation_id, form=form
+            )
+
+        assert reply.submission_failed is True
+        assert reply.offer_another is False
+        assert conversation.status == ConversationStatus.ACTIVE
 
     async def test_stays_open_and_honest_on_generic_failure(self) -> None:
         form, (q1,) = _form(mandatory_flags=[True])
