@@ -7,10 +7,20 @@
 # also running on its own schedule and double-firing alongside
 # cron-job.org.
 #
-# Requires two repo secrets (Settings > Secrets and variables > Actions):
+# `schedule:` is disabled -- production scheduling moved to cron-job.org,
+# which hits the same /internal/cron/reminders endpoint with the same
+# Authorization: Bearer CRON_SECRET header. Kept as workflow_dispatch only
+# so it's still available to run by hand if ever needed.
+#
+# Requires two repo secrets (Settings > Secrets and variables > Actions),
+# used only when this workflow is run by hand:
 #   CHATBOT_URL   -- the deployed base URL, e.g. https://<project>.vercel.app
 #   CRON_SECRET   -- must match the CRON_SECRET env var set on the Vercel
 #                    project itself (src/internal/config.py)
+#
+# Not needed at all if this service is ever moved to a persistent host
+# (Render, a VM, ...) -- there, scheduler.py's own scheduling just works and
+# neither this workflow nor cron-job.org is required.
 name: Trigger reminder check
 
 on:
