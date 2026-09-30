@@ -82,6 +82,9 @@ def build_follow_event(*, line_user_id: str) -> bytes:
                 "webhookEventId": str(uuid.uuid4()),
                 "deliveryContext": {"isRedelivery": False},
                 "replyToken": str(uuid.uuid4()),
+                # Required by the SDK's own FollowEvent model: LINE sends it
+                # to say whether this is a first-time add or an unblock.
+                "follow": {"isUnblocked": False},
             }
         ],
     }

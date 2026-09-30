@@ -305,10 +305,7 @@ async def _handle_event(event: Event) -> None:
     if isinstance(event, MessageEvent):
         await _handle_message(event)
     elif isinstance(event, FollowEvent):
-        # TODO: hand off to src.conversation / whatever identity-linking
-        # mechanism the team lands on for ADR 0002 -- this is a farmer
-        # adding the OA as a friend for the first time.
-        logger.info("follow event, user_id=%s", event.source.user_id)
+        await _handle_follow(event)
     elif isinstance(event, PostbackEvent):
         await _handle_postback(event)
     else:
@@ -386,6 +383,29 @@ async def _reply_for_intent(
         Intent.OFF_TOPIC: messages.OFF_TOPIC,
     }.get(result.intent, messages.START_HINT)
     await reply_text(reply_token, text, quick_reply=messages.START_QUICK_REPLY)
+
+
+async def _handle_follow(event: FollowEvent) -> None:
+    """A farmer just added the OA as a friend (US2-11 / docs-and-plan#185).
+
+    Previously this only logged, so the farmer's first ever interaction with
+    the bot was silence, and nothing told them what it is for or what to type.
+    A reply is used rather than a push: the follow event carries a reply
+    token, and replies don't spend the monthly push quota.
+
+    An unlinked farmer is pointed at a human on purpose. HOW a LINE account
+    gets linked is ADR 0002, still undecided -- inventing a procedure here
+    would be a promise this service can't keep.
+    """
+    user_id = await _resolve_user_id(event.source.user_id)
+    if user_id is None:
+        await reply_text(event.reply_token, messages.WELCOME_NOT_LINKED)
+        return
+    await reply_text(
+        event.reply_token,
+        messages.WELCOME_NEW_FRIEND,
+        quick_reply=messages.START_QUICK_REPLY,
+    )
 
 
 async def _reply_unsupported_message_type(event: MessageEvent) -> None:
