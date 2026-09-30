@@ -1,7 +1,5 @@
-import asyncio
 import logging
-from collections.abc import Coroutine
-from typing import Annotated, Any
+from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends
@@ -47,30 +45,27 @@ logger = logging.getLogger(__name__)
 
 _QUICK_REPLY_LIMIT = 13  # LINE's own cap on Quick Reply items per message
 
-# US2-6 (docs-and-plan#130): asyncio.create_task's result has no strong
-# reference by default, so Python is free to garbage-collect a fire-and-
-# forget task mid-execution -- this set is exactly what asyncio's own docs
-# recommend to prevent that, cleared via the done-callback once each task
-# actually finishes.
-_background_tasks: set[asyncio.Task[None]] = set()
-
-
-def _fire_and_forget(coro: Coroutine[Any, None, None]) -> None:
-    task = asyncio.create_task(coro)
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
-
 
 async def _generate_and_push_diary(user_id: str, line_user_id: str) -> None:
-    """US2-6 (docs-and-plan#130, #132, #133): fired without awaiting from the
-    confirm postback handler below, so the quick ack (reply_flex) isn't
-    delayed by web-backend's LLM polish pass. Errors are logged and
+    """US2-6 (docs-and-plan#130, #132, #133): awaited directly from both
+    postback handlers below (single-submit confirm, and finish_multi), not
+    fired as a background task -- confirmed live 2026-09-30: this service
+    runs on Vercel, which freezes a function the moment it returns its
+    response, so a detached asyncio.create_task never got a chance to run
+    (Gemini showed zero usage; the diary card never arrived). Same root
+    cause the reminders/pause-sweep jobs hit before (see git log for "fix:
+    trigger reminder/pause jobs externally instead of relying on
+    APScheduler") -- background work after responding doesn't survive on
+    this host. The quick ack/finish reply still reaches the farmer
+    immediately regardless, since those are their own calls to LINE's API,
+    not the webhook's own HTTP response -- only the webhook request itself
+    now stays open until the diary card is pushed. Errors are logged and
     swallowed -- confirm_conversation's own submit_task has already
     succeeded by the time this runs, so a diary that fails to generate
     means no follow-up card, not a failed submission.
 
-    push_flex, not reply_flex: the reply token from the original confirm
-    postback is long gone by the time the LLM polish pass finishes.
+    push_flex, not reply_flex: the reply token from the original postback
+    is long gone by the time the LLM polish pass finishes.
     """
     try:
         diary_text = await generate_diary(user_id)
@@ -448,11 +443,10 @@ async def _handle_postback(event: PostbackEvent) -> None:
         # pointing at an already-completed conversation.
         #
         # US2-6: sent via reply_flex, not reply_text, so this ack and the
-        # diary card pushed a few seconds later (once generation finishes)
-        # read as the same kind of message rather than plain text followed
-        # by a Flex card.
+        # diary card pushed once generation finishes read as the same kind
+        # of message rather than plain text followed by a Flex card.
         await reply_flex(event.reply_token, reply.text, build_quick_ack_flex(reply.text))
-        _fire_and_forget(_generate_and_push_diary(str(conversation.user_id), event.source.user_id))
+        await _generate_and_push_diary(str(conversation.user_id), event.source.user_id)
     elif action == "add_another":
         # Multi-submit loop: open the next submission on the same task and
         # form, with the parent selection carried forward so the farmer
@@ -486,9 +480,7 @@ async def _handle_postback(event: PostbackEvent) -> None:
             conversation = await session.get(Conversation, UUID(conversation_id))
         await reply_text(event.reply_token, "บันทึกข้อมูลครบแล้ว ขอบคุณครับ")
         if conversation is not None:
-            _fire_and_forget(
-                _generate_and_push_diary(str(conversation.user_id), event.source.user_id)
-            )
+            await _generate_and_push_diary(str(conversation.user_id), event.source.user_id)
     elif action == "edit":
         # US2-6: shows a picker of every already-answered (or skipped)
         # question rather than asking which field by name -- same
