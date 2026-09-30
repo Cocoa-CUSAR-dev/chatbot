@@ -78,6 +78,54 @@ async def test_push_text_sends_a_push_message() -> None:
     request = messaging_api.push_message.await_args.args[0]
     assert request.to == "Uabc123"
     assert request.messages[0].text == "เตือนความจำ"
+    assert request.messages[0].quick_reply is None
+
+
+async def test_push_text_with_quick_reply_attaches_the_buttons() -> None:
+    ctx1, ctx2, messaging_api = _patched_messaging_api()
+
+    with ctx1, ctx2:
+        await service.push_text("Uabc123", "เลือกคำตอบ", [QuickReplyOption(label="ใช่", text="ใช่")])
+
+    request = messaging_api.push_message.await_args.args[0]
+    assert request.messages[0].quick_reply.items[0].action.label == "ใช่"
+
+
+async def test_push_confirm_prompt_offers_confirm_edit_and_cancel() -> None:
+    # push twin of reply_confirm_prompt (docs-and-plan#176: the LIFF to-do
+    # list's "one-tap open" resumes/starts a conversation outside any
+    # reply-token window) -- same three Postback buttons, sent via push.
+    ctx1, ctx2, messaging_api = _patched_messaging_api()
+    conversation_id = uuid.uuid4()
+
+    with ctx1, ctx2:
+        await service.push_confirm_prompt("Uabc123", "ยืนยันไหม?", conversation_id)
+
+    request = messaging_api.push_message.await_args.args[0]
+    assert request.to == "Uabc123"
+    items = request.messages[0].quick_reply.items
+    assert [item.action.data for item in items] == [
+        f"confirm:{conversation_id}",
+        f"edit:{conversation_id}",
+        f"cancel:{conversation_id}",
+    ]
+
+
+async def test_push_autofill_offer_offers_reuse_or_fresh() -> None:
+    ctx1, ctx2, messaging_api = _patched_messaging_api()
+
+    with ctx1, ctx2:
+        await service.push_autofill_offer(
+            "Uabc123", task_id="t1", task_form_id="tf1", handler="farm_activity"
+        )
+
+    request = messaging_api.push_message.await_args.args[0]
+    assert request.to == "Uabc123"
+    items = request.messages[0].quick_reply.items
+    assert [item.action.data for item in items] == [
+        "start_autofill:yes:t1:tf1:farm_activity",
+        "start_autofill:no:t1:tf1:farm_activity",
+    ]
 
 
 async def test_multicast_text_sends_to_every_recipient() -> None:
