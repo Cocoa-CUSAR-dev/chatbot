@@ -13,10 +13,12 @@ from linebot.v3.webhooks import (
     TextMessageContent,
 )
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.conversation import reuse, service, text_parsing
+from src.conversation import intent, reuse, service, text_parsing
 from src.conversation.constants import ActiveSubstate, ConversationStatus
 from src.conversation.exceptions import ConversationNotFound
+from src.conversation.intent import Intent
 from src.conversation.models import Conversation
 from src.database import async_session_maker
 from src.diary.client import generate_diary
@@ -313,6 +315,79 @@ async def _handle_event(event: Event) -> None:
         logger.info("unhandled event type: %s", type(event).__name__)
 
 
+async def _reply_task_list(
+    reply_token: str,
+    session: AsyncSession,
+    user_id: UUID,
+    *,
+    only_title: str | None = None,
+) -> None:
+    """The one implementation of "show this farmer their tasks", shared by the
+    exact start keyword and by a classified SHOW_TASKS (US2-11 #184).
+
+    Shared on purpose: the keyword path pauses whatever was ACTIVE first
+    (US2-3), and a second copy of this would sooner or later forget to. Here
+    nothing can be active -- the caller only reaches the classifier when there
+    is no ACTIVE conversation -- so the pause is a no-op on that path, which
+    is exactly why it is safe to keep identical.
+
+    only_title narrows the list to the single task the farmer named
+    ("อยากกรอกเก็บเกี่ยว"). It is a filter over the same query, never a
+    different one -- and if it somehow matches nothing, the farmer gets the
+    full list rather than an empty one.
+    """
+    await service.pause_active_conversation(session, user_id=user_id)
+
+    # TEMPORARY (see src/line/temp_task_picker.py): Boom's real LIFF to-do
+    # list is Sprint 5. Until then, pending tasks come back as Quick Reply
+    # buttons instead of leaving the farmer stuck.
+    tasks = await temp_task_picker.list_pending_tasks(session, user_id)
+    if only_title is not None:
+        tasks = [task for task in tasks if task.title == only_title] or tasks
+    if not tasks:
+        await reply_text(reply_token, messages.NO_PENDING_TASKS)
+        return
+    await reply_task_choices(reply_token, "เลือกงานที่ต้องการทำ:", tasks)
+
+
+async def _reply_for_intent(
+    reply_token: str,
+    session: AsyncSession,
+    user_id: UUID,
+    result: intent.IntentResult,
+    task_titles: list[str],
+) -> None:
+    """Turns a classified intent into one of the flows that already exists
+    (US2-11 #184).
+
+    Two things this deliberately never does. It never starts a form:
+    SHOW_TASKS ends at the same Quick Reply buttons the keyword produces, so
+    the worst a misclassification can cost is one unwanted list, never a
+    conversation the farmer didn't ask for. And it never sends text the model
+    wrote -- every non-task branch is a fixed string from src/line/messages.py,
+    chosen by the intent, so a farmer can't be told something nobody on the
+    team has read (no weather, no prices, no agronomy advice).
+
+    UNKNOWN is also what every classifier failure returns, so this last branch
+    is the bot's pre-US2-11 behaviour, unchanged.
+    """
+    if result.intent is Intent.SHOW_TASKS:
+        await _reply_task_list(
+            reply_token,
+            session,
+            user_id,
+            only_title=intent.match_task_hint(result.task_hint, task_titles),
+        )
+        return
+
+    text = {
+        Intent.GREETING: messages.WELCOME_BACK,
+        Intent.HELP: messages.HELP,
+        Intent.OFF_TOPIC: messages.OFF_TOPIC,
+    }.get(result.intent, messages.START_HINT)
+    await reply_text(reply_token, text, quick_reply=messages.START_QUICK_REPLY)
+
+
 async def _reply_unsupported_message_type(event: MessageEvent) -> None:
     """#186 item 2: every non-text message type used to be logged and
     silently dropped, so a farmer who sent a sticker, a photo or their
@@ -367,17 +442,11 @@ async def _handle_message(event: MessageEvent) -> None:
                 # as a literal answer, which pausing-instead-of-getting-
                 # stuck no longer needs). Cancel itself is untouched, still
                 # its own explicit action via the confirm prompt's button.
-                await service.pause_active_conversation(session, user_id=user_id)
-
-                # TEMPORARY (see src/line/temp_task_picker.py): Boom's real
-                # LIFF to-do list is Sprint 5, ~2 months out as of when this
-                # was written. Until then, a keyword lists pending tasks as
-                # Quick Reply buttons instead of leaving the farmer stuck.
-                tasks = await temp_task_picker.list_pending_tasks(session, user_id)
-                if not tasks:
-                    await reply_text(event.reply_token, messages.NO_PENDING_TASKS)
-                    return
-                await reply_task_choices(event.reply_token, "เลือกงานที่ต้องการทำ:", tasks)
+                #
+                # US2-11: the exact keyword keeps its own branch ahead of the
+                # classifier -- free, instant, and never at the mercy of a
+                # provider being up.
+                await _reply_task_list(event.reply_token, session, user_id)
                 return
 
             result = await session.execute(
@@ -388,7 +457,19 @@ async def _handle_message(event: MessageEvent) -> None:
             )
             conversation = result.scalars().first()
             if conversation is None:
-                await reply_text(event.reply_token, messages.START_HINT)
+                # US2-11 (#184): the only branch this story replaces. Every
+                # OTHER path above stays exactly as it was -- in particular
+                # an ACTIVE conversation never reaches the classifier, so a
+                # real answer like "เริ่มเก็บเกี่ยววันนี้" is still an answer.
+                tasks = await temp_task_picker.list_pending_tasks(session, user_id)
+                classified = await intent.classify(message.text, [task.title for task in tasks])
+                await _reply_for_intent(
+                    event.reply_token,
+                    session,
+                    user_id,
+                    classified,
+                    [task.title for task in tasks],
+                )
                 return
 
             # docs-and-plan#189. The pause label is deliberately excluded:

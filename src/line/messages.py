@@ -43,3 +43,37 @@ UNSUPPORTED_MESSAGE_TYPE_IN_FORM = "ตอนนี้ยังรับได�
 # which was simply untrue -- the conversation was alive and waiting for a
 # button. Unrecognised text now re-shows the summary with this line on top.
 PRESS_A_BUTTON = "กรุณากดปุ่มด้านล่างครับ"
+
+# US2-11 (#184/#185). All three are canned: a farmer must never receive
+# LLM-authored prose from this bot, because anything it writes freely is
+# something the team can't review -- the classifier picks WHICH fixed message
+# to send, never what it says.
+WELCOME_BACK = f"สวัสดีครับ 🍫 น้องโกโก้พร้อมช่วยบันทึกข้อมูลแปลงของคุณแล้ว {START_HINT}"
+
+# The what-can-you-do answer. Deliberately a list of the things the farmer
+# can actually type or tap, not a description of the system.
+HELP = (
+    "น้องโกโก้ช่วยบันทึกข้อมูลแปลงตามแบบฟอร์มที่นักวิจัยกำหนดไว้ครับ\n"
+    f"- {START_HINT}\n"
+    "- กดปุ่มงานที่ต้องการ แล้วตอบคำถามทีละข้อ\n"
+    '- ระหว่างตอบ กด "⏸️ พักไว้ก่อน" เพื่อหยุดไว้ก่อน คำตอบที่ตอบแล้วจะถูกเก็บไว้\n'
+    "- ตอบครบแล้วจะมีสรุปให้ตรวจ กดยืนยัน แก้ไข หรือยกเลิกได้\n"
+    "- ถ้าติดปัญหา ติดต่อนักวิจัยประจำแปลงได้เลยครับ"
+)
+
+# Weather, prices, agronomy, anything else -- declined, never answered. The
+# bot has no grounding for those and a wrong answer here reaches a farmer's
+# actual crop.
+OFF_TOPIC = (
+    "ขอโทษครับ น้องโกโก้ช่วยได้เฉพาะเรื่องการบันทึกข้อมูลแปลงเท่านั้น "
+    f"เรื่องอื่นรบกวนสอบถามนักวิจัยประจำแปลงนะครับ {START_HINT}"
+)
+
+# FollowEvent (#185) -- a farmer who just added the OA as a friend.
+WELCOME_NEW_FRIEND = f"ยินดีต้อนรับครับ 🍫 น้องโกโก้เป็นผู้ช่วยบันทึกข้อมูลแปลงโกโก้ของคุณ {START_HINT}"
+# ADR 0002 (how a LINE account gets linked) is still undecided, so this
+# deliberately points at a human instead of inventing a linking procedure.
+WELCOME_NOT_LINKED = (
+    "ยินดีต้อนรับครับ 🍫 บัญชี LINE นี้ยังไม่ได้เชื่อมกับบัญชีในระบบ "
+    "กรุณาติดต่อนักวิจัยประจำแปลงเพื่อเชื่อมบัญชีก่อนเริ่มใช้งานนะครับ"
+)
