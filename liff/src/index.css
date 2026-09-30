@@ -1,0 +1,30 @@
+:root {
+  --text: #3d3a42;
+  --text-muted: #8a8691;
+  --bg: #f7f6f9;
+  --card-bg: #fff;
+  --border: #e5e4e7;
+  --accent: #06c755; /* LINE's own brand green -- this app only ever runs inside LINE */
+  --overdue: #e0483e;
+  --shadow: rgba(0, 0, 0, 0.06) 0 2px 8px;
+
+  font: 16px/1.5 system-ui, "Segoe UI", Roboto, sans-serif;
+  color-scheme: light;
+  color: var(--text);
+  background: var(--bg);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+#root {
+  max-width: 480px; /* LIFF views are always a phone-width webview */
+  margin: 0 auto;
+  min-height: 100svh;
+  padding: 1rem;
+}
