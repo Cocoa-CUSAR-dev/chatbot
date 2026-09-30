@@ -1,0 +1,201 @@
+.page {
+  padding: 1.25rem 1.125rem 2.5rem;
+}
+
+.header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 1.25rem;
+}
+
+.header h1 {
+  font-size: 1.375rem;
+  font-weight: 700;
+  margin: 0;
+  letter-spacing: -0.01em;
+}
+
+.header .count {
+  font-size: 0.8125rem;
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.card {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.125rem 1.125rem 1rem;
+  margin-bottom: 0.875rem;
+  box-shadow: var(--shadow);
+  animation: fade-slide-in 0.32s cubic-bezier(0.16, 1, 0.3, 1) backwards;
+}
+
+.card-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.card-title {
+  font-size: 1.0625rem;
+  font-weight: 600;
+  line-height: 1.35;
+  margin: 0;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.25rem 0.6rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.badge svg {
+  font-size: 0.9rem;
+}
+
+.badge--not-started {
+  background: #eeece7;
+  color: var(--text-muted);
+}
+
+.badge--in-progress {
+  background: var(--progress-tint);
+  color: var(--progress);
+}
+
+.badge--overdue {
+  background: var(--overdue-tint);
+  color: var(--overdue);
+}
+
+.due-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-top: 0.5rem;
+  color: var(--text-muted);
+  font-size: 0.875rem;
+}
+
+.due-row svg {
+  font-size: 1rem;
+  flex-shrink: 0;
+}
+
+.due-row.due-row--overdue {
+  color: var(--overdue);
+}
+
+.open-button {
+  margin-top: 1rem;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  padding: 0.75rem;
+  border-radius: var(--radius-sm);
+  border: none;
+  background: var(--primary);
+  color: #fff;
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    transform 0.12s ease,
+    background 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.open-button:hover:not(:disabled) {
+  background: var(--primary-dark);
+}
+
+.open-button:active:not(:disabled) {
+  transform: scale(0.98);
+}
+
+.open-button:disabled {
+  opacity: 0.65;
+  cursor: default;
+}
+
+.open-button .spinner {
+  animation: spin 0.7s linear infinite;
+}
+
+.skeleton-card {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.125rem;
+  margin-bottom: 0.875rem;
+}
+
+.skeleton-line {
+  height: 0.9rem;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #eeece7 25%, #f5f3ef 37%, #eeece7 63%);
+  background-size: 400% 100%;
+  animation: shimmer 1.4s ease infinite;
+}
+
+.center-state {
+  text-align: center;
+  padding: 3.5rem 1.5rem;
+  color: var(--text-muted);
+}
+
+.center-state .icon-wrap {
+  width: 3.5rem;
+  height: 3.5rem;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0 auto 1rem;
+  font-size: 1.75rem;
+}
+
+.center-state.empty .icon-wrap {
+  background: var(--primary-tint);
+  color: var(--primary-dark);
+}
+
+.center-state.error .icon-wrap {
+  background: var(--overdue-tint);
+  color: var(--overdue);
+}
+
+.center-state p {
+  margin: 0;
+  font-size: 0.9375rem;
+  line-height: 1.55;
+}
+
+.retry-button {
+  margin-top: 1.25rem;
+  padding: 0.625rem 1.5rem;
+  border-radius: 999px;
+  border: 1.5px solid var(--border);
+  background: var(--card-bg);
+  color: var(--text);
+  font-size: 0.9375rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color 0.15s ease;
+}
+
+.retry-button:hover {
+  border-color: var(--primary);
+  color: var(--primary-dark);
+}

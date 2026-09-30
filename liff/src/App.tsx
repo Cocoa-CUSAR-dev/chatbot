@@ -1,5 +1,14 @@
 import { useCallback, useEffect, useState } from "react";
+import "./App.css";
 import { fetchPendingTasks, startTask } from "./api";
+import {
+  AlertIcon,
+  ArrowRightIcon,
+  CalendarIcon,
+  CircleDotIcon,
+  ProgressIcon,
+  SproutIcon,
+} from "./icons";
 import { closeLiffWindow, ensureLiffReady } from "./liffClient";
 import type { PendingTask, TaskStatus } from "./types";
 
@@ -8,11 +17,16 @@ type LoadState =
   | { phase: "error"; message: string }
   | { phase: "ready"; tasks: PendingTask[] };
 
-const STATUS_LABEL: Record<TaskStatus, string> = {
-  NOT_STARTED: "ยังไม่เริ่ม",
-  IN_PROGRESS: "กำลังทำ",
-  OVERDUE: "เลยกำหนดแล้ว",
-  COMPLETED: "เสร็จแล้ว", // server already filters this out; kept for completeness
+const STATUS_META: Record<
+  TaskStatus,
+  { label: string; badgeClass: string; icon: typeof CircleDotIcon }
+> = {
+  NOT_STARTED: { label: "ยังไม่เริ่ม", badgeClass: "badge--not-started", icon: CircleDotIcon },
+  IN_PROGRESS: { label: "กำลังทำ", badgeClass: "badge--in-progress", icon: ProgressIcon },
+  OVERDUE: { label: "เลยกำหนดแล้ว", badgeClass: "badge--overdue", icon: AlertIcon },
+  // Server already filters COMPLETED out of this list; kept for type
+  // completeness rather than assuming it can never appear.
+  COMPLETED: { label: "เสร็จแล้ว", badgeClass: "badge--not-started", icon: CircleDotIcon },
 };
 
 function formatCloseAt(closeAt: string | null): string | null {
@@ -22,63 +36,57 @@ function formatCloseAt(closeAt: string | null): string | null {
   return date.toLocaleDateString("th-TH", { day: "numeric", month: "short", year: "numeric" });
 }
 
+function TaskCardSkeleton({ delay }: { delay: number }) {
+  return (
+    <div className="skeleton-card" style={{ animationDelay: `${delay}ms` }}>
+      <div className="skeleton-line" style={{ width: "70%", marginBottom: "0.6rem" }} />
+      <div className="skeleton-line" style={{ width: "40%", height: "0.75rem" }} />
+    </div>
+  );
+}
+
 function TaskCard({
   task,
+  index,
   onOpen,
   opening,
 }: {
   task: PendingTask;
+  index: number;
   onOpen: (task: PendingTask) => void;
   opening: boolean;
 }) {
+  const meta = STATUS_META[task.status];
+  const StatusIcon = meta.icon;
   const closeAtLabel = formatCloseAt(task.close_at);
+
   return (
-    <div
-      style={{
-        background: "var(--card-bg)",
-        border: "1px solid var(--border)",
-        borderRadius: "0.75rem",
-        padding: "1rem",
-        marginBottom: "0.75rem",
-        boxShadow: "var(--shadow)",
-      }}
-    >
-      <div style={{ display: "flex", justifyContent: "space-between", gap: "0.5rem" }}>
-        <strong style={{ fontSize: "1.05rem" }}>{task.title}</strong>
-        <span
-          style={{
-            fontSize: "0.75rem",
-            whiteSpace: "nowrap",
-            color: task.status === "OVERDUE" ? "var(--overdue)" : "var(--text-muted)",
-            fontWeight: task.status === "OVERDUE" ? 600 : 400,
-          }}
-        >
-          {STATUS_LABEL[task.status]}
+    <div className="card" style={{ animationDelay: `${index * 60}ms` }}>
+      <div className="card-top">
+        <p className="card-title">{task.title}</p>
+        <span className={`badge ${meta.badgeClass}`}>
+          <StatusIcon aria-hidden />
+          {meta.label}
         </span>
       </div>
       {closeAtLabel && (
-        <p style={{ color: "var(--text-muted)", fontSize: "0.875rem", margin: "0.25rem 0 0" }}>
-          กำหนดส่ง: {closeAtLabel}
-        </p>
+        <div className={`due-row ${task.status === "OVERDUE" ? "due-row--overdue" : ""}`}>
+          <CalendarIcon aria-hidden />
+          กำหนดส่ง {closeAtLabel}
+        </div>
       )}
-      <button
-        onClick={() => onOpen(task)}
-        disabled={opening}
-        style={{
-          marginTop: "0.75rem",
-          width: "100%",
-          padding: "0.625rem",
-          borderRadius: "0.5rem",
-          border: "none",
-          background: "var(--accent)",
-          color: "#fff",
-          fontSize: "1rem",
-          fontWeight: 600,
-          cursor: opening ? "default" : "pointer",
-          opacity: opening ? 0.6 : 1,
-        }}
-      >
-        {opening ? "กำลังเปิด..." : "เปิด"}
+      <button className="open-button" onClick={() => onOpen(task)} disabled={opening}>
+        {opening ? (
+          <>
+            <ProgressIcon className="spinner" aria-hidden />
+            กำลังเปิด...
+          </>
+        ) : (
+          <>
+            เปิด
+            <ArrowRightIcon aria-hidden />
+          </>
+        )}
       </button>
     </div>
   );
@@ -124,36 +132,58 @@ function App() {
     }
   }, []);
 
-  if (state.phase === "loading") {
-    return <p style={{ textAlign: "center", marginTop: "2rem" }}>กำลังโหลด...</p>;
-  }
-
-  if (state.phase === "error") {
-    return (
-      <div style={{ textAlign: "center", marginTop: "2rem" }}>
-        <p style={{ color: "var(--overdue)" }}>{state.message}</p>
-        <button onClick={load} style={{ marginTop: "0.5rem" }}>
-          ลองใหม่
-        </button>
-      </div>
-    );
-  }
-
-  if (state.tasks.length === 0) {
-    return <p style={{ textAlign: "center", marginTop: "2rem" }}>ไม่มีงานที่ต้องทำในตอนนี้ 🎉</p>;
-  }
-
   return (
-    <div>
-      <h1 style={{ fontSize: "1.25rem", margin: "0 0 1rem" }}>งานที่ต้องทำ</h1>
-      {state.tasks.map((task) => (
-        <TaskCard
-          key={task.task_id}
-          task={task}
-          onOpen={handleOpen}
-          opening={openingTaskId === task.task_id}
-        />
-      ))}
+    <div className="page">
+      <div className="header">
+        <h1>งานที่ต้องทำ</h1>
+        {state.phase === "ready" && (
+          <span className="count">{state.tasks.length} รายการ</span>
+        )}
+      </div>
+
+      {state.phase === "loading" && (
+        <>
+          <TaskCardSkeleton delay={0} />
+          <TaskCardSkeleton delay={80} />
+          <TaskCardSkeleton delay={160} />
+        </>
+      )}
+
+      {state.phase === "error" && (
+        <div className="center-state error">
+          <div className="icon-wrap">
+            <AlertIcon aria-hidden />
+          </div>
+          <p>{state.message}</p>
+          <button className="retry-button" onClick={load}>
+            ลองใหม่
+          </button>
+        </div>
+      )}
+
+      {state.phase === "ready" && state.tasks.length === 0 && (
+        <div className="center-state empty">
+          <div className="icon-wrap">
+            <SproutIcon aria-hidden />
+          </div>
+          <p>
+            ไม่มีงานที่ต้องทำในตอนนี้
+            <br />
+            พักได้เลย 🌱
+          </p>
+        </div>
+      )}
+
+      {state.phase === "ready" &&
+        state.tasks.map((task, index) => (
+          <TaskCard
+            key={task.task_id}
+            task={task}
+            index={index}
+            onOpen={handleOpen}
+            opening={openingTaskId === task.task_id}
+          />
+        ))}
     </div>
   );
 }
