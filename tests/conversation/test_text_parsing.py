@@ -112,3 +112,24 @@ class TestTryFixedParse:
         result = text_parsing.try_fixed_parse("DATETIME", "2026-09-17")
         assert result is not None
         assert result.startswith("2026-09-17")
+
+
+class TestStripTrailingParticles:
+    """Public since docs-and-plan#189 -- the router's confirmation-step word
+    matching needs the same notion of "the same word, politely" that
+    match_choice uses, rather than its own copy of the particle tuple.
+    """
+
+    def test_strips_one_particle(self) -> None:
+        assert text_parsing.strip_trailing_particles("ยืนยันครับ") == "ยืนยัน"
+
+    def test_strips_stacked_particles_longest_first(self) -> None:
+        assert text_parsing.strip_trailing_particles("ตกลงนะครับ") == "ตกลง"
+
+    def test_leaves_text_without_particles_alone(self) -> None:
+        assert text_parsing.strip_trailing_particles("  ยกเลิก  ") == "ยกเลิก"
+
+    def test_text_made_only_of_particles_strips_to_empty(self) -> None:
+        # len(text) > len(particle) guards the exact-match case, so a bare
+        # "ครับ" survives -- what must not happen is a crash or a wrong word.
+        assert text_parsing.strip_trailing_particles("ครับ") == "ครับ"
