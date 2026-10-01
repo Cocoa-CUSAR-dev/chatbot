@@ -1,0 +1,86 @@
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Thai+Looped:wght@400;500;600;700&display=swap");
+
+:root {
+  /* Same brand palette as the web-app (src/themes/mainTheme.ts) and the
+     chatbot's own cocoa-cup loading animation -- one product family, one
+     palette, even though this is a separate lightweight app (ADR 0003). */
+  --primary: #518d29;
+  --primary-light: #63a338;
+  --primary-dark: #3d691d;
+  --primary-tint: rgba(81, 141, 41, 0.1);
+  --cocoa: #6f4426;
+
+  --overdue: #d64545;
+  --overdue-tint: rgba(214, 69, 69, 0.1);
+  --progress: #c98a1f;
+  --progress-tint: rgba(201, 138, 31, 0.12);
+
+  --bg: #f6f5f2;
+  --card-bg: #fff;
+  --text: #262321;
+  --text-muted: #837c74;
+  --border: #ece9e3;
+  --shadow: 0 1px 2px rgba(38, 35, 33, 0.04), 0 8px 24px -12px rgba(38, 35, 33, 0.14);
+  --shadow-press: 0 1px 2px rgba(38, 35, 33, 0.06);
+
+  --radius: 1rem;
+  --radius-sm: 0.625rem;
+
+  font-family:
+    "IBM Plex Sans Thai Looped", system-ui, "Segoe UI", Roboto, sans-serif;
+  color-scheme: light;
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+#root {
+  max-width: 480px; /* LIFF views are always a phone-width webview */
+  margin: 0 auto;
+  min-height: 100svh;
+}
+
+button {
+  font-family: inherit;
+}
+
+@keyframes fade-slide-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes shimmer {
+  from {
+    background-position: -120% 0;
+  }
+  to {
+    background-position: 120% 0;
+  }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}

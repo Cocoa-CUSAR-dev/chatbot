@@ -11,6 +11,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from src.config import settings
 from src.exceptions import ServiceException
 from src.internal.router import router as internal_router
+from src.line.liff_tasks import router as liff_tasks_router
 from src.line.router import router as line_router
 from src.logging_config import configure_logging
 from src.notifications.router import router as notifications_router
@@ -87,6 +88,7 @@ async def health() -> dict[str, str]:
 
 
 app.include_router(line_router)
+app.include_router(liff_tasks_router)
 app.include_router(notifications_router)
 app.include_router(reminders_router)
 app.include_router(internal_router)
