@@ -455,13 +455,6 @@ async def _handle_postback(event: PostbackEvent) -> None:
             # Saved, but this task wants more rows (multi-submit) -- offer
             # the next one instead of closing out.
             await reply_add_another_prompt(event.reply_token, reply.text, reply.conversation_id)
-            if reply.multi_submitted:
-                # A multi-choice confirm already wrote every row the farmer
-                # ticked, so this IS the finished unit of work -- the diary
-                # shouldn't wait for a "✅ จบ" tap that a farmer with nothing
-                # more to add has no reason to make (that gap is exactly how
-                # multi-submit farmers ended up with no diary at all).
-                await _generate_and_push_diary(str(conversation.user_id), event.source.user_id)
             return
         # Not _reply(): confirm_conversation's reply still carries substate
         # AWAITING_CONFIRMATION on its terminal "thanks" message (the

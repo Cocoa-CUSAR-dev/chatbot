@@ -343,7 +343,10 @@ class TestSelecting:
             {"description": "พ่นยา", "plot_id": str(plot_a)},
             {"description": "พ่นยา", "plot_id": str(plot_b)},
         ]
-        assert "2 รายการ" in _sent(reply_message).text
+        # Ended outright: the terminal ack (a Flex card), no "add another".
+        confirmed = _sent(reply_message)
+        assert confirmed.alt_text == "บันทึกข้อมูลเรียบร้อยแล้ว 2 รายการ ขอบคุณครับ"
+        assert confirmed.quick_reply is None
         stored = await _answer_rows(db_session, conversation_id)
         assert stored["plot_id"]["submitted"] == [str(plot_a), str(plot_b)]
 
@@ -773,3 +776,74 @@ class TestAnyOptionQuestion:
         footer_data = [item["action"].get("data", "") for item in bubble["footer"]["contents"]]
         assert not any(data.startswith("multi_skip:") for data in footer_data)
         assert conversation_id is not None
+
+
+class TestNoAddAnotherAfterAMultiChoiceConfirm:
+    """Once a farmer has ticked several answers in one go, the old
+    one-row-at-a-time "➕ เพิ่มอีกรายการ" loop is not offered on top of it: two
+    ways of doing the same thing is a complication, not a convenience.
+    """
+
+    async def _confirm_with(
+        self, db_session: AsyncSession, client: AsyncClient, *, ticks: int
+    ) -> tuple[AsyncMock, AsyncMock]:
+        fixture = await _seed(db_session)
+        conversation_id = await _start_at_plot_question(db_session, fixture)
+
+        with respx.mock:
+            respx.get(
+                f"{forms_settings.KOTLIN_BACKEND_URL}/service/forms/{fixture.task_form_id}"
+            ).mock(return_value=Response(200, json=fixture.form_response))
+            for plot_id in fixture.plot_ids[:ticks]:
+                await _send_postback(
+                    client,
+                    line_user_id=fixture.line_user_id,
+                    data=f"multi_toggle:{conversation_id}:{plot_id}",
+                )
+            await _send_postback(
+                client, line_user_id=fixture.line_user_id, data=f"multi_done:{conversation_id}"
+            )
+
+            body = build_postback_event(
+                line_user_id=fixture.line_user_id, data=f"confirm:{conversation_id}"
+            )
+            signature = sign_signature(body, line_settings.LINE_CHANNEL_SECRET)
+            diary = AsyncMock(return_value="ไดอารี่")
+            with (
+                patch(
+                    "src.line.service.AsyncMessagingApi.reply_message", new_callable=AsyncMock
+                ) as reply_message,
+                patch("src.line.router.generate_diary", new=diary),
+                patch("src.line.router.push_flex", new=AsyncMock()),
+                patch("src.line.router.mint_sso_token", new=AsyncMock(return_value="t")),
+                patch("src.conversation.service.submit_task", new=AsyncMock()),
+            ):
+                response = await client.post(
+                    "/line/webhook", content=body, headers={"X-Line-Signature": signature}
+                )
+            assert response.status_code == 200
+        return reply_message, diary
+
+    async def test_several_answers_end_the_task_with_ack_and_diary(
+        self, db_session: AsyncSession, client: AsyncClient
+    ) -> None:
+        reply_message, diary = await self._confirm_with(db_session, client, ticks=2)
+
+        message = _sent(reply_message)
+        assert message.alt_text == "บันทึกข้อมูลเรียบร้อยแล้ว 2 รายการ ขอบคุณครับ"
+        assert message.quick_reply is None, "no add-another buttons"
+        diary.assert_awaited_once()
+
+    async def test_a_single_tick_keeps_the_ordinary_multi_submit_loop(
+        self, db_session: AsyncSession, client: AsyncClient
+    ) -> None:
+        """One ticked answer is stored as an ordinary answer, so nothing about
+        the multi-submit form's usual behaviour changes for it.
+        """
+        reply_message, diary = await self._confirm_with(db_session, client, ticks=1)
+
+        message = _sent(reply_message)
+        assert "ต้องการเพิ่มอีกรายการ" in message.text
+        labels = [item.action.label for item in message.quick_reply.items]
+        assert any("เพิ่มอีกรายการ" in label for label in labels)
+        diary.assert_not_awaited()

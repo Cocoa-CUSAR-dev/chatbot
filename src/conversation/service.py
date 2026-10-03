@@ -185,13 +185,6 @@ class ConversationReply:
     # True for the short "เลือกแล้ว: ..." acknowledgement after a tap, which
     # is a text line with one "เสร็จ" button rather than a new bubble.
     selection_ack: bool = False
-    # Set on a SUCCESSFUL confirm that fanned out into one row per ticked
-    # answer. The form is multiple-submit, so offer_another is set too and
-    # the diary would normally wait for "✅ จบ" -- but the farmer just
-    # finished a whole piece of work across several rows, so the caller
-    # generates the diary now. Kotlin regenerates the day from every response
-    # anyway, so a later "✅ จบ" simply refreshes it.
-    multi_submitted: bool = False
 
 
 def _constrained_choices_for(q: dict[str, Any]) -> list[Choice] | None:
@@ -1656,32 +1649,43 @@ async def confirm_conversation(
     conversation.status = ConversationStatus.COMPLETED
     await session.commit()
 
-    fanned_out = multi_row is not None
+    # A multi-choice confirm ends the submission outright -- no "➕ เพิ่มอีก
+    # รายการ". The farmer has just ticked every answer they had in one go;
+    # offering the one-row-at-a-time loop on top of that would put two ways of
+    # doing the same thing in front of them, and a second fan-out from the
+    # same carried-forward answers is exactly the duplicate this feature was
+    # careful not to create. Returned as the ordinary terminal reply, so the
+    # caller sends the quick ack and the diary just as for any single-submit
+    # form -- the task itself stays listed under "เริ่ม" until close_at, as
+    # every multi-submit task does, if they genuinely have more to record.
+    if multi_row is not None:
+        row_count = len(multi_row.answer.get("values", []))
+        return ConversationReply(
+            conversation_id=conversation_id,
+            substate=ActiveSubstate.AWAITING_CONFIRMATION,
+            text=f"บันทึกข้อมูลเรียบร้อยแล้ว {row_count} รายการ ขอบคุณครับ",
+        )
 
     # This conversation is done either way -- the row is saved. A
     # multiple-submit form just isn't finished with the TASK: the farmer is
     # expected to file several rows against it (grade A, then B, then C), so
     # offer another instead of closing the conversation out. The caller
     # attaches the buttons; router.py's "add_another" postback starts the
-    # next one with the parent selection carried forward.
+    # next one with the parent selection carried forward. Reached only when
+    # the picker was NOT used for several answers -- including a picker
+    # where the farmer ticked just one, which is stored as an ordinary answer.
     if form.is_multiple_submit:
-        text = "บันทึกข้อมูลเรียบร้อยแล้ว ต้องการเพิ่มอีกรายการสำหรับงานนี้หรือไม่?"
-        if multi_row is not None:
-            row_count = len(multi_row.answer.get("values", []))
-            text = f"บันทึกข้อมูลเรียบร้อยแล้ว {row_count} รายการ ต้องการเพิ่มอีกรายการสำหรับงานนี้หรือไม่?"
         return ConversationReply(
             conversation_id=conversation_id,
             substate=ActiveSubstate.AWAITING_CONFIRMATION,
-            text=text,
+            text="บันทึกข้อมูลเรียบร้อยแล้ว ต้องการเพิ่มอีกรายการสำหรับงานนี้หรือไม่?",
             offer_another=True,
-            multi_submitted=fanned_out,
         )
 
     return ConversationReply(
         conversation_id=conversation_id,
         substate=ActiveSubstate.AWAITING_CONFIRMATION,
         text="บันทึกข้อมูลเรียบร้อยแล้ว ขอบคุณครับ",
-        multi_submitted=fanned_out,
     )
 
 
