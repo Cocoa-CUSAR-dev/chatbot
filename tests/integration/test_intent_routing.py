@@ -134,7 +134,7 @@ class TestShowTasks:
             classify=_verdict(intent.Intent.SHOW_TASKS),
         )
 
-        assert _message(reply_message).text == "ไม่มีงานที่ต้องทำในตอนนี้"
+        assert _message(reply_message).text == "ตอนนี้ยังไม่มีงานที่ต้องบันทึกครับ ขอบคุณมากนะครับ"
 
 
 class TestNonTaskIntentsAnswerWithFixedText:
@@ -164,7 +164,7 @@ class TestNonTaskIntentsAnswerWithFixedText:
         wrong one here reaches a real crop.
         """
         reply = await self._reply_for(db_session, client, intent.Intent.OFF_TOPIC)
-        assert "ช่วยได้เฉพาะเรื่องการบันทึกข้อมูลแปลง" in reply
+        assert "ช่วยได้เฉพาะการบันทึกข้อมูลแปลง" in reply
 
     async def test_unknown_falls_back_to_the_old_hint(
         self, db_session: AsyncSession, client: AsyncClient
@@ -173,7 +173,7 @@ class TestNonTaskIntentsAnswerWithFixedText:
         pre-US2-11 behaviour, unchanged.
         """
         reply = await self._reply_for(db_session, client, intent.Intent.UNKNOWN)
-        assert reply.startswith('พิมพ์ "เริ่ม"')
+        assert reply.startswith('รบกวนพิมพ์ "เริ่ม"')
 
 
 class TestTheClassifierIsNotAlwaysCalled:

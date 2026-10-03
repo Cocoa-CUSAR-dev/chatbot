@@ -71,7 +71,7 @@ class TestNonTextMessagesAlwaysGetAReply:
         reply_message = await _send(client, line_user_id=line_user_id, message=_IMAGE)
 
         message = reply_message.await_args.args[0].messages[0]
-        assert "ข้อความตัวอักษร" in message.text
+        assert "ข้อความที่พิมพ์" in message.text
         assert [item.action.text for item in message.quick_reply.items] == ["เริ่ม"]
 
     async def test_sticker_gets_a_reply(
@@ -83,7 +83,7 @@ class TestNonTextMessagesAlwaysGetAReply:
 
         reply_message = await _send(client, line_user_id=line_user_id, message=_STICKER)
 
-        assert "ข้อความตัวอักษร" in reply_message.await_args.args[0].messages[0].text
+        assert "ข้อความที่พิมพ์" in reply_message.await_args.args[0].messages[0].text
 
     async def test_mid_form_the_farmer_is_told_to_type_the_answer(
         self, db_session: AsyncSession, client: AsyncClient
@@ -109,7 +109,7 @@ class TestNonTextMessagesAlwaysGetAReply:
         reply_message = await _send(client, line_user_id=line_user_id, message=_LOCATION)
 
         message = reply_message.await_args.args[0].messages[0]
-        assert "กรุณาพิมพ์คำตอบเป็นข้อความ" in message.text
+        assert "รบกวนพิมพ์คำตอบเป็นข้อความ" in message.text
         assert message.quick_reply is None
 
     async def test_unlinked_user_is_told_so(
@@ -117,4 +117,4 @@ class TestNonTextMessagesAlwaysGetAReply:
     ) -> None:
         reply_message = await _send(client, line_user_id=f"U{uuid.uuid4().hex}", message=_IMAGE)
 
-        assert "ยังไม่ได้เชื่อมกับบัญชีในระบบ" in reply_message.await_args.args[0].messages[0].text
+        assert "ยังไม่ได้เชื่อมกับระบบ" in reply_message.await_args.args[0].messages[0].text

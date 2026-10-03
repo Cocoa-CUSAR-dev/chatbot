@@ -250,7 +250,7 @@ class TestUnrecognisedTextIsNeverADeadEnd:
 
         sent_message = reply_message.await_args.args[0].messages[0]
         assert "ไม่พบบทสนทนานี้แล้ว" not in sent_message.text
-        assert "กรุณากดปุ่มด้านล่างครับ" in sent_message.text
+        assert "รบกวนกดปุ่มด้านล่าง" in sent_message.text
         assert "สรุปคำตอบของคุณ" in sent_message.text
         assert "หมายเหตุ: ฝนตก" in sent_message.text
         labels = [item.action.label for item in sent_message.quick_reply.items]

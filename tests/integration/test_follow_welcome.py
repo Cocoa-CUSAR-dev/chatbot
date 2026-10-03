@@ -49,7 +49,8 @@ class TestFollowWelcome:
         self, db_session: AsyncSession, client: AsyncClient
     ) -> None:
         """ADR 0002 is undecided, so the copy must not invent a linking
-        procedure -- it names a human instead.
+        procedure -- it points at the team, and never at a specific role
+        (a field researcher) the farmer may not have.
         """
         message = (
             (await _follow(client, line_user_id=f"U{uuid.uuid4().hex}"))
@@ -57,6 +58,7 @@ class TestFollowWelcome:
             .messages[0]
         )
 
-        assert "ยังไม่ได้เชื่อมกับบัญชีในระบบ" in message.text
-        assert "นักวิจัยประจำแปลง" in message.text
+        assert "ยังไม่ได้เชื่อมกับระบบ" in message.text
+        assert "ติดต่อทีมงาน" in message.text
+        assert "นักวิจัย" not in message.text
         assert message.quick_reply is None
