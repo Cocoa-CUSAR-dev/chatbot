@@ -246,7 +246,7 @@ class TestThePickerIsShown:
         assert labels == ["แปลง A", "แปลง B", "แปลง C"]
         # Kotlin's global plot list never appears -- these are the scoped ones.
         assert "แปลงของคนอื่น" not in labels
-        assert any(f"plot_done:{conversation_id}" in data for data in _postback_data(bubble))
+        assert any(f"multi_done:{conversation_id}" in data for data in _postback_data(bubble))
 
     async def test_a_non_multi_submit_form_still_uses_quick_reply(
         self, db_session: AsyncSession, client: AsyncClient
@@ -302,32 +302,35 @@ class TestSelecting:
             await _send_postback(
                 client,
                 line_user_id=fixture.line_user_id,
-                data=f"plot_toggle:{conversation_id}:{plot_a}",
+                data=f"multi_toggle:{conversation_id}:{plot_a}",
             )
             reply_message = await _send_postback(
                 client,
                 line_user_id=fixture.line_user_id,
-                data=f"plot_toggle:{conversation_id}:{plot_c}",
+                data=f"multi_toggle:{conversation_id}:{plot_c}",
             )
-            assert "เลือกแล้ว: แปลง A, แปลง C (2 แปลง)" in _sent(reply_message).text
+            assert "เลือกแล้ว: แปลง A, แปลง C (2 รายการ)" in _sent(reply_message).text
 
             # Tapping C again removes it -- the farmer changed their mind.
             reply_message = await _send_postback(
                 client,
                 line_user_id=fixture.line_user_id,
-                data=f"plot_toggle:{conversation_id}:{plot_c}",
+                data=f"multi_toggle:{conversation_id}:{plot_c}",
             )
-            assert "เลือกแล้ว: แปลง A (1 แปลง)" in _sent(reply_message).text
+            assert "เลือกแล้ว: แปลง A (1 รายการ)" in _sent(reply_message).text
 
             await _send_postback(
                 client,
                 line_user_id=fixture.line_user_id,
-                data=f"plot_toggle:{conversation_id}:{plot_b}",
+                data=f"multi_toggle:{conversation_id}:{plot_b}",
             )
             reply_message = await _send_postback(
-                client, line_user_id=fixture.line_user_id, data=f"plot_done:{conversation_id}"
+                client, line_user_id=fixture.line_user_id, data=f"multi_done:{conversation_id}"
             )
-            assert "จะบันทึกเป็น 2 รายการ (แยกตามแปลง): แปลง A, แปลง B" in _sent(reply_message).text
+            assert (
+                "จะบันทึกเป็น 2 รายการ (แยกตามแปลงที่ดำเนินการ): แปลง A, แปลง B"
+                in _sent(reply_message).text
+            )
 
             submit = AsyncMock()
             with patch("src.conversation.service.submit_task", new=submit):
@@ -355,10 +358,10 @@ class TestSelecting:
                 f"{forms_settings.KOTLIN_BACKEND_URL}/service/forms/{fixture.task_form_id}"
             ).mock(return_value=Response(200, json=fixture.form_response))
             reply_message = await _send_postback(
-                client, line_user_id=fixture.line_user_id, data=f"plot_done:{conversation_id}"
+                client, line_user_id=fixture.line_user_id, data=f"multi_done:{conversation_id}"
             )
 
-        assert "กรุณาเลือกอย่างน้อย 1 แปลง" in _sent(reply_message).alt_text
+        assert "กรุณาเลือกอย่างน้อย 1 รายการ" in _sent(reply_message).alt_text
 
     async def test_one_plot_is_stored_exactly_like_a_normal_answer(
         self, db_session: AsyncSession, client: AsyncClient
@@ -374,10 +377,10 @@ class TestSelecting:
             await _send_postback(
                 client,
                 line_user_id=fixture.line_user_id,
-                data=f"plot_toggle:{conversation_id}:{plot_a}",
+                data=f"multi_toggle:{conversation_id}:{plot_a}",
             )
             await _send_postback(
-                client, line_user_id=fixture.line_user_id, data=f"plot_done:{conversation_id}"
+                client, line_user_id=fixture.line_user_id, data=f"multi_done:{conversation_id}"
             )
 
             submit = AsyncMock()
@@ -403,7 +406,7 @@ class TestSelecting:
             await _send_postback(
                 client,
                 line_user_id=fixture.line_user_id,
-                data=f"plot_whole_farm:{conversation_id}",
+                data=f"multi_skip:{conversation_id}",
             )
 
             submit = AsyncMock()
@@ -435,16 +438,16 @@ class TestStaleBubble:
             await _send_postback(
                 client,
                 line_user_id=fixture.line_user_id,
-                data=f"plot_toggle:{conversation_id}:{plot_a}",
+                data=f"multi_toggle:{conversation_id}:{plot_a}",
             )
             await _send_postback(
-                client, line_user_id=fixture.line_user_id, data=f"plot_done:{conversation_id}"
+                client, line_user_id=fixture.line_user_id, data=f"multi_done:{conversation_id}"
             )
 
             reply_message = await _send_postback(
                 client,
                 line_user_id=fixture.line_user_id,
-                data=f"plot_toggle:{conversation_id}:{plot_b}",
+                data=f"multi_toggle:{conversation_id}:{plot_b}",
             )
 
         assert _sent(reply_message).text == "คำถามนี้ผ่านไปแล้วครับ"
@@ -473,7 +476,7 @@ class TestStaleBubble:
             reply_message = await _send_postback(
                 client,
                 line_user_id=fixture.line_user_id,
-                data=f"plot_toggle:{conversation_id}:{other_plots[0]}",
+                data=f"multi_toggle:{conversation_id}:{other_plots[0]}",
             )
 
         assert _sent(reply_message).text == "คำถามนี้ผ่านไปแล้วครับ"
@@ -495,7 +498,7 @@ class TestTypedTextWhileSelecting:
                 client, line_user_id=fixture.line_user_id, text_content="แปลง B"
             )
 
-        assert "เลือกแล้ว: แปลง B (1 แปลง)" in _sent(reply_message).text
+        assert "เลือกแล้ว: แปลง B (1 รายการ)" in _sent(reply_message).text
         stored = await _answer_rows(db_session, conversation_id)
         assert stored["plot_id"]["values"] == [str(fixture.plot_ids[1])]
 
@@ -512,7 +515,7 @@ class TestTypedTextWhileSelecting:
             await _send_postback(
                 client,
                 line_user_id=fixture.line_user_id,
-                data=f"plot_toggle:{conversation_id}:{fixture.plot_ids[0]}",
+                data=f"multi_toggle:{conversation_id}:{fixture.plot_ids[0]}",
             )
             reply_message = await _send_text(
                 client, line_user_id=fixture.line_user_id, text_content="เสร็จ"
@@ -534,7 +537,7 @@ class TestTypedTextWhileSelecting:
                 client, line_user_id=fixture.line_user_id, text_content="asdfgh"
             )
 
-        assert "กรุณากดเลือกแปลงจากปุ่มด้านบนครับ" in _sent(reply_message).alt_text
+        assert "กรุณากดเลือกจากปุ่มด้านบนครับ" in _sent(reply_message).alt_text
         assert "plot_id" not in await _answer_rows(db_session, conversation_id)
 
 
@@ -553,7 +556,7 @@ class TestPauseAndResume:
             await _send_postback(
                 client,
                 line_user_id=fixture.line_user_id,
-                data=f"plot_toggle:{conversation_id}:{plot_a}",
+                data=f"multi_toggle:{conversation_id}:{plot_a}",
             )
             await _send_text(client, line_user_id=fixture.line_user_id, text_content="⏸️ พักไว้ก่อน")
             reply_message = await _send_postback(
@@ -590,10 +593,10 @@ class TestPartialFailureRetry:
                 await _send_postback(
                     client,
                     line_user_id=fixture.line_user_id,
-                    data=f"plot_toggle:{conversation_id}:{plot_id}",
+                    data=f"multi_toggle:{conversation_id}:{plot_id}",
                 )
             await _send_postback(
-                client, line_user_id=fixture.line_user_id, data=f"plot_done:{conversation_id}"
+                client, line_user_id=fixture.line_user_id, data=f"multi_done:{conversation_id}"
             )
 
             failing = AsyncMock(side_effect=[None, RuntimeError("go is down")])
@@ -601,7 +604,7 @@ class TestPartialFailureRetry:
                 reply_message = await _send_postback(
                     client, line_user_id=fixture.line_user_id, data=f"confirm:{conversation_id}"
                 )
-            assert "บันทึกแล้ว 1 จาก 2 แปลง" in _sent(reply_message).text
+            assert "บันทึกแล้ว 1 จาก 2 รายการ" in _sent(reply_message).text
 
             status = await db_session.execute(
                 text("SELECT status FROM chat.conversation WHERE conversation_id = :cid"),
@@ -622,3 +625,151 @@ class TestPartialFailureRetry:
             {"cid": conversation_id},
         )
         assert status.scalar_one() == "completed"
+
+
+async def _seed_activity_type_form(db_session: AsyncSession) -> tuple[_Fixture, uuid.UUID, dict]:
+    """A multiple-submit form with an ordinary OPTION question (the activity
+    type, choices straight from Kotlin) BEFORE the plot question -- the shape
+    that proves the picker is not plot-only.
+    """
+    line_user_id = f"U{uuid.uuid4().hex}"
+    user_id = await seed_user_with_line_identity(db_session, line_user_id=line_user_id)
+    _, plot_ids = await seed_farm_with_plots(
+        db_session, farmer_id=user_id, plot_names=["แปลง A", "แปลง B"]
+    )
+    task_id, task_form_id = await seed_task_form(
+        db_session, handler="farm_activity", is_multiple_submit=True
+    )
+    type_question_id = await seed_question(
+        db_session,
+        task_id=task_id,
+        field_name="farm_activity_type_id",
+        input_type="OPTION",
+        label="กิจกรรมที่ทำ",
+        sort_order=1,
+    )
+    plot_question_id = await seed_question(
+        db_session,
+        task_id=task_id,
+        field_name="plot_id",
+        input_type="OPTION",
+        label="แปลงที่ดำเนินการ",
+        is_mandatory=False,
+        sort_order=2,
+    )
+    activity_choices = {"spray": "พ่นยา", "fertilise": "ใส่ปุ๋ย", "prune": "ตัดแต่งกิ่ง"}
+    form_response = build_form_response(
+        task_form_id=task_form_id,
+        is_multiple_submit=True,
+        questions=[
+            question_json(
+                question_id=type_question_id,
+                field_name="farm_activity_type_id",
+                input_type="OPTION",
+                label="กิจกรรมที่ทำ",
+                sort_order=1,
+                choices=[{"id": key, "name": name} for key, name in activity_choices.items()],
+            ),
+            question_json(
+                question_id=plot_question_id,
+                field_name="plot_id",
+                input_type="OPTION",
+                label="แปลงที่ดำเนินการ",
+                is_mandatory=False,
+                sort_order=2,
+                choices=[{"id": str(uuid.uuid4()), "name": "แปลงของคนอื่น"}],
+            ),
+        ],
+    )
+    fixture = _Fixture(
+        line_user_id=line_user_id,
+        user_id=user_id,
+        task_id=task_id,
+        task_form_id=task_form_id,
+        plot_question_id=plot_question_id,
+        plot_ids=plot_ids,
+        form_response=form_response,
+    )
+    conversation_id = await seed_conversation(
+        db_session,
+        user_id=user_id,
+        task_id=task_id,
+        task_form_id=task_form_id,
+        current_question_id=type_question_id,
+        status="active",
+    )
+    return fixture, conversation_id, form_response
+
+
+class TestAnyOptionQuestion:
+    async def test_a_non_plot_question_fans_out_by_its_own_choices(
+        self, db_session: AsyncSession, client: AsyncClient
+    ) -> None:
+        """The plot was only the example. Tick two activity types, answer the
+        plot once, confirm -- two rows, split by activity type.
+        """
+        fixture, conversation_id, form_response = await _seed_activity_type_form(db_session)
+        plot_a = fixture.plot_ids[0]
+
+        with respx.mock:
+            respx.get(
+                f"{forms_settings.KOTLIN_BACKEND_URL}/service/forms/{fixture.task_form_id}"
+            ).mock(return_value=Response(200, json=form_response))
+
+            for choice_id in ("spray", "fertilise"):
+                await _send_postback(
+                    client,
+                    line_user_id=fixture.line_user_id,
+                    data=f"multi_toggle:{conversation_id}:{choice_id}",
+                )
+            reply_message = await _send_postback(
+                client, line_user_id=fixture.line_user_id, data=f"multi_done:{conversation_id}"
+            )
+
+            # One multi-answer question per round: the activity type already
+            # holds two answers, so the plot question is the ordinary
+            # one-answer Quick Reply, not a second picker.
+            plot_message = _sent(reply_message)
+            assert plot_message.quick_reply is not None
+            assert getattr(plot_message, "contents", None) is None
+
+            await _send_text(client, line_user_id=fixture.line_user_id, text_content="แปลงของคนอื่น")
+
+            submit = AsyncMock()
+            with patch("src.conversation.service.submit_task", new=submit):
+                await _send_postback(
+                    client, line_user_id=fixture.line_user_id, data=f"confirm:{conversation_id}"
+                )
+
+        sent_types = [
+            call.args[0].answer["farm_activity_type_id"] for call in submit.await_args_list
+        ]
+        assert sent_types == ["spray", "fertilise"]
+        plot_values = {call.args[0].answer["plot_id"] for call in submit.await_args_list}
+        assert len(plot_values) == 1, "every row carries the same single plot answer"
+        assert plot_a is not None
+
+    async def test_the_picker_shows_the_questions_own_choices(
+        self, db_session: AsyncSession, client: AsyncClient
+    ) -> None:
+        fixture, conversation_id, form_response = await _seed_activity_type_form(db_session)
+
+        with respx.mock:
+            respx.get(
+                f"{forms_settings.KOTLIN_BACKEND_URL}/service/forms/{fixture.task_form_id}"
+            ).mock(return_value=Response(200, json=form_response))
+            reply_message = await _send_text(
+                client, line_user_id=fixture.line_user_id, text_content="อะไรนะ"
+            )
+
+        bubble = _flex_json(reply_message)
+        labels = [
+            item["action"]["label"]
+            for item in bubble["body"]["contents"]
+            if item["type"] == "button"
+        ]
+        assert labels == ["พ่นยา", "ใส่ปุ๋ย", "ตัดแต่งกิ่ง"]
+        # A mandatory question has no skip button on the bubble.
+        footer_data = [item["action"].get("data", "") for item in bubble["footer"]["contents"]]
+        assert not any(data.startswith("multi_skip:") for data in footer_data)
+        assert conversation_id is not None

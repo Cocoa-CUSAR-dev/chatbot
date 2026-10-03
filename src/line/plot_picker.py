@@ -1,4 +1,7 @@
-"""The farmer's own plots, for the multi-plot answer picker.
+"""The farmer's own plots, for the plot question in the multi-choice picker.
+
+Every other OPTION question in the picker uses its own choices as Kotlin sent
+them; the plot question is the one exception, for the reason below.
 
 Why this exists at all: the plot question's choices normally come from Kotlin
 (`FormRepository.fetchRefChoices` -> `SELECT plot_id, plot_name FROM
@@ -28,9 +31,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 # A Flex bubble stays readable at roughly a dozen buttons, and the carousel
 # the builder falls back to is capped at 12 bubbles by LINE itself. This cap
 # is on the DATA, so the builder never has to silently drop a plot a farmer
-# can see in the count -- see build_multi_plot_flex, which logs when it has
-# to split, and _list_plots' own warning when a farmer genuinely has more
-# plots than this.
+# can see in the count -- see build_multi_choice_flex, which logs if it ever
+# has to.
 MAX_PLOTS = 60
 
 

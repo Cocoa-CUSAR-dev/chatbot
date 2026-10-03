@@ -1,4 +1,4 @@
-"""Multi-plot answer: the pieces that need no database.
+"""Multi-choice answer: the pieces that need no database.
 
 The fan-out tests here are the important ones. Writing N rows for one
 conversation is the only part of this feature that can corrupt real farm data
@@ -43,21 +43,53 @@ def _question(form: FormDetail, field_name: str) -> service.Question:
     return next(q for q in service.questions_from_form(form) if q.field_name == field_name)
 
 
-class TestIsMultiPlotQuestion:
+class TestIsMultiChoiceQuestion:
     def test_plot_question_on_a_multi_submit_form(self) -> None:
         form = _form(field_names=["plot_id", "description"], is_multiple_submit=True)
-        assert service.is_multi_plot_question(_question(form, "plot_id"), form) is True
+        assert service.is_multi_choice_question(_question(form, "plot_id"), form) is True
 
     def test_plot_question_on_an_ordinary_form_is_not(self) -> None:
         """Fanning out on a form the researchers did NOT mark multiple-submit
         would write exactly the duplicate rows they said they didn't want.
         """
         form = _form(field_names=["plot_id"], is_multiple_submit=False)
-        assert service.is_multi_plot_question(_question(form, "plot_id"), form) is False
+        assert service.is_multi_choice_question(_question(form, "plot_id"), form) is False
 
-    def test_any_other_question_is_not(self) -> None:
+    def test_any_option_question_is_eligible_not_just_the_plot(self) -> None:
+        """The plot was only ever the motivating example: the activity type,
+        the farm, any fixed-list question can take several answers.
+        """
+        form = _form(field_names=["farm_activity_type_id"], is_multiple_submit=True)
+        question = _question(form, "farm_activity_type_id")
+        assert service.is_multi_choice_question(question, form) is True
+
+    def test_free_text_is_not(self) -> None:
+        """Nothing to tick -- and a free-text answer is one answer."""
         form = _form(field_names=["plot_id", "description"], is_multiple_submit=True)
-        assert service.is_multi_plot_question(_question(form, "description"), form) is False
+        assert service.is_multi_choice_question(_question(form, "description"), form) is False
+
+    def test_boolean_is_not(self) -> None:
+        """Yes AND no at once is not an answer."""
+        form = FormDetail(
+            task_form_id="tf-1",
+            sections=[
+                {
+                    "questions": [
+                        {
+                            "question_id": str(uuid.uuid4()),
+                            "label": "เสียหายไหม",
+                            "field_name": "is_quality_damage",
+                            "input_type": "BOOLEAN",
+                            "is_mandatory": True,
+                            "sort_order": 0,
+                        }
+                    ]
+                }
+            ],
+            is_multiple_submit=True,
+        )
+        question = service.questions_from_form(form)[0]
+        assert service.is_multi_choice_question(question, form) is False
 
 
 class TestPlotAnswerShape:
@@ -65,10 +97,10 @@ class TestPlotAnswerShape:
         """So nothing downstream -- summary, payload, autofill, carry-forward
         -- has to know the picker exists for the common case.
         """
-        assert service._plot_answer(["p1"], ["แปลง A"]) == {"text": "แปลง A", "value": "p1"}
+        assert service._multi_choice_answer(["p1"], ["แปลง A"]) == {"text": "แปลง A", "value": "p1"}
 
     def test_several_plots_carry_the_fan_out_keys(self) -> None:
-        answer = service._plot_answer(["p1", "p2"], ["แปลง A", "แปลง B"])
+        answer = service._multi_choice_answer(["p1", "p2"], ["แปลง A", "แปลง B"])
         assert answer == {
             "text": "แปลง A, แปลง B",
             "values": ["p1", "p2"],
@@ -78,8 +110,8 @@ class TestPlotAnswerShape:
         }
 
     def test_selection_line_reads_back_what_was_picked(self) -> None:
-        assert service._selection_text(["แปลง A", "แปลง C"]) == "เลือกแล้ว: แปลง A, แปลง C (2 แปลง)"
-        assert service._selection_text([]) == "ยังไม่ได้เลือกแปลง"
+        assert service._selection_text(["แปลง A", "แปลง C"]) == "เลือกแล้ว: แปลง A, แปลง C (2 รายการ)"
+        assert service._selection_text([]) == "ยังไม่ได้เลือก"
 
 
 class TestCarriedAnswer:
@@ -136,10 +168,11 @@ class TestFanOut:
         row = _multi_row()
 
         with patch("src.conversation.service.submit_task", new=submit):
-            result = await service._submit_per_plot(
+            result = await service._submit_per_choice(
                 session,
                 conversation=_conversation(),
                 row=row,
+                field_name="plot_id",
                 base_payload={"description": "พ่นยา"},
             )
 
@@ -152,14 +185,49 @@ class TestFanOut:
         ]
         assert row.answer["submitted"] == ["p1", "p2", "p3"]
 
+    async def test_rows_are_split_by_whichever_question_holds_the_choices(self) -> None:
+        """Not hard-wired to plot_id: the varying column is the multi answer's
+        own question, here the activity type.
+        """
+        session = MagicMock(commit=AsyncMock())
+        submit = AsyncMock()
+        row = _row(
+            {
+                "text": "พ่นยา, ใส่ปุ๋ย",
+                "values": ["spray", "fertilise"],
+                "labels": ["พ่นยา", "ใส่ปุ๋ย"],
+                "multi": True,
+                "submitted": [],
+            }
+        )
+
+        with patch("src.conversation.service.submit_task", new=submit):
+            await service._submit_per_choice(
+                session,
+                conversation=_conversation(),
+                row=row,
+                field_name="farm_activity_type_id",
+                base_payload={"plot_id": "p1"},
+            )
+
+        sent = [call.args[0].answer for call in submit.await_args_list]
+        assert sent == [
+            {"plot_id": "p1", "farm_activity_type_id": "spray"},
+            {"plot_id": "p1", "farm_activity_type_id": "fertilise"},
+        ]
+
     async def test_each_plot_is_committed_as_it_lands(self) -> None:
         """Not one commit at the end: a crash or a Vercel timeout between
         plots must not lose the record of what already reached Go.
         """
         session = MagicMock(commit=AsyncMock())
         with patch("src.conversation.service.submit_task", new=AsyncMock()):
-            await service._submit_per_plot(
-                session, conversation=_conversation(), row=_multi_row(), base_payload={}
+            await service._submit_per_choice(
+                session,
+                conversation=_conversation(),
+                row=_multi_row(),
+                field_name="plot_id",
+                base_payload={},
             )
         assert session.commit.await_count == 3
 
@@ -169,13 +237,17 @@ class TestFanOut:
         row = _multi_row()
 
         with patch("src.conversation.service.submit_task", new=submit):
-            result = await service._submit_per_plot(
-                session, conversation=_conversation(), row=row, base_payload={}
+            result = await service._submit_per_choice(
+                session,
+                conversation=_conversation(),
+                row=row,
+                field_name="plot_id",
+                base_payload={},
             )
 
         assert result is not None
         assert result.submission_failed is True
-        assert "บันทึกแล้ว 1 จาก 3 แปลง" in result.text
+        assert "บันทึกแล้ว 1 จาก 3 รายการ" in result.text
         assert "แปลง A" in result.text
         # It stopped at the failure rather than carrying on to plot 3 -- the
         # farmer is told what is missing, and a retry does the rest in order.
@@ -189,8 +261,12 @@ class TestFanOut:
         row = _multi_row(submitted=["p1"])
 
         with patch("src.conversation.service.submit_task", new=submit):
-            result = await service._submit_per_plot(
-                session, conversation=_conversation(), row=row, base_payload={}
+            result = await service._submit_per_choice(
+                session,
+                conversation=_conversation(),
+                row=row,
+                field_name="plot_id",
+                base_payload={},
             )
 
         assert result is None
@@ -206,8 +282,12 @@ class TestFanOut:
         submit = AsyncMock(side_effect=RuntimeError("go is down"))
 
         with patch("src.conversation.service.submit_task", new=submit):
-            result = await service._submit_per_plot(
-                session, conversation=_conversation(), row=_multi_row(), base_payload={}
+            result = await service._submit_per_choice(
+                session,
+                conversation=_conversation(),
+                row=_multi_row(),
+                field_name="plot_id",
+                base_payload={},
             )
 
         assert result is not None
@@ -226,8 +306,12 @@ class TestFanOut:
             patch("src.conversation.service.submit_task", new=submit),
             pytest.raises(HandlerNotSupported),
         ):
-            await service._submit_per_plot(
-                session, conversation=_conversation(), row=row, base_payload={}
+            await service._submit_per_choice(
+                session,
+                conversation=_conversation(),
+                row=row,
+                field_name="plot_id",
+                base_payload={},
             )
 
         assert row.answer["submitted"] == []
@@ -250,7 +334,7 @@ class TestConfirmationSummary:
 
         summary = service._format_confirmation_summary([question], [row])
 
-        assert "จะบันทึกเป็น 2 รายการ (แยกตามแปลง): แปลง A, แปลง C" in summary
+        assert "จะบันทึกเป็น 2 รายการ (แยกตามคำถาม plot_id): แปลง A, แปลง C" in summary
 
     def test_a_single_plot_answer_adds_nothing(self) -> None:
         form = _form(field_names=["plot_id"], is_multiple_submit=True)

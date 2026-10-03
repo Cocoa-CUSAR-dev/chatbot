@@ -34,8 +34,8 @@ from src.line.service import (
     reply_confirm_prompt,
     reply_edit_picker,
     reply_flex,
-    reply_multi_plot_picker,
-    reply_plot_selection,
+    reply_multi_choice_picker,
+    reply_selection_ack,
     reply_task_choices,
     reply_text,
 )
@@ -106,22 +106,22 @@ async def _reply(reply_token: str, reply: service.ConversationReply) -> None:
         await reply_confirm_prompt(reply_token, reply.text, reply.conversation_id)
         return
 
-    if reply.multi_plot and reply.plot_options is not None:
-        # The multi-plot picker (plot_id on a multiple-submit form): a Flex
-        # bubble whose buttons survive the "เลือกแล้ว: ..." replies the farmer
-        # gets while tapping, which Quick Reply buttons would not.
-        await reply_multi_plot_picker(
+    if reply.multi_choice and reply.picker_options is not None:
+        # The multi-choice picker (an OPTION question on a multiple-submit
+        # form): a Flex bubble whose buttons survive the "เลือกแล้ว: ..."
+        # replies the farmer gets while tapping, which Quick Reply would not.
+        await reply_multi_choice_picker(
             reply_token,
             reply.text,
             reply.conversation_id,
-            [(option.id, option.label) for option in reply.plot_options],
-            selected_ids=reply.selected_plot_ids,
-            allow_whole_farm=reply.allow_whole_farm,
+            [(option.id, option.label) for option in reply.picker_options],
+            selected_ids=reply.selected_ids,
+            skip_label=reply.skip_label,
         )
         return
 
-    if reply.plot_selection_ack:
-        await reply_plot_selection(reply_token, reply.text, reply.conversation_id)
+    if reply.selection_ack:
+        await reply_selection_ack(reply_token, reply.text, reply.conversation_id)
         return
 
     if not reply.choices:
@@ -455,9 +455,9 @@ async def _handle_postback(event: PostbackEvent) -> None:
             # Saved, but this task wants more rows (multi-submit) -- offer
             # the next one instead of closing out.
             await reply_add_another_prompt(event.reply_token, reply.text, reply.conversation_id)
-            if reply.multi_plot_submitted:
-                # A multi-plot confirm already wrote every plot the farmer
-                # picked, so this IS the finished unit of work -- the diary
+            if reply.multi_submitted:
+                # A multi-choice confirm already wrote every row the farmer
+                # ticked, so this IS the finished unit of work -- the diary
                 # shouldn't wait for a "✅ จบ" tap that a farmer with nothing
                 # more to add has no reason to make (that gap is exactly how
                 # multi-submit farmers ended up with no diary at all).
@@ -508,8 +508,8 @@ async def _handle_postback(event: PostbackEvent) -> None:
         await reply_text(event.reply_token, "บันทึกข้อมูลครบแล้ว ขอบคุณครับ")
         if conversation is not None:
             await _generate_and_push_diary(str(conversation.user_id), event.source.user_id)
-    elif action in ("plot_toggle", "plot_done", "plot_whole_farm"):
-        # The multi-plot picker's own buttons. All three go through the same
+    elif action in ("multi_toggle", "multi_done", "multi_skip"):
+        # The multi-choice picker's own buttons. All three go through the same
         # load-form-then-call-service shape as every other postback here; the
         # staleness check (an old bubble is still tappable forever) lives in
         # the service layer, next to the row lock it needs.
@@ -521,19 +521,19 @@ async def _handle_postback(event: PostbackEvent) -> None:
                 return
             form = await get_form(str(conversation.task_form_id))
             try:
-                if action == "plot_toggle":
-                    reply = await service.toggle_plot(
+                if action == "multi_toggle":
+                    reply = await service.toggle_choice(
                         session,
                         conversation_id=conversation.conversation_id,
-                        plot_id=args[1],
+                        choice_id=args[1],
                         form=form,
                     )
-                elif action == "plot_done":
-                    reply = await service.finish_plot_selection(
+                elif action == "multi_done":
+                    reply = await service.finish_selection(
                         session, conversation_id=conversation.conversation_id, form=form
                     )
                 else:
-                    reply = await service.select_whole_farm(
+                    reply = await service.skip_selection(
                         session, conversation_id=conversation.conversation_id, form=form
                     )
             except ConversationNotFound:

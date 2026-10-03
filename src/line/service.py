@@ -19,7 +19,7 @@ from linebot.v3.messaging import (
 )
 
 from src.line.config import line_settings
-from src.line.flex_builders import build_multi_plot_flex
+from src.line.flex_builders import build_multi_choice_flex
 from src.line.schemas import QuickReplyOption
 
 if TYPE_CHECKING:
@@ -301,38 +301,38 @@ async def reply_edit_picker(
         )
 
 
-async def reply_multi_plot_picker(
+async def reply_multi_choice_picker(
     reply_token: str,
     text: str,
     conversation_id: UUID,
     options: list[tuple[str, str]],
     *,
     selected_ids: frozenset[str] = frozenset(),
-    allow_whole_farm: bool = True,
+    skip_label: str | None = None,
 ) -> None:
-    """Sends the multi-plot picker bubble (see build_multi_plot_flex for why
-    this is Flex rather than Quick Reply).
+    """Sends the multi-choice picker bubble (see build_multi_choice_flex for
+    why this is Flex rather than Quick Reply).
 
     altText is what shows in the farmer's notification and on any client that
-    cannot render Flex -- it names the question, not the button list, since a
-    notification reading "แปลง A, แปลง B, ..." tells nobody what is being asked.
+    cannot render Flex -- it is the question itself, since a notification
+    listing every option tells nobody what is being asked.
     """
     await reply_flex(
         reply_token,
         text,
-        build_multi_plot_flex(
+        build_multi_choice_flex(
             text,
             options,
             str(conversation_id),
             selected_ids=selected_ids,
-            allow_whole_farm=allow_whole_farm,
+            skip_label=skip_label,
         ),
     )
 
 
-async def reply_plot_selection(reply_token: str, text: str, conversation_id: UUID) -> None:
-    """The short "เลือกแล้ว: แปลง A, แปลง C (2 แปลง)" line a farmer gets after each
-    tap, carrying a single "✅ เสร็จ" Quick Reply.
+async def reply_selection_ack(reply_token: str, text: str, conversation_id: UUID) -> None:
+    """The short "เลือกแล้ว: แปลง A, แปลง C (2 รายการ)" line a farmer gets after
+    each tap, carrying a single "✅ เสร็จ" Quick Reply.
 
     Deliberately NOT a re-sent bubble: the picker is already on screen and
     still tappable, so re-sending it every tap would bury the chat in
@@ -344,7 +344,7 @@ async def reply_plot_selection(reply_token: str, text: str, conversation_id: UUI
             QuickReplyItem(
                 action=PostbackAction(
                     label="✅ เสร็จ",
-                    data=f"plot_done:{conversation_id}",
+                    data=f"multi_done:{conversation_id}",
                     displayText="เสร็จ",
                 )
             )
