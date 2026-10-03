@@ -34,6 +34,8 @@ from src.line.service import (
     reply_confirm_prompt,
     reply_edit_picker,
     reply_flex,
+    reply_multi_choice_picker,
+    reply_selection_ack,
     reply_task_choices,
     reply_text,
 )
@@ -102,6 +104,24 @@ async def _reply(reply_token: str, reply: service.ConversationReply) -> None:
     """
     if reply.substate == ActiveSubstate.AWAITING_CONFIRMATION:
         await reply_confirm_prompt(reply_token, reply.text, reply.conversation_id)
+        return
+
+    if reply.multi_choice and reply.picker_options is not None:
+        # The multi-choice picker (an OPTION question on a multiple-submit
+        # form): a Flex bubble whose buttons survive the "เลือกแล้ว: ..."
+        # replies the farmer gets while tapping, which Quick Reply would not.
+        await reply_multi_choice_picker(
+            reply_token,
+            reply.text,
+            reply.conversation_id,
+            [(option.id, option.label) for option in reply.picker_options],
+            selected_ids=reply.selected_ids,
+            skip_label=reply.skip_label,
+        )
+        return
+
+    if reply.selection_ack:
+        await reply_selection_ack(reply_token, reply.text, reply.conversation_id)
         return
 
     if not reply.choices:
@@ -481,6 +501,38 @@ async def _handle_postback(event: PostbackEvent) -> None:
         await reply_text(event.reply_token, "บันทึกข้อมูลครบแล้ว ขอบคุณครับ")
         if conversation is not None:
             await _generate_and_push_diary(str(conversation.user_id), event.source.user_id)
+    elif action in ("multi_toggle", "multi_done", "multi_skip"):
+        # The multi-choice picker's own buttons. All three go through the same
+        # load-form-then-call-service shape as every other postback here; the
+        # staleness check (an old bubble is still tappable forever) lives in
+        # the service layer, next to the row lock it needs.
+        conversation_id = args[0]
+        async with async_session_maker() as session:
+            conversation = await session.get(Conversation, UUID(conversation_id))
+            if conversation is None:
+                await reply_text(event.reply_token, "ไม่พบบทสนทนานี้แล้ว")
+                return
+            form = await get_form(str(conversation.task_form_id))
+            try:
+                if action == "multi_toggle":
+                    reply = await service.toggle_choice(
+                        session,
+                        conversation_id=conversation.conversation_id,
+                        choice_id=args[1],
+                        form=form,
+                    )
+                elif action == "multi_done":
+                    reply = await service.finish_selection(
+                        session, conversation_id=conversation.conversation_id, form=form
+                    )
+                else:
+                    reply = await service.skip_selection(
+                        session, conversation_id=conversation.conversation_id, form=form
+                    )
+            except ConversationNotFound:
+                await reply_text(event.reply_token, "ไม่พบบทสนทนานี้แล้ว")
+                return
+        await _reply(event.reply_token, reply)
     elif action == "edit":
         # US2-6: shows a picker of every already-answered (or skipped)
         # question rather than asking which field by name -- same

@@ -40,3 +40,13 @@ class AnswerSource(StrEnum):
 
     LLM_EXTRACTED = "llm_extracted"
     GUIDED_FLOW = "guided_flow"
+
+
+# The pause button's label. Lives here, not in service.py, because the
+# multi-plot picker's Flex footer (src/line/flex_builders.py) needs the exact
+# same literal -- a farmer must be able to pause mid-selection, and that
+# button works by sending this text, which handle_answer already recognises
+# as a pause from any step. Importing service.py from a builder would be a
+# layering inversion; the emoji drifting between the two would be a bug
+# nobody notices until a farmer taps pause and gets "ไม่เข้าใจคำตอบ".
+PAUSE_LABEL = "⏸️ พักไว้ก่อน"
