@@ -201,14 +201,24 @@ def question_json(
 
 
 def build_form_response(
-    *, task_form_id: uuid.UUID, questions: list[dict[str, Any]]
+    *,
+    task_form_id: uuid.UUID,
+    questions: list[dict[str, Any]],
+    is_multiple_submit: bool = False,
 ) -> dict[str, Any]:
     """The full `{"value": ..., "error": null}` envelope forms/client.py's
     get_form() expects, wrapping the given questions in a single section.
+
+    `is_multiple_submit` is spelled the way Kotlin sends it (camelCase, see
+    web-backend's Form.Detail). It matters because the chatbot reads that flag
+    from THIS payload, not from the form.task_form row a test may also have
+    seeded -- so a test that only seeds the row never reaches the
+    multiple-submit (or multi-plot) code at all.
     """
     return {
         "value": {
             "formId": str(task_form_id),
+            "isMultipleSubmit": is_multiple_submit,
             "sections": [{"questions": questions}],
         },
         "error": None,
