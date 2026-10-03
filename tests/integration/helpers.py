@@ -296,3 +296,40 @@ async def seed_conversation_answer(
         },
     )
     await session.commit()
+
+
+async def seed_farm_with_plots(
+    session: AsyncSession,
+    *,
+    farmer_id: uuid.UUID,
+    plot_names: list[str],
+    farm_name: str = "ไร่ทดสอบ",
+) -> tuple[uuid.UUID, list[uuid.UUID]]:
+    """One farm linked to this farmer, plus its plots -- what
+    src/line/plot_picker.py's scoped query reads. Returns (farm_id, plot_ids)
+    in the order the names were given.
+    """
+    farm_id = uuid.uuid4()
+    await session.execute(
+        text("INSERT INTO agriculture.farm (farm_id, farm_name) VALUES (:farm_id, :farm_name)"),
+        {"farm_id": farm_id, "farm_name": farm_name},
+    )
+    await session.execute(
+        text(
+            "INSERT INTO agriculture.farmer_farm (farmer_id, farm_id) VALUES (:farmer_id, :farm_id)"
+        ),
+        {"farmer_id": farmer_id, "farm_id": farm_id},
+    )
+    plot_ids = []
+    for name in plot_names:
+        plot_id = uuid.uuid4()
+        await session.execute(
+            text(
+                "INSERT INTO agriculture.plot (plot_id, farm_id, plot_name) "
+                "VALUES (:plot_id, :farm_id, :plot_name)"
+            ),
+            {"plot_id": plot_id, "farm_id": farm_id, "plot_name": name},
+        )
+        plot_ids.append(plot_id)
+    await session.commit()
+    return farm_id, plot_ids
