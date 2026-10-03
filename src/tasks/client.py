@@ -17,7 +17,7 @@ from src.exceptions import UpstreamServiceError
 from src.request_id import REQUEST_ID_HEADER, get_request_id
 from src.tasks.config import tasks_settings
 from src.tasks.exceptions import HandlerNotSupported
-from src.tasks.schemas import TaskSubmission
+from src.tasks.schemas import TaskListItem, TaskSubmission
 
 
 async def submit_task(submission: TaskSubmission) -> None:
@@ -66,6 +66,37 @@ async def submit_task(submission: TaskSubmission) -> None:
             f"Go doesn't support automatic storage for this handler yet (501): {detail}"
         )
     raise UpstreamServiceError(f"Go backend returned {response.status_code}: {detail}")
+
+
+async def fetch_pending_tasks(*, user_id: str) -> list[TaskListItem]:
+    """GET Go's /service/tasks (docs-and-plan#176) -- the service-key twin
+    of Go's own farmer-facing GetTasks, for the chatbot's LIFF to-do list
+    (no farmer JWT session to call the real /tasks with). Returns every
+    task Go knows about for this user_id, status included -- "pending"
+    filtering (excluding COMPLETED) is this caller's job, not Go's, same
+    division of responsibility as fetch_last_answer/GetLastAnswer.
+
+    page_size=100, not Go's own default of 50 -- a farmer's full open task
+    list is expected to comfortably fit in one page for the to-do screen;
+    revisit with real pagination if that stops being true.
+    """
+    async with httpx.AsyncClient(base_url=tasks_settings.GO_BACKEND_URL, timeout=30.0) as client:
+        response = await client.get(
+            "/service/tasks",
+            params={"user_id": user_id, "page_size": 100},
+            headers={
+                "X-Service-Key": tasks_settings.GO_SERVICE_KEY,
+                REQUEST_ID_HEADER: get_request_id(),
+            },
+        )
+
+    if response.status_code >= 400:
+        raise UpstreamServiceError(
+            f"Go backend returned {response.status_code} for pending-tasks lookup: "
+            f"{_error_detail(response)}"
+        )
+
+    return [TaskListItem.model_validate(row) for row in response.json()]
 
 
 async def fetch_last_answer(*, user_id: str, handler: str) -> dict[str, Any] | None:
