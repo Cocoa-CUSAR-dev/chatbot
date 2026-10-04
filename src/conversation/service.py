@@ -39,7 +39,7 @@ from src.conversation.constants import ActiveSubstate, AnswerSource, Conversatio
 from src.conversation.exceptions import ConversationNotFound
 from src.conversation.models import Conversation, ConversationAnswer
 from src.conversation.state_machine import on_guided_answer
-from src.conversation.validation import validate_answer
+from src.conversation.validation import parse_lat_lng, validate_answer
 from src.forms.schemas import FormDetail
 from src.line import parent_picker
 from src.tasks.client import submit_task
@@ -244,7 +244,7 @@ _SUPPORTED_INPUT_TYPES = {
 # it). The prompt line below is shown under the question so a farmer who
 # doesn't notice the button still knows what to do.
 LOCATION_BUTTON_LABEL = "📍 ส่งตำแหน่ง"
-_LOCATION_PROMPT = f'กดปุ่ม "{LOCATION_BUTTON_LABEL}" ด้านล่างครับ'
+_LOCATION_PROMPT = f"กรุณากดปุ่ม {LOCATION_BUTTON_LABEL} ด้านล่างครับ"
 
 
 def _is_supported(q: dict[str, Any]) -> bool:
@@ -874,6 +874,17 @@ async def handle_answer(
     # defined, including the is_skip/resolved_value/no-open-question cases
     # that skip that block entirely.
     text_for_validation = raw_text
+
+    if not is_skip and current_question is not None and current_question.input_type == "GEODATA":
+        return await _answer_geodata_from_text(
+            session,
+            conversation=conversation,
+            question=current_question,
+            questions=questions,
+            form=form,
+            raw_text=raw_text,
+        )
+
     if not is_skip and resolved_value is None and current_question is not None:
         # A mandatory free-text question offers no skip button (see
         # _choices_for), so blank/whitespace-only text is never an
@@ -976,6 +987,60 @@ def _geodata_error(question: Question, lat: float, lng: float) -> str | None:
     to exactly the same rule.
     """
     return validate_answer(question.validation_rule, f"{lat},{lng}")
+
+
+# Shown above the re-asked GEODATA question when typed text couldn't be read
+# as a coordinate. The question itself already ends with _LOCATION_PROMPT, so
+# the farmer reads: what went wrong, the question, and the one thing to do.
+_LOCATION_TEXT_NOT_UNDERSTOOD = "ขออภัยครับ อ่านตำแหน่งจากข้อความนี้ไม่ได้"
+
+
+async def _answer_geodata_from_text(
+    session: AsyncSession,
+    *,
+    conversation: Conversation,
+    question: Question,
+    questions: list[Question],
+    form: FormDetail,
+    raw_text: str,
+) -> ConversationReply:
+    """Typed text at a GEODATA question (skip and pause never reach here --
+    handle_answer resolves both first, exactly as for any other question).
+
+    Pasted coordinates ("13.75, 100.5", e.g. copied from a map app) are a
+    real answer: parsed by the same parse_lat_lng the validator uses,
+    range-checked by the question's own rule, and stored in the same
+    [{"lat", "lng"}] shape a shared location gets -- never as the "lat,lng"
+    string, which Go's validation gate would reject.
+
+    Anything else is re-asked with the 📍 button, never a dead end (the same
+    rule as docs-and-plan#189). Deliberately NOT geocoded: turning
+    "สวนหลังบ้าน" into a coordinate is a guess, and a wrong location on a
+    pest or activity record is worse than a skipped one.
+    """
+    coordinates = parse_lat_lng(raw_text)
+    if coordinates is None:
+        return _reply_for_question(
+            conversation.conversation_id,
+            question,
+            page=conversation.current_page,
+            error=_LOCATION_TEXT_NOT_UNDERSTOOD,
+        )
+
+    lat, lng = coordinates
+    error = _geodata_error(question, lat, lng)
+    if error is not None:
+        return _reply_for_question(
+            conversation.conversation_id, question, page=conversation.current_page, error=error
+        )
+
+    return await _store_answer_and_advance(
+        session,
+        conversation=conversation,
+        questions=questions,
+        form=form,
+        answer=_geodata_answer(lat, lng, display=raw_text.strip()),
+    )
 
 
 async def handle_location(
