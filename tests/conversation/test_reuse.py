@@ -259,3 +259,37 @@ class TestSanitizeThenBuildIntegration:
 
         assert len(rows) == 1
         assert rows[0].answer == {"text": "sprayed at dawn"}
+
+
+class TestGeodataIsNeverReused:
+    """ "ตำแหน่งปัจจุบัน" means where the farmer is now -- a previous visit's
+    location must never be offered or prefilled, even if Go passes it back.
+    """
+
+    @staticmethod
+    def _gis() -> dict[str, object]:
+        return {
+            "question_id": str(uuid.uuid4()),
+            "label": "ตำแหน่งปัจจุบัน",
+            "field_name": "gis",
+            "input_type": "GEODATA",
+            "is_mandatory": False,
+            "sort_order": 1,
+        }
+
+    async def test_previous_location_is_dropped_from_the_offer(self) -> None:
+        questions = _form_with(_varchar("note"), self._gis())
+        go_response = {"note": "ใส่ปุ๋ย", "gis": [{"lat": 13.75, "lng": 100.5}]}
+
+        with patch(
+            "src.conversation.reuse.fetch_sanitized_autofill",
+            new=AsyncMock(return_value=go_response),
+        ):
+            result = await reuse.sanitize_for_autofill(
+                {"note": "ใส่ปุ๋ย", "gis": [{"lat": 13.75, "lng": 100.5}]}, questions
+            )
+
+        assert result == {"note": "ใส่ปุ๋ย"}
+        assert "ตำแหน่ง" not in reuse.format_autofill_preview(result, questions)
+        rows = reuse.build_answer_rows(uuid.uuid4(), result, questions)
+        assert [row.answer for row in rows] == [{"text": "ใส่ปุ๋ย"}]

@@ -7,7 +7,7 @@ answering is covered alongside handle_location.
 """
 
 import uuid
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.conversation import service
 from src.forms.schemas import FormDetail
@@ -97,3 +97,47 @@ class TestRouterAttachesTheLocationButton:
 
         options = reply_text.await_args.kwargs["quick_reply"]
         assert all(o.kind == "message" for o in options)
+
+
+class TestEditAndResumeReShowTheLocationPrompt:
+    async def test_editing_the_location_re_asks_with_the_button(self) -> None:
+        """US2-6's แก้ไข re-opens the question through _reply_for_question, so
+        the farmer gets the 📍 prompt (and input_type for the button) again.
+        """
+        form = _form(_gis_question())
+        question = service.questions_from_form(form)[0]
+        conversation = MagicMock(conversation_id=uuid.uuid4(), current_page=0)
+        session = MagicMock()
+        session.get = AsyncMock(return_value=conversation)
+        session.commit = AsyncMock()
+
+        reply = await service.begin_edit(
+            session,
+            conversation_id=conversation.conversation_id,
+            question_id=question.question_id,
+            form=form,
+        )
+
+        assert reply.input_type == "GEODATA"
+        assert "กรุณากดปุ่ม 📍 ส่งตำแหน่ง ด้านล่างครับ" in reply.text
+
+    async def test_resuming_at_the_location_question_re_asks_with_the_button(self) -> None:
+        form = _form(_gis_question())
+        question = service.questions_from_form(form)[0]
+        conversation = MagicMock(
+            conversation_id=uuid.uuid4(),
+            current_question_id=question.question_id,
+            current_page=0,
+            parent_answer=None,
+        )
+        session = MagicMock()
+        session.commit = AsyncMock()
+        execute_result = MagicMock()
+        execute_result.scalars.return_value.all.return_value = []
+        session.execute = AsyncMock(return_value=execute_result)
+
+        reply = await service.resume_conversation(session, conversation=conversation, form=form)
+
+        assert reply.input_type == "GEODATA"
+        assert reply.text.startswith("ตำแหน่งปัจจุบัน")
+        assert "กรุณากดปุ่ม 📍 ส่งตำแหน่ง ด้านล่างครับ" in reply.text
