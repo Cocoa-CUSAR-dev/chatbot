@@ -26,7 +26,7 @@ OPTION questions failed with `invalid input syntax for type uuid`).
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 from uuid import UUID
 
@@ -633,25 +633,20 @@ async def _handle_parent_answer(
     return _reply_for_question(conversation.conversation_id, first_question)
 
 
-async def handle_answer(
-    session: AsyncSession,
-    *,
-    conversation_id: UUID,
-    raw_text: str,
-    form: FormDetail,
-) -> ConversationReply | None:
-    # Locks the conversation row for the rest of this function -- serializes
-    # concurrent webhook deliveries for the same conversation (LINE's own
-    # retry-on-slow-response, or a farmer double-tapping/double-texting can
-    # otherwise both read the same current_question_id and both write an
-    # answer for it before either commits; live-caught 2026-08-09 during the
-    # chatbot pathway audit). NOWAIT means a message that arrives while
-    # another is still being processed for this conversation is dropped
-    # immediately rather than queued -- first message wins, full stop.
-    # Reconciling two rapid, genuinely different answers (e.g. a farmer
-    # correcting a typo a second later) is deferred to the future LLM-driven
-    # flow, which can actually decide what the farmer meant; this guided
-    # flow doesn't try.
+class _AnswerInFlight(Exception):
+    """Another message for this conversation is already being processed."""
+
+
+async def _lock_conversation(session: AsyncSession, conversation_id: UUID) -> Conversation:
+    """Locks the conversation row for the rest of the caller's transaction --
+    see handle_answer's comment for why, and why NOWAIT. Shared with
+    handle_location so a location and a typed answer arriving together for
+    the same question can't both be stored: whichever gets the lock first
+    wins, the other is dropped, same as two typed answers.
+
+    Raises _AnswerInFlight on lock contention (callers return None, i.e. no
+    reply) and ConversationNotFound when the row is gone.
+    """
     try:
         conversation = (
             await session.execute(
@@ -672,9 +667,122 @@ async def handle_answer(
             "conversation_id=%s already has an answer in flight -- dropping this message",
             conversation_id,
         )
-        return None
+        raise _AnswerInFlight() from exc
     if conversation is None:
         raise ConversationNotFound()
+    return conversation
+
+
+async def _store_answer_and_advance(
+    session: AsyncSession,
+    *,
+    conversation: Conversation,
+    questions: list[Question],
+    form: FormDetail,
+    answer: dict[str, Any],
+) -> ConversationReply:
+    """Stores `answer` against the conversation's currently-open question and
+    moves on -- to the next question, or to the confirmation summary once
+    everything required is in.
+
+    Extracted from handle_answer so a location shared through LINE's picker
+    (handle_location) ends a question exactly the way a typed answer does.
+    A location arrives as its own webhook message type, not text, so without
+    this it would need its own copy of the upsert, the state-machine call,
+    the confirmation-summary branch and the advance -- four things that have
+    to stay identical for the two paths to be indistinguishable downstream.
+
+    Same name and signature as the helper the multi-plot work (chatbot#76)
+    factors out for its own postback answers, so whichever of the two lands
+    second merges into one helper rather than two. `form` is unused here and
+    kept for that reason.
+    """
+    conversation_id = conversation.conversation_id
+
+    # Upsert, not a blind insert: US2-6's "แก้ไข" (edit-at-confirmation,
+    # begin_edit below) can re-open a question that's already been answered
+    # once, or skipped -- update that row in place rather than adding a
+    # second one for the same question_id, which _format_answered_lines and
+    # confirm_conversation's own dict-comprehension would otherwise both
+    # silently show/collapse in an order that isn't actually guaranteed (no
+    # ORDER BY on _answered_rows, and no unique constraint on
+    # (conversation_id, question_id) at the DB level). The normal
+    # forward-only flow never finds an existing row here -- current_question_id
+    # only ever advances to a not-yet-answered question -- so this is a
+    # no-op behavior change for every path except editing.
+    answer_rows = await _answered_rows(session, conversation_id)
+    existing_row = next(
+        (row for row in answer_rows if row.question_id == conversation.current_question_id),
+        None,
+    )
+    if existing_row is not None:
+        # Reassign, not mutate -- this column isn't wrapped in
+        # sqlalchemy.ext.mutable.MutableDict, so an in-place
+        # `existing_row.answer["text"] = ...` wouldn't be seen by the unit
+        # of work at commit time.
+        existing_row.answer = answer
+    else:
+        existing_row = ConversationAnswer(
+            conversation_id=conversation_id,
+            question_id=conversation.current_question_id,
+            answer=answer,
+            source=AnswerSource.GUIDED_FLOW,
+        )
+        session.add(existing_row)
+        answer_rows.append(existing_row)
+    await session.flush()
+
+    answered = {row.question_id for row in answer_rows}
+    transition = on_guided_answer(all_slots_filled=_all_required_answered(questions, answered))
+
+    if transition.next_state == ActiveSubstate.AWAITING_CONFIRMATION:
+        _advance_to(conversation, None)
+        await session.commit()
+        return ConversationReply(
+            conversation_id=conversation_id,
+            substate=ActiveSubstate.AWAITING_CONFIRMATION,
+            text=_format_confirmation_summary(questions, answer_rows),
+        )
+
+    next_question = _next_unanswered_required(questions, answered)
+    if next_question is None:
+        # on_guided_answer's contract (constants.py) says this can't happen --
+        # "slots remain" and "no unanswered required question found" are
+        # contradictory. Fail loudly rather than silently going quiet on the
+        # farmer.
+        raise RuntimeError(
+            f"on_guided_answer reported slots remaining for conversation_id={conversation_id} "
+            "but no unanswered mandatory question was found"
+        )
+
+    _advance_to(conversation, next_question.question_id)
+    await session.commit()
+    return _reply_for_question(conversation_id, next_question)
+
+
+async def handle_answer(
+    session: AsyncSession,
+    *,
+    conversation_id: UUID,
+    raw_text: str,
+    form: FormDetail,
+) -> ConversationReply | None:
+    # Locks the conversation row for the rest of this function -- serializes
+    # concurrent webhook deliveries for the same conversation (LINE's own
+    # retry-on-slow-response, or a farmer double-tapping/double-texting can
+    # otherwise both read the same current_question_id and both write an
+    # answer for it before either commits; live-caught 2026-08-09 during the
+    # chatbot pathway audit). NOWAIT means a message that arrives while
+    # another is still being processed for this conversation is dropped
+    # immediately rather than queued -- first message wins, full stop.
+    # Reconciling two rapid, genuinely different answers (e.g. a farmer
+    # correcting a typo a second later) is deferred to the future LLM-driven
+    # flow, which can actually decide what the farmer meant; this guided
+    # flow doesn't try.
+    try:
+        conversation = await _lock_conversation(session, conversation_id)
+    except _AnswerInFlight:
+        return None
 
     # Checked before everything else below (parent-picker step, no open
     # question, or a real question) -- pause (US2-3) works identically
@@ -828,65 +936,104 @@ async def handle_answer(
     if resolved_value is not None:
         answer["value"] = resolved_value
 
-    # Upsert, not a blind insert: US2-6's "แก้ไข" (edit-at-confirmation,
-    # begin_edit below) can re-open a question that's already been answered
-    # once, or skipped -- update that row in place rather than adding a
-    # second one for the same question_id, which _format_answered_lines and
-    # confirm_conversation's own dict-comprehension would otherwise both
-    # silently show/collapse in an order that isn't actually guaranteed (no
-    # ORDER BY on _answered_rows, and no unique constraint on
-    # (conversation_id, question_id) at the DB level). The normal
-    # forward-only flow never finds an existing row here -- current_question_id
-    # only ever advances to a not-yet-answered question -- so this is a
-    # no-op behavior change for every path except editing.
-    answer_rows = await _answered_rows(session, conversation_id)
-    existing_row = next(
-        (row for row in answer_rows if row.question_id == conversation.current_question_id),
-        None,
+    return await _store_answer_and_advance(
+        session, conversation=conversation, questions=questions, form=form, answer=answer
     )
-    if existing_row is not None:
-        # Reassign, not mutate -- this column isn't wrapped in
-        # sqlalchemy.ext.mutable.MutableDict, so an in-place
-        # `existing_row.answer["text"] = ...` wouldn't be seen by the unit
-        # of work at commit time.
-        existing_row.answer = answer
-    else:
-        existing_row = ConversationAnswer(
-            conversation_id=conversation_id,
-            question_id=conversation.current_question_id,
-            answer=answer,
-            source=AnswerSource.GUIDED_FLOW,
+
+
+# Prefixed to the current step when a location arrives while the bot is
+# asking something else -- the location is not stored, and the farmer is
+# shown exactly where they are instead.
+_LOCATION_NOT_ASKED = "ตอนนี้ยังไม่ได้ถามตำแหน่งครับ"
+
+
+def _geodata_answer(
+    lat: float, lng: float, *, display: str, source_kind: str | None = None
+) -> dict[str, Any]:
+    """The stored answer for a GEODATA question.
+
+    `value` is already the exact shape mobile-backend's isValidGeodata
+    accepts -- a non-empty list of {"lat": number, "lng": number}, the same
+    thing mobile-app sends. confirm_conversation submits `value or text`, so
+    the list is what reaches Go; a "lat,lng" string would be rejected by Go's
+    validation gate and fail the whole submission.
+
+    `text` is what the farmer reads in the confirmation summary and resume
+    recap (both read answer["text"]).
+    """
+    answer: dict[str, Any] = {"text": f"📍 {display}", "value": [{"lat": lat, "lng": lng}]}
+    if source_kind is not None:
+        answer["source_kind"] = source_kind
+    return answer
+
+
+def _geodata_error(question: Question, lat: float, lng: float) -> str | None:
+    """Range-checks a coordinate against the question's own rule (V16's
+    valid_lat_lng), returning the rule's error message to re-ask with.
+
+    Goes through validate_answer itself rather than re-implementing the
+    check, so a location from LINE's picker and pasted coordinates are held
+    to exactly the same rule.
+    """
+    return validate_answer(question.validation_rule, f"{lat},{lng}")
+
+
+async def handle_location(
+    session: AsyncSession,
+    *,
+    conversation_id: UUID,
+    latitude: float,
+    longitude: float,
+    address: str | None,
+    form: FormDetail,
+) -> ConversationReply | None:
+    """A location shared through LINE's own location picker -- the answer to
+    a GEODATA question.
+
+    Mirrors handle_answer: same row lock, same "first message wins" (returns
+    None when another message for this conversation is in flight), same
+    upsert-and-advance via _store_answer_and_advance, so an edited location
+    replaces the old one in place.
+
+    A location that arrives while the bot is asking something else (another
+    question, the parent picker, or the confirmation summary) is NOT stored
+    against whatever happens to be open -- a coordinate saved as a farm name
+    or a harvest weight would be silently wrong data. The farmer is shown the
+    step they're actually on instead, via resume_conversation, which already
+    knows how to re-render every one of those steps.
+    """
+    try:
+        conversation = await _lock_conversation(session, conversation_id)
+    except _AnswerInFlight:
+        return None
+
+    questions = questions_from_form(form)
+    question_by_id = {q.question_id: q for q in questions}
+    current_question = (
+        question_by_id.get(conversation.current_question_id)
+        if conversation.current_question_id is not None
+        else None
+    )
+    picker_pending = (conversation.parent_answer or {}).get("pending_kind") is not None
+
+    if picker_pending or current_question is None or current_question.input_type != "GEODATA":
+        current_step = await resume_conversation(session, conversation=conversation, form=form)
+        return replace(current_step, text=f"{_LOCATION_NOT_ASKED}\n\n{current_step.text}")
+
+    error = _geodata_error(current_question, latitude, longitude)
+    if error is not None:
+        return _reply_for_question(
+            conversation_id, current_question, page=conversation.current_page, error=error
         )
-        session.add(existing_row)
-        answer_rows.append(existing_row)
-    await session.flush()
 
-    answered = {row.question_id for row in answer_rows}
-    transition = on_guided_answer(all_slots_filled=_all_required_answered(questions, answered))
-
-    if transition.next_state == ActiveSubstate.AWAITING_CONFIRMATION:
-        _advance_to(conversation, None)
-        await session.commit()
-        return ConversationReply(
-            conversation_id=conversation_id,
-            substate=ActiveSubstate.AWAITING_CONFIRMATION,
-            text=_format_confirmation_summary(questions, answer_rows),
-        )
-
-    next_question = _next_unanswered_required(questions, answered)
-    if next_question is None:
-        # on_guided_answer's contract (constants.py) says this can't happen --
-        # "slots remain" and "no unanswered required question found" are
-        # contradictory. Fail loudly rather than silently going quiet on the
-        # farmer.
-        raise RuntimeError(
-            f"on_guided_answer reported slots remaining for conversation_id={conversation_id} "
-            "but no unanswered mandatory question was found"
-        )
-
-    _advance_to(conversation, next_question.question_id)
-    await session.commit()
-    return _reply_for_question(conversation_id, next_question)
+    display = (address or "").strip() or f"{latitude:.6f}, {longitude:.6f}"
+    return await _store_answer_and_advance(
+        session,
+        conversation=conversation,
+        questions=questions,
+        form=form,
+        answer=_geodata_answer(latitude, longitude, display=display, source_kind="line_location"),
+    )
 
 
 async def confirm_conversation(

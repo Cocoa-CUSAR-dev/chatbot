@@ -1,4 +1,4 @@
-from src.conversation.validation import validate_answer
+from src.conversation.validation import parse_lat_lng, validate_answer
 from src.forms.client import _convert_keys
 
 
@@ -115,6 +115,23 @@ class TestGeodata:
 
     def test_non_numeric_fails(self) -> None:
         assert validate_answer(self._RULE, "bangkok") is not None
+
+    def test_nan_fails_even_without_a_range_rule(self) -> None:
+        """NaN compares False both ways, so it used to slip past the range
+        check -- and it has no JSON form, so storing it would break the
+        jsonb write.
+        """
+        assert validate_answer({"type": "GEODATA"}, "nan,nan") is not None
+        assert validate_answer(self._RULE, "inf,100") is not None
+
+
+class TestParseLatLng:
+    def test_parses_a_pair(self) -> None:
+        assert parse_lat_lng(" 13.75 , 100.5 ") == (13.75, 100.5)
+
+    def test_rejects_anything_else(self) -> None:
+        for text in ("13.75", "a,b", "1,2,3", "", "nan,1"):
+            assert parse_lat_lng(text) is None, text
 
 
 def test_real_camel_case_shape_survives_convert_keys_and_validates() -> None:

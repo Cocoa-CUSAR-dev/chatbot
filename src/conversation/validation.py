@@ -80,18 +80,43 @@ def _valid_datetime(text: str, rule: dict[str, Any]) -> bool:
     return not (rule.get("max_date") == "today" and value > datetime.now())
 
 
-def _valid_geodata(text: str, rule: dict[str, Any]) -> bool:
-    # "lat,lng" -- matches how the LIFF-side map picker already hands a
-    # coordinate pair back as a single string field.
+def parse_lat_lng(text: str) -> tuple[float, float] | None:
+    """A "lat,lng" string -> (lat, lng), or None if it isn't one.
+
+    The one definition of the coordinate text format, shared by
+    _valid_geodata below and service.py's GEODATA handling, which turns
+    pasted coordinates into the [{"lat", "lng"}] list Go's isValidGeodata
+    requires. Note that "lat,lng" is only how the chatbot READS typed
+    coordinates -- it is never what gets submitted.
+
+    Non-finite values ("nan", "inf") are rejected outright: they parse as
+    floats, slip past every range comparison (NaN compares False both ways),
+    and have no JSON representation, so storing one would break the jsonb
+    write rather than fail validation.
+    """
     parts = text.strip().split(",")
     if len(parts) != 2:
-        return False
+        return None
     try:
         lat, lng = float(parts[0].strip()), float(parts[1].strip())
     except ValueError:
+        return None
+    if not (math.isfinite(lat) and math.isfinite(lng)):
+        return None
+    return lat, lng
+
+
+def _valid_geodata(text: str, rule: dict[str, Any]) -> bool:
+    # "lat,lng" -- matches how the LIFF-side map picker already hands a
+    # coordinate pair back as a single string field, and what service.py
+    # builds from a location shared through LINE's own picker before
+    # checking it here.
+    parsed = parse_lat_lng(text)
+    if parsed is None:
         return False
     if not rule.get("valid_lat_lng"):
         return True
+    lat, lng = parsed
     return -90 <= lat <= 90 and -180 <= lng <= 180
 
 
