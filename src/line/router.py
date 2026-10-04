@@ -104,13 +104,22 @@ async def _reply(reply_token: str, reply: service.ConversationReply) -> None:
         await reply_confirm_prompt(reply_token, reply.text, reply.conversation_id)
         return
 
-    if not reply.choices:
+    # GEODATA: LINE's own location picker leads, ahead of skip/pause, and
+    # takes one of the 13 Quick Reply slots (a GEODATA question only ever
+    # has skip+pause otherwise, so nothing real is ever pushed out).
+    location_button = (
+        [QuickReplyOption(label=service.LOCATION_BUTTON_LABEL, kind="location")]
+        if reply.input_type == "GEODATA"
+        else []
+    )
+
+    if not reply.choices and not location_button:
         await reply_text(reply_token, reply.text)
         return
 
-    quick_reply = [
+    quick_reply = location_button + [
         QuickReplyOption(label=c.label[:20], text=c.label)
-        for c in reply.choices[:_QUICK_REPLY_LIMIT]
+        for c in (reply.choices or [])[: _QUICK_REPLY_LIMIT - len(location_button)]
     ]
     await reply_text(reply_token, reply.text, quick_reply=quick_reply)
 

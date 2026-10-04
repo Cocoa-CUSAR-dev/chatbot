@@ -155,11 +155,12 @@ class ConversationReply:
     # terminal thanks. Same "let the caller attach the right buttons"
     # pattern as submission_failed above.
     offer_another: bool = False
-    # Debug-only passthrough of the open question's own shape -- None
-    # whenever this reply isn't "here's a fixed question to answer" (e.g.
-    # confirmation/completed/cancelled replies have no single open question).
-    # Not used by the real LINE webhook path; exists so the dev test UI can
-    # show a developer what's actually being validated without guessing.
+    # The open question's own shape -- None whenever this reply isn't
+    # "here's a fixed question to answer" (e.g. confirmation/completed/
+    # cancelled replies have no single open question). Started as a
+    # debug-only passthrough for the dev test UI; the LINE webhook path now
+    # reads input_type too, to attach the 📍 location button to GEODATA
+    # questions (router.py's _reply).
     input_type: str | None = None
     validation_rule: dict[str, Any] | None = None
 
@@ -208,16 +209,42 @@ def _choices_for(q: dict[str, Any], is_mandatory: bool) -> tuple[list[Choice], b
 # DATE/DATETIME/FLOAT/INT all validate as free text through the same
 # validate_answer()-then-re-ask path VARCHAR/BOOLEAN already use, with no
 # LINE-side UI dependency -- CB-9 confirmed there's no blocker for any of
-# them. GEODATA stays deferred: it needs a storage.geo row + FK link, which
-# Go's dissection (SubmitTaskForUser, form_handler.go) still only does as a
-# single-table flat insert with no storage.geo handling at all -- a farmer
-# could answer a GEODATA question here and have the submission silently
-# lose the coordinate. "upload" is a VARCHAR field_name convention (see
-# form.question seed data) for photo attachments, which have nowhere to go
-# yet either. Filtered out at the form level (not just skipped when picking
-# the next question) so unsupported types never show up in the guided flow
-# OR the confirmation summary.
-_SUPPORTED_INPUT_TYPES = {"VARCHAR", "OPTION", "BOOLEAN", "FLOAT", "INT", "DATE", "DATETIME"}
+# them.
+#
+# GEODATA was deferred here for a long time on the grounds that Go's
+# dissection has no storage.geo handling. That turned out not to block
+# anything: the task forms that ask for a location (farm_activity,
+# farm_pest_disease_record, processing_record -- field_name "gis") have no
+# geo column on their domain tables at all, so the coordinate lives only in
+# form.response.answer, which Go stores whole. That is exactly where
+# mobile-app's own submissions keep it, so answering through the chat
+# reaches parity with the app rather than losing anything. The farmer
+# answers by tapping LINE's native location picker (see LOCATION_BUTTON_LABEL
+# below and handle_location); the stored value is already in the
+# [{"lat", "lng"}] shape Go's isValidGeodata accepts.
+#
+# "upload" is a VARCHAR field_name convention (see form.question seed data)
+# for photo attachments, which still have nowhere to go from the chat.
+# Filtered out at the form level (not just skipped when picking the next
+# question) so unsupported types never show up in the guided flow OR the
+# confirmation summary.
+_SUPPORTED_INPUT_TYPES = {
+    "VARCHAR",
+    "OPTION",
+    "BOOLEAN",
+    "FLOAT",
+    "INT",
+    "DATE",
+    "DATETIME",
+    "GEODATA",
+}
+
+# GEODATA questions are answered with LINE's own location picker, opened by
+# a Quick Reply LocationAction carrying this label (router.py's _reply adds
+# it). The prompt line below is shown under the question so a farmer who
+# doesn't notice the button still knows what to do.
+LOCATION_BUTTON_LABEL = "📍 ส่งตำแหน่ง"
+_LOCATION_PROMPT = f'กดปุ่ม "{LOCATION_BUTTON_LABEL}" ด้านล่างครับ'
 
 
 def _is_supported(q: dict[str, Any]) -> bool:
@@ -388,11 +415,23 @@ def _advance_to(conversation: Conversation, question_id: UUID | None) -> None:
     conversation.current_page = 0
 
 
+def _question_text(question: Question, indicator: str = "") -> str:
+    """The question as the farmer reads it. Shared by every path that asks a
+    question -- first ask, re-ask after an error, edit, and resume -- so a
+    GEODATA question carries its "press 📍" line in all of them, not just the
+    first time it's asked.
+    """
+    text = question.label + indicator
+    if question.input_type == "GEODATA":
+        text = f"{text}\n{_LOCATION_PROMPT}"
+    return text
+
+
 def _reply_for_question(
     conversation_id: UUID, question: Question, *, page: int = 0, error: str | None = None
 ) -> ConversationReply:
     paginated = _paginate(question, page)
-    label = question.label + paginated.indicator
+    label = _question_text(question, paginated.indicator)
     text = f"{error}\n\n{label}" if error else label
     return ConversationReply(
         conversation_id=conversation_id,
@@ -1168,7 +1207,7 @@ async def resume_conversation(
     return ConversationReply(
         conversation_id=conversation.conversation_id,
         substate=ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION,
-        text=recap + current_question.label + paginated.indicator,
+        text=recap + _question_text(current_question, paginated.indicator),
         choices=paginated.choices,
         input_type=current_question.input_type,
         validation_rule=current_question.validation_rule,
