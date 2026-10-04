@@ -179,3 +179,27 @@ async def test_multicast_text_batched_reports_a_failed_chunk_without_losing_earl
 
     assert succeeded == ["U1", "U3"]
     assert failed == ["U2"]
+
+
+async def test_location_option_becomes_a_native_location_action() -> None:
+    """GEODATA: the 📍 button must open LINE's own location sheet (a
+    LocationAction), not re-send its label as text -- the location comes
+    back to the webhook as a location message.
+    """
+    ctx1, ctx2, messaging_api = _patched_messaging_api()
+    with ctx1, ctx2:
+        await service.reply_text(
+            "reply-token",
+            "ตำแหน่งปัจจุบัน",
+            [
+                QuickReplyOption(label="📍 ส่งตำแหน่ง", kind="location"),
+                QuickReplyOption(label="⏭️ ข้าม", text="⏭️ ข้าม"),
+            ],
+        )
+
+    items = messaging_api.reply_message.await_args.args[0].messages[0].quick_reply.items
+    assert items[0].action.type == "location"
+    assert items[0].action.label == "📍 ส่งตำแหน่ง"
+    # Every other button keeps behaving exactly as before.
+    assert items[1].action.type == "message"
+    assert items[1].action.text == "⏭️ ข้าม"
