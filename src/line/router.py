@@ -446,6 +446,12 @@ async def _handle_postback(event: PostbackEvent) -> None:
             reply = await service.confirm_conversation(
                 session, conversation_id=conversation.conversation_id, form=form
             )
+        if reply.nothing_submitted:
+            # Not a real confirmation (a repeat tap, or an old button while a
+            # question is open again) -- nothing was saved by THIS request,
+            # so no quick ack and no diary; just show where things stand.
+            await _reply(event.reply_token, reply)
+            return
         if reply.submission_failed:
             # Re-attach the confirm button so tapping it again retries --
             # the conversation is still awaiting confirmation, not completed.
@@ -543,6 +549,15 @@ async def _handle_postback(event: PostbackEvent) -> None:
             conversation = await session.get(Conversation, UUID(conversation_id))
             if conversation is None:
                 await reply_text(event.reply_token, "ไม่พบบทสนทนานี้แล้ว")
+                return
+            # Once part of a several-answer submission is in Go, editing is
+            # off -- see service.edit_blocked_reason. The confirm buttons
+            # come back so the farmer can finish (or cancel) instead.
+            blocked = await service.edit_blocked_reason(
+                session, conversation_id=conversation.conversation_id
+            )
+            if blocked is not None:
+                await reply_confirm_prompt(event.reply_token, blocked, conversation.conversation_id)
                 return
             form = await get_form(str(conversation.task_form_id))
             questions = await service.editable_questions(

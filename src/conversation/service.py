@@ -160,6 +160,13 @@ class ConversationReply:
     # terminal thanks. Same "let the caller attach the right buttons"
     # pattern as submission_failed above.
     offer_another: bool = False
+    # True when confirm_conversation submitted NOTHING because the tap
+    # wasn't a real confirmation any more: a second tap after the first one
+    # already saved everything, or an old ยืนยัน button pressed while a
+    # question is open again (mid-edit, mid-selection). The caller renders
+    # it as an ordinary step -- no quick ack, no diary -- since nothing was
+    # saved by this request.
+    nothing_submitted: bool = False
     # Debug-only passthrough of the open question's own shape -- None
     # whenever this reply isn't "here's a fixed question to answer" (e.g.
     # confirmation/completed/cancelled replies have no single open question).
@@ -307,10 +314,19 @@ def _answered_question_ids(answer_rows: list[ConversationAnswer]) -> set[UUID]:
     return {row.question_id for row in answer_rows if not row.answer.get("selecting")}
 
 
-async def _answered_rows(session: AsyncSession, conversation_id: UUID) -> list[ConversationAnswer]:
-    result = await session.execute(
-        select(ConversationAnswer).where(ConversationAnswer.conversation_id == conversation_id)
+async def _answered_rows(
+    session: AsyncSession, conversation_id: UUID, *, refresh: bool = False
+) -> list[ConversationAnswer]:
+    """refresh=True re-reads rows this session may already hold (see
+    confirm_conversation: after waiting on a lock, a stale in-memory
+    `submitted` would re-send rows that another request already saved).
+    """
+    statement = select(ConversationAnswer).where(
+        ConversationAnswer.conversation_id == conversation_id
     )
+    if refresh:
+        statement = statement.execution_options(populate_existing=True)
+    result = await session.execute(statement)
     return list(result.scalars().all())
 
 
@@ -1447,6 +1463,30 @@ async def handle_answer(
     )
 
 
+def _nothing_submitted(conversation_id: UUID, text: str) -> ConversationReply:
+    """A plain-text reply for a confirm that wasn't one (see
+    ConversationReply.nothing_submitted). GUIDED_ASKING_FIXED_QUESTION with no
+    choices, so the router's _reply sends it as text with no confirm button
+    pointing at a conversation that's already finished.
+    """
+    return ConversationReply(
+        conversation_id=conversation_id,
+        substate=ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION,
+        text=text,
+        nothing_submitted=True,
+    )
+
+
+def _already_submitted(answer_rows: list[ConversationAnswer]) -> list[str]:
+    """Which rows of a several-answer submission have already reached Go --
+    empty unless a confirm stopped partway.
+    """
+    row = _multi_choice_row(answer_rows)
+    if row is None:
+        return []
+    return [str(value) for value in row.answer.get("submitted", [])]
+
+
 def _multi_choice_row(answer_rows: list[ConversationAnswer]) -> ConversationAnswer | None:
     """The answer that holds several choices, if this conversation has one --
     there is at most one (see multi_choice_options_for).
@@ -1550,15 +1590,69 @@ async def _submit_per_choice(
     return None
 
 
+_ALREADY_SAVED = "บันทึกข้อมูลชุดนี้ไปแล้วครับ"
+_ALREADY_CANCELLED = "รายการนี้ถูกยกเลิกไปแล้วครับ"
+_CONFIRM_NOT_READY = "ยังตอบไม่ครบครับ กรุณาตอบข้อนี้ให้เสร็จก่อนกดยืนยัน"
+
+
 async def confirm_conversation(
     session: AsyncSession, *, conversation_id: UUID, form: FormDetail
 ) -> ConversationReply:
-    conversation = await session.get(Conversation, conversation_id)
+    # Locked, and WAITING for the lock (not NOWAIT): a double tap on ยืนยัน,
+    # or LINE redelivering the postback, arrives as two independent webhook
+    # requests. Unlocked, both read `submitted` before either wrote it, both
+    # saw nothing sent, and both sent every row -- 3 plots became 6 rows
+    # (review on #76). With the lock the second request waits for the first
+    # to finish, then sees the conversation COMPLETED (or `submitted`
+    # already filled in) and sends nothing twice. Waiting rather than
+    # dropping it, so the second tap still gets an honest answer.
+    #
+    # populate_existing is load-bearing: the router has usually already
+    # loaded this row in the same session (session.get, to find the form)
+    # BEFORE the lock was taken. Without it SQLAlchemy hands back that
+    # already-loaded object with its pre-lock attributes, so the waiting
+    # request would still see status ACTIVE and submit everything again.
+    conversation = (
+        await session.execute(
+            select(Conversation)
+            .where(Conversation.conversation_id == conversation_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
     if conversation is None:
         raise ConversationNotFound()
 
+    if conversation.status == ConversationStatus.COMPLETED:
+        return _nothing_submitted(conversation_id, _ALREADY_SAVED)
+    if conversation.status == ConversationStatus.CANCELLED:
+        return _nothing_submitted(conversation_id, _ALREADY_CANCELLED)
+
+    # Only the confirmation step can be confirmed. A ยืนยัน button can never
+    # be retracted from the chat, so an old one stays tappable after the
+    # farmer has gone back into a question (แก้ไข, or a selection still being
+    # built). Submitting then would send whatever half-finished state that
+    # question is in -- e.g. a plot selection with nothing ticked yet goes
+    # out as plot_id missing, i.e. a whole-farm record nobody asked for
+    # (review on #76). Show them the step they're actually on instead.
+    picker_pending = (conversation.parent_answer or {}).get("pending_kind") is not None
+    if picker_pending or conversation.current_question_id is not None:
+        current_step = await resume_conversation(session, conversation=conversation, form=form)
+        return replace(
+            current_step,
+            text=f"{_CONFIRM_NOT_READY}\n\n{current_step.text}",
+            nothing_submitted=True,
+        )
+
     field_name_by_question_id = {q.question_id: q.field_name for q in questions_from_form(form)}
-    answer_rows = await _answered_rows(session, conversation_id)
+    # A selection still being built ({"selecting": true}) is never part of a
+    # submission. The state check above already rules this out; this is the
+    # backstop, so no future path can ship an unfinished answer to Go.
+    answer_rows = [
+        row
+        for row in await _answered_rows(session, conversation_id, refresh=True)
+        if not row.answer.get("selecting")
+    ]
     multi_row = _multi_choice_row(answer_rows)
     # Skipped fields are saved as nothing -- omitted from the payload
     # entirely rather than sending an empty/null value for that column. The
@@ -1959,6 +2053,30 @@ async def editable_questions(
     return [question_by_id[qid] for qid in ordered]
 
 
+async def edit_blocked_reason(session: AsyncSession, *, conversation_id: UUID) -> str | None:
+    """Why แก้ไข isn't allowed right now, or None if it is.
+
+    Blocked exactly when a several-answer confirm stopped partway: some rows
+    are already in Go, the rest aren't. Editing then can only go wrong
+    (review on #76):
+    - a fresh selection is stored as a new answer with an empty
+      `submitted`, so the next confirm re-sends the rows that already
+      landed -- duplicate farm records, which Go can't catch because
+      repeat submissions are allowed by design;
+    - and even without that, the chat cannot change rows Go already wrote,
+      so letting the farmer "edit" them would promise something untrue.
+    The farmer can still confirm (sends only what's missing) or cancel.
+    """
+    already = _already_submitted(await _answered_rows(session, conversation_id))
+    if not already:
+        return None
+    return (
+        f"บันทึกไปแล้ว {len(already)} รายการ จึงแก้ไขคำตอบไม่ได้ครับ "
+        "กดยืนยันเพื่อบันทึกรายการที่เหลือ หรือกดยกเลิก "
+        "(รายการที่บันทึกแล้วจะยังอยู่ในระบบ)"
+    )
+
+
 async def begin_edit(
     session: AsyncSession, *, conversation_id: UUID, question_id: UUID, form: FormDetail
 ) -> ConversationReply:
@@ -1976,6 +2094,18 @@ async def begin_edit(
         raise ConversationNotFound()
 
     questions = questions_from_form(form)
+    # Checked here as well as at the แก้ไข button (edit_blocked_reason): the
+    # question picker that leads here can't be retracted, so an old one may
+    # still be tapped after part of the submission went through.
+    blocked = await edit_blocked_reason(session, conversation_id=conversation_id)
+    if blocked is not None:
+        answer_rows = await _answered_rows(session, conversation_id)
+        return ConversationReply(
+            conversation_id=conversation_id,
+            substate=ActiveSubstate.AWAITING_CONFIRMATION,
+            text=f"{blocked}\n\n{_format_confirmation_summary(questions, answer_rows)}",
+        )
+
     question_by_id = {q.question_id: q for q in questions}
     question = question_by_id.get(question_id)
     if question is None:
