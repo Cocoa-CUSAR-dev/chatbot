@@ -20,6 +20,22 @@ from src.forms.schemas import FormDetail
 from src.tasks.exceptions import HandlerNotSupported
 
 
+@pytest.fixture(autouse=True)
+def _record_submitted_in_memory():  # noqa: ANN202
+    """_record_submitted writes through its own real session (so the
+    confirm lock is never released mid-fan-out -- see its docstring). These
+    unit tests have no database, so they get an in-memory stand-in that
+    records the same thing on the row; the real write is covered by
+    tests/integration/test_multi_choice_review_fixes.py.
+    """
+
+    async def record(row: ConversationAnswer, submitted: list[str]) -> None:
+        row.answer = {**row.answer, "submitted": submitted}
+
+    with patch("src.conversation.service._record_submitted", new=record):
+        yield
+
+
 def _form(*, field_names: list[str], is_multiple_submit: bool) -> FormDetail:
     questions = [
         {
@@ -216,12 +232,26 @@ class TestFanOut:
             {"plot_id": "p1", "farm_activity_type_id": "fertilise"},
         ]
 
-    async def test_each_plot_is_committed_as_it_lands(self) -> None:
-        """Not one commit at the end: a crash or a Vercel timeout between
+    async def test_each_plot_is_recorded_as_it_lands_without_releasing_the_lock(self) -> None:
+        """Not one record at the end: a crash or a Vercel timeout between
         plots must not lose the record of what already reached Go.
+
+        But never by committing the caller's session -- that releases
+        confirm_conversation's lock mid-fan-out and lets a second ยืนยัน send
+        the remaining plots again (review on #76). Each record goes through
+        _record_submitted's own session instead.
         """
         session = MagicMock(commit=AsyncMock())
-        with patch("src.conversation.service.submit_task", new=AsyncMock()):
+        recorded: list[list[str]] = []
+
+        async def record(row: ConversationAnswer, submitted: list[str]) -> None:
+            recorded.append(list(submitted))
+            row.answer = {**row.answer, "submitted": submitted}
+
+        with (
+            patch("src.conversation.service.submit_task", new=AsyncMock()),
+            patch("src.conversation.service._record_submitted", new=record),
+        ):
             await service._submit_per_choice(
                 session,
                 conversation=_conversation(),
@@ -229,7 +259,9 @@ class TestFanOut:
                 field_name="plot_id",
                 base_payload={},
             )
-        assert session.commit.await_count == 3
+
+        assert recorded == [["p1"], ["p1", "p2"], ["p1", "p2", "p3"]]
+        session.commit.assert_not_awaited()
 
     async def test_partial_failure_keeps_what_landed_and_says_so(self) -> None:
         session = MagicMock(commit=AsyncMock())

@@ -30,9 +30,10 @@ from dataclasses import dataclass, replace
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 
 from src.conversation import llm_parsing, reuse, text_parsing
 from src.conversation.constants import (
@@ -45,6 +46,7 @@ from src.conversation.exceptions import ConversationNotFound
 from src.conversation.models import Conversation, ConversationAnswer
 from src.conversation.state_machine import on_guided_answer
 from src.conversation.validation import validate_answer
+from src.database import async_session_maker
 from src.forms.schemas import FormDetail
 from src.line import parent_picker, plot_picker
 from src.tasks.client import submit_task
@@ -1581,13 +1583,41 @@ async def _submit_per_choice(
             )
 
         submitted = [*submitted, choice_id]
-        # Reassign + commit per row, not once at the end: a crash, a Vercel
-        # timeout, or the farmer's next tap must never be able to lose the
-        # record of what already reached Go.
-        row.answer = {**row.answer, "submitted": submitted}
-        await session.commit()
+        # Saved per row, not once at the end: a crash or a Vercel timeout
+        # must never lose the record of what already reached Go.
+        #
+        # But NOT by committing `session`: confirm_conversation holds a
+        # FOR UPDATE lock on the conversation for this whole fan-out, and a
+        # COMMIT releases it. Committing here let a second ยืนยัน take the
+        # lock after the first plot, read submitted=[plot 1] with the status
+        # still ACTIVE, and send plots 2 and 3 alongside this request (caught
+        # by test_two_simultaneous_confirms_write_each_plot_once). So the
+        # record is written through its own short session instead -- a
+        # different table from the locked row, so it never waits on it --
+        # and the lock stays held until confirm_conversation's final commit.
+        await _record_submitted(row, submitted)
 
     return None
+
+
+async def _record_submitted(row: ConversationAnswer, submitted: list[str]) -> None:
+    """Durably records which choices reached Go, in its own transaction.
+
+    The in-memory copy is updated with set_committed_value, which does NOT
+    mark the row dirty. If the calling session flushed its own UPDATE of
+    this row, its transaction would hold the row lock while this session
+    waited on it -- a deadlock Postgres can't detect, since both
+    connections are held by the same request.
+    """
+    answer = {**row.answer, "submitted": submitted}
+    async with async_session_maker() as side_session:
+        await side_session.execute(
+            update(ConversationAnswer)
+            .where(ConversationAnswer.conversation_answer_id == row.conversation_answer_id)
+            .values(answer=answer)
+        )
+        await side_session.commit()
+    set_committed_value(row, "answer", answer)
 
 
 _ALREADY_SAVED = "บันทึกข้อมูลชุดนี้ไปแล้วครับ"
