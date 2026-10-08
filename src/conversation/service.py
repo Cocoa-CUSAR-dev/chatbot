@@ -45,7 +45,7 @@ from src.conversation.constants import (
 from src.conversation.exceptions import ConversationNotFound
 from src.conversation.models import Conversation, ConversationAnswer
 from src.conversation.state_machine import on_guided_answer
-from src.conversation.validation import validate_answer
+from src.conversation.validation import parse_lat_lng, validate_answer
 from src.database import async_session_maker
 from src.forms.schemas import FormDetail
 from src.line import parent_picker, plot_picker
@@ -175,11 +175,12 @@ class ConversationReply:
     # it as an ordinary step -- no quick ack, no diary -- since nothing was
     # saved by this request.
     nothing_submitted: bool = False
-    # Debug-only passthrough of the open question's own shape -- None
-    # whenever this reply isn't "here's a fixed question to answer" (e.g.
-    # confirmation/completed/cancelled replies have no single open question).
-    # Not used by the real LINE webhook path; exists so the dev test UI can
-    # show a developer what's actually being validated without guessing.
+    # The open question's own shape -- None whenever this reply isn't
+    # "here's a fixed question to answer" (e.g. confirmation/completed/
+    # cancelled replies have no single open question). Started as a
+    # debug-only passthrough for the dev test UI; the LINE webhook path now
+    # reads input_type too, to attach the 📍 location button to GEODATA
+    # questions (router.py's _reply).
     input_type: str | None = None
     validation_rule: dict[str, Any] | None = None
     # Multi-choice picker: an OPTION question on a multiple-submit form, asked
@@ -246,16 +247,42 @@ def _choices_for(q: dict[str, Any], is_mandatory: bool) -> tuple[list[Choice], b
 # DATE/DATETIME/FLOAT/INT all validate as free text through the same
 # validate_answer()-then-re-ask path VARCHAR/BOOLEAN already use, with no
 # LINE-side UI dependency -- CB-9 confirmed there's no blocker for any of
-# them. GEODATA stays deferred: it needs a storage.geo row + FK link, which
-# Go's dissection (SubmitTaskForUser, form_handler.go) still only does as a
-# single-table flat insert with no storage.geo handling at all -- a farmer
-# could answer a GEODATA question here and have the submission silently
-# lose the coordinate. "upload" is a VARCHAR field_name convention (see
-# form.question seed data) for photo attachments, which have nowhere to go
-# yet either. Filtered out at the form level (not just skipped when picking
-# the next question) so unsupported types never show up in the guided flow
-# OR the confirmation summary.
-_SUPPORTED_INPUT_TYPES = {"VARCHAR", "OPTION", "BOOLEAN", "FLOAT", "INT", "DATE", "DATETIME"}
+# them.
+#
+# GEODATA was deferred here for a long time on the grounds that Go's
+# dissection has no storage.geo handling. That turned out not to block
+# anything: the task forms that ask for a location (farm_activity,
+# farm_pest_disease_record, processing_record -- field_name "gis") have no
+# geo column on their domain tables at all, so the coordinate lives only in
+# form.response.answer, which Go stores whole. That is exactly where
+# mobile-app's own submissions keep it, so answering through the chat
+# reaches parity with the app rather than losing anything. The farmer
+# answers by tapping LINE's native location picker (see LOCATION_BUTTON_LABEL
+# below and handle_location); the stored value is already in the
+# [{"lat", "lng"}] shape Go's isValidGeodata accepts.
+#
+# "upload" is a VARCHAR field_name convention (see form.question seed data)
+# for photo attachments, which still have nowhere to go from the chat.
+# Filtered out at the form level (not just skipped when picking the next
+# question) so unsupported types never show up in the guided flow OR the
+# confirmation summary.
+_SUPPORTED_INPUT_TYPES = {
+    "VARCHAR",
+    "OPTION",
+    "BOOLEAN",
+    "FLOAT",
+    "INT",
+    "DATE",
+    "DATETIME",
+    "GEODATA",
+}
+
+# GEODATA questions are answered with LINE's own location picker, opened by
+# a Quick Reply LocationAction carrying this label (router.py's _reply adds
+# it). The prompt line below is shown under the question so a farmer who
+# doesn't notice the button still knows what to do.
+LOCATION_BUTTON_LABEL = "📍 ส่งตำแหน่ง"
+_LOCATION_PROMPT = f"กรุณากดปุ่ม {LOCATION_BUTTON_LABEL} ด้านล่างครับ"
 
 
 def _is_supported(q: dict[str, Any]) -> bool:
@@ -464,6 +491,18 @@ def _advance_to(conversation: Conversation, question_id: UUID | None) -> None:
     """
     conversation.current_question_id = question_id
     conversation.current_page = 0
+
+
+def _question_text(question: Question, indicator: str = "") -> str:
+    """The question as the farmer reads it. Shared by every path that asks a
+    question -- first ask, re-ask after an error, edit, and resume -- so a
+    GEODATA question carries its "press 📍" line in all of them, not just the
+    first time it's asked.
+    """
+    text = question.label + indicator
+    if question.input_type == "GEODATA":
+        text = f"{text}\n{_LOCATION_PROMPT}"
+    return text
 
 
 # The plot question is the one OPTION question whose options the picker does
@@ -973,7 +1012,7 @@ def _reply_for_question(
     conversation_id: UUID, question: Question, *, page: int = 0, error: str | None = None
 ) -> ConversationReply:
     paginated = _paginate(question, page)
-    label = question.label + paginated.indicator
+    label = _question_text(question, paginated.indicator)
     text = f"{error}\n\n{label}" if error else label
     return ConversationReply(
         conversation_id=conversation_id,
@@ -1192,8 +1231,10 @@ async def _store_answer_and_advance(
     everything required is in.
 
     Extracted from handle_answer so the multi-choice picker's "เสร็จ" and skip
-    buttons can end a question exactly the way a typed or tapped answer does.
-    Those arrive as postbacks, not text, so without this they would each need
+    buttons, and a location shared through LINE's picker (handle_location),
+    can end a question exactly the way a typed or tapped answer does. Those
+    arrive as postbacks or a location message, not text, so without this they
+    would each need
     their own copy of the upsert, the state-machine call, the
     confirmation-summary branch and the advance -- four things that have to
     stay identical for the two paths to be indistinguishable downstream, and
@@ -1264,25 +1305,20 @@ async def _store_answer_and_advance(
     )
 
 
-async def handle_answer(
-    session: AsyncSession,
-    *,
-    conversation_id: UUID,
-    raw_text: str,
-    form: FormDetail,
-) -> ConversationReply | None:
-    # Locks the conversation row for the rest of this function -- serializes
-    # concurrent webhook deliveries for the same conversation (LINE's own
-    # retry-on-slow-response, or a farmer double-tapping/double-texting can
-    # otherwise both read the same current_question_id and both write an
-    # answer for it before either commits; live-caught 2026-08-09 during the
-    # chatbot pathway audit). NOWAIT means a message that arrives while
-    # another is still being processed for this conversation is dropped
-    # immediately rather than queued -- first message wins, full stop.
-    # Reconciling two rapid, genuinely different answers (e.g. a farmer
-    # correcting a typo a second later) is deferred to the future LLM-driven
-    # flow, which can actually decide what the farmer meant; this guided
-    # flow doesn't try.
+class _AnswerInFlight(Exception):
+    """Another message for this conversation is already being processed."""
+
+
+async def _lock_conversation(session: AsyncSession, conversation_id: UUID) -> Conversation:
+    """Locks the conversation row for the rest of the caller's transaction --
+    see handle_answer's comment for why, and why NOWAIT. Shared with
+    handle_location so a location and a typed answer arriving together for
+    the same question can't both be stored: whichever gets the lock first
+    wins, the other is dropped, same as two typed answers.
+
+    Raises _AnswerInFlight on lock contention (callers return None, i.e. no
+    reply) and ConversationNotFound when the row is gone.
+    """
     try:
         conversation = (
             await session.execute(
@@ -1303,9 +1339,35 @@ async def handle_answer(
             "conversation_id=%s already has an answer in flight -- dropping this message",
             conversation_id,
         )
-        return None
+        raise _AnswerInFlight() from exc
     if conversation is None:
         raise ConversationNotFound()
+    return conversation
+
+
+async def handle_answer(
+    session: AsyncSession,
+    *,
+    conversation_id: UUID,
+    raw_text: str,
+    form: FormDetail,
+) -> ConversationReply | None:
+    # Locks the conversation row for the rest of this function -- serializes
+    # concurrent webhook deliveries for the same conversation (LINE's own
+    # retry-on-slow-response, or a farmer double-tapping/double-texting can
+    # otherwise both read the same current_question_id and both write an
+    # answer for it before either commits; live-caught 2026-08-09 during the
+    # chatbot pathway audit). NOWAIT means a message that arrives while
+    # another is still being processed for this conversation is dropped
+    # immediately rather than queued -- first message wins, full stop.
+    # Reconciling two rapid, genuinely different answers (e.g. a farmer
+    # correcting a typo a second later) is deferred to the future LLM-driven
+    # flow, which can actually decide what the farmer meant; this guided
+    # flow doesn't try.
+    try:
+        conversation = await _lock_conversation(session, conversation_id)
+    except _AnswerInFlight:
+        return None
 
     # Checked before everything else below (parent-picker step, no open
     # question, or a real question) -- pause (US2-3) works identically
@@ -1416,6 +1478,17 @@ async def handle_answer(
     # defined, including the is_skip/resolved_value/no-open-question cases
     # that skip that block entirely.
     text_for_validation = raw_text
+
+    if not is_skip and current_question is not None and current_question.input_type == "GEODATA":
+        return await _answer_geodata_from_text(
+            session,
+            conversation=conversation,
+            question=current_question,
+            questions=questions,
+            form=form,
+            raw_text=raw_text,
+        )
+
     if not is_skip and resolved_value is None and current_question is not None:
         # A mandatory free-text question offers no skip button (see
         # _choices_for), so blank/whitespace-only text is never an
@@ -1480,6 +1553,155 @@ async def handle_answer(
 
     return await _store_answer_and_advance(
         session, conversation=conversation, questions=questions, form=form, answer=answer
+    )
+
+
+# Prefixed to the current step when a location arrives while the bot is
+# asking something else -- the location is not stored, and the farmer is
+# shown exactly where they are instead.
+_LOCATION_NOT_ASKED = "ตอนนี้ยังไม่ได้ถามตำแหน่งครับ"
+
+
+def _geodata_answer(
+    lat: float, lng: float, *, display: str, source_kind: str | None = None
+) -> dict[str, Any]:
+    """The stored answer for a GEODATA question.
+
+    `value` is already the exact shape mobile-backend's isValidGeodata
+    accepts -- a non-empty list of {"lat": number, "lng": number}, the same
+    thing mobile-app sends. confirm_conversation submits `value or text`, so
+    the list is what reaches Go; a "lat,lng" string would be rejected by Go's
+    validation gate and fail the whole submission.
+
+    `text` is what the farmer reads in the confirmation summary and resume
+    recap (both read answer["text"]).
+    """
+    answer: dict[str, Any] = {"text": f"📍 {display}", "value": [{"lat": lat, "lng": lng}]}
+    if source_kind is not None:
+        answer["source_kind"] = source_kind
+    return answer
+
+
+def _geodata_error(question: Question, lat: float, lng: float) -> str | None:
+    """Range-checks a coordinate against the question's own rule (V16's
+    valid_lat_lng), returning the rule's error message to re-ask with.
+
+    Goes through validate_answer itself rather than re-implementing the
+    check, so a location from LINE's picker and pasted coordinates are held
+    to exactly the same rule.
+    """
+    return validate_answer(question.validation_rule, f"{lat},{lng}")
+
+
+# Shown above the re-asked GEODATA question when typed text couldn't be read
+# as a coordinate. The question itself already ends with _LOCATION_PROMPT, so
+# the farmer reads: what went wrong, the question, and the one thing to do.
+_LOCATION_TEXT_NOT_UNDERSTOOD = "ขออภัยครับ อ่านตำแหน่งจากข้อความนี้ไม่ได้"
+
+
+async def _answer_geodata_from_text(
+    session: AsyncSession,
+    *,
+    conversation: Conversation,
+    question: Question,
+    questions: list[Question],
+    form: FormDetail,
+    raw_text: str,
+) -> ConversationReply:
+    """Typed text at a GEODATA question (skip and pause never reach here --
+    handle_answer resolves both first, exactly as for any other question).
+
+    Pasted coordinates ("13.75, 100.5", e.g. copied from a map app) are a
+    real answer: parsed by the same parse_lat_lng the validator uses,
+    range-checked by the question's own rule, and stored in the same
+    [{"lat", "lng"}] shape a shared location gets -- never as the "lat,lng"
+    string, which Go's validation gate would reject.
+
+    Anything else is re-asked with the 📍 button, never a dead end (the same
+    rule as docs-and-plan#189). Deliberately NOT geocoded: turning
+    "สวนหลังบ้าน" into a coordinate is a guess, and a wrong location on a
+    pest or activity record is worse than a skipped one.
+    """
+    coordinates = parse_lat_lng(raw_text)
+    if coordinates is None:
+        return _reply_for_question(
+            conversation.conversation_id,
+            question,
+            page=conversation.current_page,
+            error=_LOCATION_TEXT_NOT_UNDERSTOOD,
+        )
+
+    lat, lng = coordinates
+    error = _geodata_error(question, lat, lng)
+    if error is not None:
+        return _reply_for_question(
+            conversation.conversation_id, question, page=conversation.current_page, error=error
+        )
+
+    return await _store_answer_and_advance(
+        session,
+        conversation=conversation,
+        questions=questions,
+        form=form,
+        answer=_geodata_answer(lat, lng, display=raw_text.strip()),
+    )
+
+
+async def handle_location(
+    session: AsyncSession,
+    *,
+    conversation_id: UUID,
+    latitude: float,
+    longitude: float,
+    address: str | None,
+    form: FormDetail,
+) -> ConversationReply | None:
+    """A location shared through LINE's own location picker -- the answer to
+    a GEODATA question.
+
+    Mirrors handle_answer: same row lock, same "first message wins" (returns
+    None when another message for this conversation is in flight), same
+    upsert-and-advance via _store_answer_and_advance, so an edited location
+    replaces the old one in place.
+
+    A location that arrives while the bot is asking something else (another
+    question, the parent picker, or the confirmation summary) is NOT stored
+    against whatever happens to be open -- a coordinate saved as a farm name
+    or a harvest weight would be silently wrong data. The farmer is shown the
+    step they're actually on instead, via resume_conversation, which already
+    knows how to re-render every one of those steps.
+    """
+    try:
+        conversation = await _lock_conversation(session, conversation_id)
+    except _AnswerInFlight:
+        return None
+
+    questions = questions_from_form(form)
+    question_by_id = {q.question_id: q for q in questions}
+    current_question = (
+        question_by_id.get(conversation.current_question_id)
+        if conversation.current_question_id is not None
+        else None
+    )
+    picker_pending = (conversation.parent_answer or {}).get("pending_kind") is not None
+
+    if picker_pending or current_question is None or current_question.input_type != "GEODATA":
+        current_step = await resume_conversation(session, conversation=conversation, form=form)
+        return replace(current_step, text=f"{_LOCATION_NOT_ASKED}\n\n{current_step.text}")
+
+    error = _geodata_error(current_question, latitude, longitude)
+    if error is not None:
+        return _reply_for_question(
+            conversation_id, current_question, page=conversation.current_page, error=error
+        )
+
+    display = (address or "").strip() or f"{latitude:.6f}, {longitude:.6f}"
+    return await _store_answer_and_advance(
+        session,
+        conversation=conversation,
+        questions=questions,
+        form=form,
+        answer=_geodata_answer(latitude, longitude, display=display, source_kind="line_location"),
     )
 
 
@@ -2084,7 +2306,7 @@ async def resume_conversation(
     return ConversationReply(
         conversation_id=conversation.conversation_id,
         substate=ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION,
-        text=recap + current_question.label + paginated.indicator,
+        text=recap + _question_text(current_question, paginated.indicator),
         choices=paginated.choices,
         input_type=current_question.input_type,
         validation_rule=current_question.validation_rule,

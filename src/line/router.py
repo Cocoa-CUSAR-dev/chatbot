@@ -129,13 +129,22 @@ async def _reply(reply_token: str, reply: service.ConversationReply) -> None:
         await reply_selection_ack(reply_token, reply.text, reply.conversation_id)
         return
 
-    if not reply.choices:
+    # GEODATA: LINE's own location picker leads, ahead of skip/pause, and
+    # takes one of the 13 Quick Reply slots (a GEODATA question only ever
+    # has skip+pause otherwise, so nothing real is ever pushed out).
+    location_button = (
+        [QuickReplyOption(label=service.LOCATION_BUTTON_LABEL, kind="location")]
+        if reply.input_type == "GEODATA"
+        else []
+    )
+
+    if not reply.choices and not location_button:
         await reply_text(reply_token, reply.text)
         return
 
-    quick_reply = [
+    quick_reply = location_button + [
         QuickReplyOption(label=c.label[:20], text=c.label)
-        for c in reply.choices[:_QUICK_REPLY_LIMIT]
+        for c in (reply.choices or [])[: _QUICK_REPLY_LIMIT - len(location_button)]
     ]
     await reply_text(reply_token, reply.text, quick_reply=quick_reply)
 
@@ -448,10 +457,11 @@ async def _handle_follow(event: FollowEvent) -> None:
 
 async def _reply_unsupported_message_type(event: MessageEvent) -> None:
     """#186 item 2: every non-text message type used to be logged and
-    silently dropped, so a farmer who sent a sticker, a photo or their
-    location got no reply whatsoever and no way to tell the bot from a dead
-    one. Mid-form the farmer is being asked something specific, so they are
-    told to type the answer rather than pointed back at the task list.
+    silently dropped, so a farmer who sent a sticker or a photo got no reply
+    whatsoever and no way to tell the bot from a dead one. (A location is an
+    answer now -- see _handle_location_message.) Mid-form the farmer is being
+    asked something specific, so they are told to type the answer rather than
+    pointed back at the task list.
     """
     user_id = await _resolve_user_id(event.source.user_id)
     if user_id is None:
@@ -475,6 +485,61 @@ async def _reply_unsupported_message_type(event: MessageEvent) -> None:
         messages.UNSUPPORTED_MESSAGE_TYPE,
         quick_reply=messages.START_QUICK_REPLY,
     )
+
+
+async def _handle_location_message(event: MessageEvent, message: LocationMessageContent) -> None:
+    """A location shared through LINE's own picker -- the answer to a GEODATA
+    question, which the 📍 button on that question opens.
+
+    Previously only logged (with the coordinates themselves, which are
+    personal data -- no longer), so the farmer got no reply at all. Every
+    case now answers:
+    - not linked -> the same reply the text branch gives;
+    - no ACTIVE conversation -> the same start hint the text branch gives,
+      and nothing is stored (there is nothing to attach it to);
+    - ACTIVE conversation -> service.handle_location, which stores it only
+      if a GEODATA question is actually open, and otherwise re-shows the
+      step the farmer is really on.
+    """
+    logger.info("location message received")
+
+    user_id = await _resolve_user_id(event.source.user_id)
+    if user_id is None:
+        await reply_text(event.reply_token, messages.NOT_LINKED)
+        return
+
+    async with async_session_maker() as session:
+        result = await session.execute(
+            select(Conversation).where(
+                Conversation.user_id == user_id,
+                Conversation.status == ConversationStatus.ACTIVE,
+            )
+        )
+        conversation = result.scalars().first()
+        if conversation is None:
+            await reply_text(
+                event.reply_token, messages.START_HINT, quick_reply=messages.START_QUICK_REPLY
+            )
+            return
+
+        form = await get_form(str(conversation.task_form_id))
+        try:
+            reply = await service.handle_location(
+                session,
+                conversation_id=conversation.conversation_id,
+                latitude=message.latitude,
+                longitude=message.longitude,
+                address=message.address,
+                form=form,
+            )
+        except ConversationNotFound:
+            await reply_text(event.reply_token, "ไม่พบบทสนทนานี้แล้ว")
+            return
+
+    if reply is None:
+        # Same "first message wins" drop as typed answers (CB-12).
+        return
+    await _reply(event.reply_token, reply)
 
 
 async def _handle_message(event: MessageEvent) -> None:
@@ -560,11 +625,7 @@ async def _handle_message(event: MessageEvent) -> None:
             return
         await _reply(event.reply_token, reply)
     elif isinstance(message, LocationMessageContent):
-        # TODO: hand off to src.conversation -- this is the direct LINE
-        # equivalent of a GEODATA question (see the database review's
-        # findings on GEODATA questions meaning "open a map picker" today).
-        logger.info("location message: lat=%s lng=%s", message.latitude, message.longitude)
-        await _reply_unsupported_message_type(event)
+        await _handle_location_message(event, message)
     elif isinstance(message, ImageMessageContent):
         # TODO: hand off to src.conversation -- photo evidence for a task.
         logger.info("image message, id=%s", message.id)

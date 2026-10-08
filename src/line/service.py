@@ -8,6 +8,7 @@ from linebot.v3.messaging import (
     Configuration,
     FlexContainer,
     FlexMessage,
+    LocationAction,
     MessageAction,
     MulticastRequest,
     PostbackAction,
@@ -36,12 +37,16 @@ _configuration = Configuration(access_token=line_settings.LINE_CHANNEL_ACCESS_TO
 _QUICK_REPLY_LABEL_MAX = 20  # LINE's own platform limit on a button's label
 
 
+def _quick_reply_action(option: QuickReplyOption) -> MessageAction | LocationAction:
+    if option.kind == "location":
+        # LINE's native location sheet (map + "Share") -- the result arrives
+        # at the webhook as a LocationMessageContent, never as text.
+        return LocationAction(label=option.label)
+    return MessageAction(label=option.label, text=option.text)
+
+
 def _build_quick_reply(options: list[QuickReplyOption]) -> QuickReply:
-    return QuickReply(
-        items=[
-            QuickReplyItem(action=MessageAction(label=opt.label, text=opt.text)) for opt in options
-        ]
-    )
+    return QuickReply(items=[QuickReplyItem(action=_quick_reply_action(opt)) for opt in options])
 
 
 async def reply_text(

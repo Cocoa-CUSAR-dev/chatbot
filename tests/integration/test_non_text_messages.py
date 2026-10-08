@@ -1,4 +1,4 @@
-"""#186 item 2 -- a sticker, photo or location used to be logged and dropped,
+"""#186 item 2 -- a sticker or photo used to be logged and dropped,
 so the farmer got no reply at all and no way to tell the bot from a dead one.
 
 Webhook-level rather than unit, because the thing being fixed is precisely
@@ -37,14 +37,6 @@ _STICKER = {
     "stickerId": "1988",
     "stickerResourceType": "STATIC",
     "quoteToken": "q-sticker",
-}
-_LOCATION = {
-    "type": "location",
-    "id": "1002",
-    "title": "แปลงหลังบ้าน",
-    "address": "เชียงใหม่",
-    "latitude": 18.79,
-    "longitude": 98.98,
 }
 
 
@@ -106,7 +98,7 @@ class TestNonTextMessagesAlwaysGetAReply:
             status="active",
         )
 
-        reply_message = await _send(client, line_user_id=line_user_id, message=_LOCATION)
+        reply_message = await _send(client, line_user_id=line_user_id, message=_IMAGE)
 
         message = reply_message.await_args.args[0].messages[0]
         assert "รบกวนพิมพ์คำตอบเป็นข้อความ" in message.text

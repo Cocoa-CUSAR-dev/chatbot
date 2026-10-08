@@ -63,7 +63,18 @@ async def sanitize_for_autofill(
         }
         for q in questions
     ]
-    return await fetch_sanitized_autofill(answer=raw_answer, questions=questions_payload)
+    sanitized = await fetch_sanitized_autofill(answer=raw_answer, questions=questions_payload)
+
+    # GEODATA is never reused. The question is "ตำแหน่งปัจจุบัน" -- where the
+    # farmer is NOW -- so last visit's coordinate offered as today's would be
+    # quietly wrong on every record it lands in. Dropped here, on the chatbot
+    # side, rather than in Go: #105's sanitizer is shared with mobile-app,
+    # and changing what the app's own autofill does is outside this change.
+    # (It also matters mechanically: build_answer_rows stores non-choice
+    # values as str(value), which would turn the [{"lat", "lng"}] list into
+    # a string that Go's isValidGeodata then rejects at submit.)
+    geodata_fields = {q.field_name for q in questions if q.input_type == "GEODATA"}
+    return {field: value for field, value in sanitized.items() if field not in geodata_fields}
 
 
 def format_autofill_preview(sanitized_answer: dict[str, Any], questions: list["Question"]) -> str:
