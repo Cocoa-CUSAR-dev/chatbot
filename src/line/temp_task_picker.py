@@ -18,8 +18,15 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+# The one keyword every hint message names (#186 item 1). START_KEYWORDS is a
+# set, so `next(iter(...))` -- what the hint used to do -- could tell one
+# farmer to type "start" and the next "ทำแบบฟอร์ม" depending on hash order.
+# Thai first because that is what the farmer-facing copy and the rich menu
+# already say.
+PRIMARY_START_KEYWORD = "เริ่ม"
+
 # Case-insensitive; message text is lowercased before matching.
-START_KEYWORDS = {"เริ่ม", "start", "ทำแบบฟอร์ม"}
+START_KEYWORDS = {PRIMARY_START_KEYWORD, "start", "ทำแบบฟอร์ม"}
 
 _QUICK_REPLY_LIMIT = 13  # LINE's own cap on Quick Reply items per message
 

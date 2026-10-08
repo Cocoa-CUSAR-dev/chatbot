@@ -13,16 +13,18 @@ from linebot.v3.webhooks import (
     TextMessageContent,
 )
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.conversation import reuse, service
-from src.conversation.constants import ActiveSubstate, ConversationStatus
+from src.conversation import intent, reuse, service, text_parsing
+from src.conversation.constants import PAUSE_LABEL, ActiveSubstate, ConversationStatus
 from src.conversation.exceptions import ConversationNotFound
+from src.conversation.intent import Intent
 from src.conversation.models import Conversation
 from src.database import async_session_maker
 from src.diary.client import generate_diary
 from src.exceptions import UpstreamServiceError
 from src.forms.client import get_form
-from src.line import identity, parent_picker, temp_task_picker
+from src.line import identity, messages, parent_picker, temp_task_picker
 from src.line.config import line_settings
 from src.line.dependencies import parse_line_events
 from src.line.flex_builders import build_diary_flex, build_quick_ack_flex
@@ -80,7 +82,10 @@ async def _generate_and_push_diary(user_id: str, line_user_id: str) -> None:
     # link that lands on the login page instead of straight into /history.
     try:
         token = await mint_sso_token(user_id)
-        history_url = f"{line_settings.WEB_APP_URL}/sso?token={token}"
+        # F2 (docs-and-plan#125): token rides in the URL *fragment*, not a query
+        # param -- the fragment never reaches the server, so it can't land in
+        # access logs / Referer. web-app's /sso page reads it client-side.
+        history_url = f"{line_settings.WEB_APP_URL}/sso#token={token}"
     except Exception:
         logger.exception("SSO token mint failed for user_id=%s", user_id)
         history_url = f"{line_settings.WEB_APP_URL}/history"
@@ -165,6 +170,168 @@ def _parse_postback_data(data: str) -> tuple[str, list[str]]:
     return action, args
 
 
+# docs-and-plan#189: the confirmation summary's buttons are postback-only, so
+# a farmer who types instead of tapping used to get "ไม่พบบทสนทนานี้แล้ว".
+# These are the typed equivalents of the three buttons, matched exactly after
+# strip().lower() plus trailing-particle stripping ("ยืนยันครับ" -> "ยืนยัน")
+# -- NOT sent through the intent classifier: nothing mid-form ever is (see
+# _reply_for_intent's docstring / the US2-11 design doc §3.1).
+_CONFIRM_WORDS = frozenset({"ยืนยัน", "ตกลง", "ใช่", "ok", "โอเค", "เค", "ส่ง"})
+_CANCEL_WORDS = frozenset({"ยกเลิก"})
+_EDIT_WORDS = frozenset({"แก้ไข"})
+
+
+def _awaiting_confirmation(conversation: Conversation) -> bool:
+    """True when an ACTIVE conversation has no open question left -- i.e. it
+    is sitting on the confirmation summary.
+
+    Mirrors handle_answer's own two checks, in the same order: the
+    parent-picker step also leaves current_question_id NULL (see
+    start_conversation), and that step is still genuinely awaiting a typed
+    answer, so it must not be mistaken for the confirmation step.
+    """
+    if (conversation.parent_answer or {}).get("pending_kind") is not None:
+        return False
+    return conversation.current_question_id is None
+
+
+async def _confirm_and_reply(reply_token: str, line_user_id: str, conversation_id: UUID) -> None:
+    """The "ยืนยัน" path, shared by the confirm postback and the typed
+    yes-words at the confirmation step (docs-and-plan#189) -- one
+    implementation so the typed route can never drift from the tapped one
+    (it also carries the multi-submit prompt and the awaited diary, both
+    easy to forget in a second copy).
+    """
+    async with async_session_maker() as session:
+        conversation = await session.get(Conversation, conversation_id)
+        if conversation is None:
+            await reply_text(reply_token, "ไม่พบบทสนทนานี้แล้ว")
+            return
+        form = await get_form(str(conversation.task_form_id))
+        reply = await service.confirm_conversation(
+            session, conversation_id=conversation.conversation_id, form=form
+        )
+        user_id = str(conversation.user_id)
+
+    if reply.nothing_submitted:
+        # Not a real confirmation (a repeat tap, or an old button while a
+        # question is open again) -- nothing was saved by THIS request,
+        # so no quick ack and no diary; just show where things stand.
+        await _reply(reply_token, reply)
+        return
+    if reply.submission_failed:
+        # Re-attach the confirm button so tapping it again retries --
+        # the conversation is still awaiting confirmation, not completed.
+        await reply_confirm_prompt(reply_token, reply.text, reply.conversation_id)
+        return
+    if reply.offer_another:
+        # Saved, but this task wants more rows (multi-submit) -- offer
+        # the next one instead of closing out.
+        await reply_add_another_prompt(reply_token, reply.text, reply.conversation_id)
+        return
+    # Not _reply(): confirm_conversation's reply still carries substate
+    # AWAITING_CONFIRMATION on its terminal "thanks" message (the
+    # conversation is COMPLETED by this point, not awaiting anything),
+    # so routing it through _reply() would attach a confirm button
+    # pointing at an already-completed conversation.
+    #
+    # US2-6: sent via reply_flex, not reply_text, so this ack and the
+    # diary card pushed once generation finishes read as the same kind
+    # of message rather than plain text followed by a Flex card.
+    await reply_flex(reply_token, reply.text, build_quick_ack_flex(reply.text))
+    await _generate_and_push_diary(user_id, line_user_id)
+
+
+async def _cancel_and_reply(reply_token: str, conversation_id: UUID) -> None:
+    """The "ยกเลิก" path, shared with the typed word (docs-and-plan#189)."""
+    async with async_session_maker() as session:
+        try:
+            reply = await service.cancel_conversation(session, conversation_id=conversation_id)
+        except ConversationNotFound:
+            await reply_text(reply_token, "ไม่พบบทสนทนานี้แล้ว")
+            return
+    # Same reasoning as confirm above: terminal message, no button.
+    await reply_text(reply_token, reply.text)
+
+
+async def _edit_and_reply(reply_token: str, conversation_id: UUID) -> None:
+    """The "แก้ไข" path, shared with the typed word (docs-and-plan#189).
+
+    US2-6: shows a picker of every already-answered (or skipped) question
+    rather than asking which field by name -- same "buttons, not free text"
+    reasoning as everywhere else in this flow (elderly farmers are the
+    primary users).
+    """
+    async with async_session_maker() as session:
+        conversation = await session.get(Conversation, conversation_id)
+        if conversation is None:
+            await reply_text(reply_token, "ไม่พบบทสนทนานี้แล้ว")
+            return
+        # Once part of a several-answer submission is in Go, editing is
+        # off -- see service.edit_blocked_reason. The confirm buttons
+        # come back so the farmer can finish (or cancel) instead.
+        blocked = await service.edit_blocked_reason(
+            session, conversation_id=conversation.conversation_id
+        )
+        if blocked is not None:
+            await reply_confirm_prompt(reply_token, blocked, conversation.conversation_id)
+            return
+        form = await get_form(str(conversation.task_form_id))
+        questions = await service.editable_questions(
+            session, conversation_id=conversation.conversation_id, form=form
+        )
+    if not questions:
+        # Shouldn't happen in practice -- reaching AWAITING_CONFIRMATION
+        # requires every required question to have an answer row -- but
+        # an honest message beats a Quick Reply with zero buttons.
+        await reply_text(reply_token, "ยังไม่มีคำตอบให้แก้ไขในตอนนี้")
+        return
+    await reply_edit_picker(
+        reply_token,
+        conversation_id=conversation_id,
+        questions=questions[:_QUICK_REPLY_LIMIT],
+    )
+
+
+async def _handle_confirmation_step_text(
+    event: MessageEvent, *, conversation_id: UUID, raw_text: str
+) -> None:
+    """Typed text while the confirmation summary is showing (#189).
+
+    Found in manual testing: a farmer typed "เค" at the summary and got
+    "ไม่พบบทสนทนานี้แล้ว", because handle_answer raises ConversationNotFound
+    when there is no open question. Anything recognisable now runs the same
+    code path as the matching button; anything else re-shows the summary
+    with its buttons instead of dead-ending.
+    """
+    word = text_parsing.strip_trailing_particles(raw_text.strip().lower())
+
+    if word in _CONFIRM_WORDS:
+        await _confirm_and_reply(event.reply_token, event.source.user_id, conversation_id)
+        return
+    if word in _CANCEL_WORDS:
+        await _cancel_and_reply(event.reply_token, conversation_id)
+        return
+    if word in _EDIT_WORDS:
+        await _edit_and_reply(event.reply_token, conversation_id)
+        return
+
+    async with async_session_maker() as session:
+        conversation = await session.get(Conversation, conversation_id)
+        if conversation is None:
+            await reply_text(event.reply_token, "ไม่พบบทสนทนานี้แล้ว")
+            return
+        form = await get_form(str(conversation.task_form_id))
+        reply = await service.confirmation_prompt(
+            session, conversation_id=conversation_id, form=form
+        )
+    await reply_confirm_prompt(
+        event.reply_token,
+        f"{messages.PRESS_A_BUTTON}\n\n{reply.text}",
+        reply.conversation_id,
+    )
+
+
 async def _handle_event(event: Event) -> None:
     """Dispatches one parsed webhook event by type.
 
@@ -176,14 +343,138 @@ async def _handle_event(event: Event) -> None:
     if isinstance(event, MessageEvent):
         await _handle_message(event)
     elif isinstance(event, FollowEvent):
-        # TODO: hand off to src.conversation / whatever identity-linking
-        # mechanism the team lands on for ADR 0002 -- this is a farmer
-        # adding the OA as a friend for the first time.
-        logger.info("follow event, user_id=%s", event.source.user_id)
+        await _handle_follow(event)
     elif isinstance(event, PostbackEvent):
         await _handle_postback(event)
     else:
         logger.info("unhandled event type: %s", type(event).__name__)
+
+
+async def _reply_task_list(
+    reply_token: str,
+    session: AsyncSession,
+    user_id: UUID,
+    *,
+    only_title: str | None = None,
+) -> None:
+    """The one implementation of "show this farmer their tasks", shared by the
+    exact start keyword and by a classified SHOW_TASKS (US2-11 #184).
+
+    Shared on purpose: the keyword path pauses whatever was ACTIVE first
+    (US2-3), and a second copy of this would sooner or later forget to. Here
+    nothing can be active -- the caller only reaches the classifier when there
+    is no ACTIVE conversation -- so the pause is a no-op on that path, which
+    is exactly why it is safe to keep identical.
+
+    only_title narrows the list to the single task the farmer named
+    ("อยากกรอกเก็บเกี่ยว"). It is a filter over the same query, never a
+    different one -- and if it somehow matches nothing, the farmer gets the
+    full list rather than an empty one.
+    """
+    await service.pause_active_conversation(session, user_id=user_id)
+
+    # TEMPORARY (see src/line/temp_task_picker.py): Boom's real LIFF to-do
+    # list is Sprint 5. Until then, pending tasks come back as Quick Reply
+    # buttons instead of leaving the farmer stuck.
+    tasks = await temp_task_picker.list_pending_tasks(session, user_id)
+    if only_title is not None:
+        tasks = [task for task in tasks if task.title == only_title] or tasks
+    if not tasks:
+        await reply_text(reply_token, messages.NO_PENDING_TASKS)
+        return
+    await reply_task_choices(reply_token, "เลือกงานที่ต้องการทำ:", tasks)
+
+
+async def _reply_for_intent(
+    reply_token: str,
+    session: AsyncSession,
+    user_id: UUID,
+    result: intent.IntentResult,
+    task_titles: list[str],
+) -> None:
+    """Turns a classified intent into one of the flows that already exists
+    (US2-11 #184).
+
+    Two things this deliberately never does. It never starts a form:
+    SHOW_TASKS ends at the same Quick Reply buttons the keyword produces, so
+    the worst a misclassification can cost is one unwanted list, never a
+    conversation the farmer didn't ask for. And it never sends text the model
+    wrote -- every non-task branch is a fixed string from src/line/messages.py,
+    chosen by the intent, so a farmer can't be told something nobody on the
+    team has read (no weather, no prices, no agronomy advice).
+
+    UNKNOWN is also what every classifier failure returns, so this last branch
+    is the bot's pre-US2-11 behaviour, unchanged.
+    """
+    if result.intent is Intent.SHOW_TASKS:
+        await _reply_task_list(
+            reply_token,
+            session,
+            user_id,
+            only_title=intent.match_task_hint(result.task_hint, task_titles),
+        )
+        return
+
+    text = {
+        Intent.GREETING: messages.WELCOME_BACK,
+        Intent.HELP: messages.HELP,
+        Intent.OFF_TOPIC: messages.OFF_TOPIC,
+    }.get(result.intent, messages.START_HINT)
+    await reply_text(reply_token, text, quick_reply=messages.START_QUICK_REPLY)
+
+
+async def _handle_follow(event: FollowEvent) -> None:
+    """A farmer just added the OA as a friend (US2-11 / docs-and-plan#185).
+
+    Previously this only logged, so the farmer's first ever interaction with
+    the bot was silence, and nothing told them what it is for or what to type.
+    A reply is used rather than a push: the follow event carries a reply
+    token, and replies don't spend the monthly push quota.
+
+    An unlinked farmer is pointed at a human on purpose. HOW a LINE account
+    gets linked is ADR 0002, still undecided -- inventing a procedure here
+    would be a promise this service can't keep.
+    """
+    user_id = await _resolve_user_id(event.source.user_id)
+    if user_id is None:
+        await reply_text(event.reply_token, messages.WELCOME_NOT_LINKED)
+        return
+    await reply_text(
+        event.reply_token,
+        messages.WELCOME_NEW_FRIEND,
+        quick_reply=messages.START_QUICK_REPLY,
+    )
+
+
+async def _reply_unsupported_message_type(event: MessageEvent) -> None:
+    """#186 item 2: every non-text message type used to be logged and
+    silently dropped, so a farmer who sent a sticker, a photo or their
+    location got no reply whatsoever and no way to tell the bot from a dead
+    one. Mid-form the farmer is being asked something specific, so they are
+    told to type the answer rather than pointed back at the task list.
+    """
+    user_id = await _resolve_user_id(event.source.user_id)
+    if user_id is None:
+        await reply_text(event.reply_token, messages.NOT_LINKED)
+        return
+
+    async with async_session_maker() as session:
+        result = await session.execute(
+            select(Conversation).where(
+                Conversation.user_id == user_id,
+                Conversation.status == ConversationStatus.ACTIVE,
+            )
+        )
+        in_form = result.scalars().first() is not None
+
+    if in_form:
+        await reply_text(event.reply_token, messages.UNSUPPORTED_MESSAGE_TYPE_IN_FORM)
+        return
+    await reply_text(
+        event.reply_token,
+        messages.UNSUPPORTED_MESSAGE_TYPE,
+        quick_reply=messages.START_QUICK_REPLY,
+    )
 
 
 async def _handle_message(event: MessageEvent) -> None:
@@ -192,7 +483,7 @@ async def _handle_message(event: MessageEvent) -> None:
     if isinstance(message, TextMessageContent):
         user_id = await _resolve_user_id(event.source.user_id)
         if user_id is None:
-            await reply_text(event.reply_token, "บัญชี LINE นี้ยังไม่ได้เชื่อมกับบัญชีในระบบ")
+            await reply_text(event.reply_token, messages.NOT_LINKED)
             return
 
         async with async_session_maker() as session:
@@ -209,17 +500,11 @@ async def _handle_message(event: MessageEvent) -> None:
                 # as a literal answer, which pausing-instead-of-getting-
                 # stuck no longer needs). Cancel itself is untouched, still
                 # its own explicit action via the confirm prompt's button.
-                await service.pause_active_conversation(session, user_id=user_id)
-
-                # TEMPORARY (see src/line/temp_task_picker.py): Boom's real
-                # LIFF to-do list is Sprint 5, ~2 months out as of when this
-                # was written. Until then, a keyword lists pending tasks as
-                # Quick Reply buttons instead of leaving the farmer stuck.
-                tasks = await temp_task_picker.list_pending_tasks(session, user_id)
-                if not tasks:
-                    await reply_text(event.reply_token, "ไม่มีงานที่ต้องทำในตอนนี้")
-                    return
-                await reply_task_choices(event.reply_token, "เลือกงานที่ต้องการทำ:", tasks)
+                #
+                # US2-11: the exact keyword keeps its own branch ahead of the
+                # classifier -- free, instant, and never at the mercy of a
+                # provider being up.
+                await _reply_task_list(event.reply_token, session, user_id)
                 return
 
             result = await session.execute(
@@ -230,8 +515,30 @@ async def _handle_message(event: MessageEvent) -> None:
             )
             conversation = result.scalars().first()
             if conversation is None:
-                keyword = next(iter(temp_task_picker.START_KEYWORDS))
-                await reply_text(event.reply_token, f'พิมพ์ "{keyword}" เพื่อดูงานที่ต้องทำ')
+                # US2-11 (#184): the only branch this story replaces. Every
+                # OTHER path above stays exactly as it was -- in particular
+                # an ACTIVE conversation never reaches the classifier, so a
+                # real answer like "เริ่มเก็บเกี่ยววันนี้" is still an answer.
+                tasks = await temp_task_picker.list_pending_tasks(session, user_id)
+                classified = await intent.classify(message.text, [task.title for task in tasks])
+                await _reply_for_intent(
+                    event.reply_token,
+                    session,
+                    user_id,
+                    classified,
+                    [task.title for task in tasks],
+                )
+                return
+
+            # docs-and-plan#189. The pause label is deliberately excluded:
+            # handle_answer treats pausing as valid from ANY step, including
+            # this one, and that must keep working.
+            if _awaiting_confirmation(conversation) and message.text.strip() != PAUSE_LABEL:
+                await _handle_confirmation_step_text(
+                    event,
+                    conversation_id=conversation.conversation_id,
+                    raw_text=message.text,
+                )
                 return
 
             form = await get_form(str(conversation.task_form_id))
@@ -257,11 +564,16 @@ async def _handle_message(event: MessageEvent) -> None:
         # equivalent of a GEODATA question (see the database review's
         # findings on GEODATA questions meaning "open a map picker" today).
         logger.info("location message: lat=%s lng=%s", message.latitude, message.longitude)
+        await _reply_unsupported_message_type(event)
     elif isinstance(message, ImageMessageContent):
         # TODO: hand off to src.conversation -- photo evidence for a task.
         logger.info("image message, id=%s", message.id)
+        await _reply_unsupported_message_type(event)
     else:
+        # Stickers, audio, video, files -- previously logged and dropped, so
+        # the farmer got no reply at all (#186 item 2).
         logger.info("unhandled message content type: %s", type(message).__name__)
+        await _reply_unsupported_message_type(event)
 
 
 async def _handle_postback(event: PostbackEvent) -> None:
@@ -271,7 +583,7 @@ async def _handle_postback(event: PostbackEvent) -> None:
         task_id, task_form_id, handler = args
         user_id = await _resolve_user_id(event.source.user_id)
         if user_id is None:
-            await reply_text(event.reply_token, "บัญชี LINE นี้ยังไม่ได้เชื่อมกับบัญชีในระบบ")
+            await reply_text(event.reply_token, messages.NOT_LINKED)
             return
 
         async with async_session_maker() as session:
@@ -360,7 +672,7 @@ async def _handle_postback(event: PostbackEvent) -> None:
         decision, task_id, task_form_id, handler = args
         user_id = await _resolve_user_id(event.source.user_id)
         if user_id is None:
-            await reply_text(event.reply_token, "บัญชี LINE นี้ยังไม่ได้เชื่อมกับบัญชีในระบบ")
+            await reply_text(event.reply_token, messages.NOT_LINKED)
             return
 
         form = await get_form(task_form_id)
@@ -437,42 +749,7 @@ async def _handle_postback(event: PostbackEvent) -> None:
         await _reply(event.reply_token, reply)
     elif action == "confirm":
         (conversation_id,) = args
-        async with async_session_maker() as session:
-            conversation = await session.get(Conversation, UUID(conversation_id))
-            if conversation is None:
-                await reply_text(event.reply_token, "ไม่พบบทสนทนานี้แล้ว")
-                return
-            form = await get_form(str(conversation.task_form_id))
-            reply = await service.confirm_conversation(
-                session, conversation_id=conversation.conversation_id, form=form
-            )
-        if reply.nothing_submitted:
-            # Not a real confirmation (a repeat tap, or an old button while a
-            # question is open again) -- nothing was saved by THIS request,
-            # so no quick ack and no diary; just show where things stand.
-            await _reply(event.reply_token, reply)
-            return
-        if reply.submission_failed:
-            # Re-attach the confirm button so tapping it again retries --
-            # the conversation is still awaiting confirmation, not completed.
-            await reply_confirm_prompt(event.reply_token, reply.text, reply.conversation_id)
-            return
-        if reply.offer_another:
-            # Saved, but this task wants more rows (multi-submit) -- offer
-            # the next one instead of closing out.
-            await reply_add_another_prompt(event.reply_token, reply.text, reply.conversation_id)
-            return
-        # Not _reply(): confirm_conversation's reply still carries substate
-        # AWAITING_CONFIRMATION on its terminal "thanks" message (the
-        # conversation is COMPLETED by this point, not awaiting anything),
-        # so routing it through _reply() would attach a confirm button
-        # pointing at an already-completed conversation.
-        #
-        # US2-6: sent via reply_flex, not reply_text, so this ack and the
-        # diary card pushed once generation finishes read as the same kind
-        # of message rather than plain text followed by a Flex card.
-        await reply_flex(event.reply_token, reply.text, build_quick_ack_flex(reply.text))
-        await _generate_and_push_diary(str(conversation.user_id), event.source.user_id)
+        await _confirm_and_reply(event.reply_token, event.source.user_id, UUID(conversation_id))
     elif action == "add_another":
         # Multi-submit loop: open the next submission on the same task and
         # form, with the parent selection carried forward so the farmer
@@ -540,40 +817,8 @@ async def _handle_postback(event: PostbackEvent) -> None:
                 return
         await _reply(event.reply_token, reply)
     elif action == "edit":
-        # US2-6: shows a picker of every already-answered (or skipped)
-        # question rather than asking which field by name -- same
-        # "buttons, not free text" reasoning as everywhere else in this
-        # flow (elderly farmers are the primary users).
         (conversation_id,) = args
-        async with async_session_maker() as session:
-            conversation = await session.get(Conversation, UUID(conversation_id))
-            if conversation is None:
-                await reply_text(event.reply_token, "ไม่พบบทสนทนานี้แล้ว")
-                return
-            # Once part of a several-answer submission is in Go, editing is
-            # off -- see service.edit_blocked_reason. The confirm buttons
-            # come back so the farmer can finish (or cancel) instead.
-            blocked = await service.edit_blocked_reason(
-                session, conversation_id=conversation.conversation_id
-            )
-            if blocked is not None:
-                await reply_confirm_prompt(event.reply_token, blocked, conversation.conversation_id)
-                return
-            form = await get_form(str(conversation.task_form_id))
-            questions = await service.editable_questions(
-                session, conversation_id=conversation.conversation_id, form=form
-            )
-        if not questions:
-            # Shouldn't happen in practice -- reaching AWAITING_CONFIRMATION
-            # requires every required question to have an answer row -- but
-            # an honest message beats a Quick Reply with zero buttons.
-            await reply_text(event.reply_token, "ยังไม่มีคำตอบให้แก้ไขในตอนนี้")
-            return
-        await reply_edit_picker(
-            event.reply_token,
-            conversation_id=conversation.conversation_id,
-            questions=questions[:_QUICK_REPLY_LIMIT],
-        )
+        await _edit_and_reply(event.reply_token, UUID(conversation_id))
     elif action == "edit_pick":
         conversation_id, question_id = args
         async with async_session_maker() as session:
@@ -599,16 +844,7 @@ async def _handle_postback(event: PostbackEvent) -> None:
         await _reply(event.reply_token, reply)
     elif action == "cancel":
         (conversation_id,) = args
-        async with async_session_maker() as session:
-            try:
-                reply = await service.cancel_conversation(
-                    session, conversation_id=UUID(conversation_id)
-                )
-            except ConversationNotFound:
-                await reply_text(event.reply_token, "ไม่พบบทสนทนานี้แล้ว")
-                return
-        # Same reasoning as confirm above: terminal message, no button.
-        await reply_text(event.reply_token, reply.text)
+        await _cancel_and_reply(event.reply_token, UUID(conversation_id))
     else:
         logger.info("postback event, data=%s", event.postback.data)
 

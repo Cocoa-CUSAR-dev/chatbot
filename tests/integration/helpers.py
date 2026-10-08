@@ -46,6 +46,51 @@ def build_text_message_event(
     return json.dumps(payload).encode()
 
 
+def build_message_event(*, line_user_id: str, message: dict[str, Any]) -> bytes:
+    """Any non-text message type (image, sticker, location, ...) -- the
+    `message` dict is passed through to LINE's own parser verbatim, so each
+    test states exactly the shape LINE would deliver (#186 item 2).
+    """
+    payload = {
+        "destination": "Udestination0000000000000000000",
+        "events": [
+            {
+                "type": "message",
+                "source": {"type": "user", "userId": line_user_id},
+                "timestamp": 1700000000000,
+                "mode": "active",
+                "webhookEventId": str(uuid.uuid4()),
+                "deliveryContext": {"isRedelivery": False},
+                "replyToken": str(uuid.uuid4()),
+                "message": message,
+            }
+        ],
+    }
+    return json.dumps(payload).encode()
+
+
+def build_follow_event(*, line_user_id: str) -> bytes:
+    """A farmer adding the OA as a friend (US2-11 / docs-and-plan#185)."""
+    payload = {
+        "destination": "Udestination0000000000000000000",
+        "events": [
+            {
+                "type": "follow",
+                "source": {"type": "user", "userId": line_user_id},
+                "timestamp": 1700000000000,
+                "mode": "active",
+                "webhookEventId": str(uuid.uuid4()),
+                "deliveryContext": {"isRedelivery": False},
+                "replyToken": str(uuid.uuid4()),
+                # Required by the SDK's own FollowEvent model: LINE sends it
+                # to say whether this is a first-time add or an unblock.
+                "follow": {"isUnblocked": False},
+            }
+        ],
+    }
+    return json.dumps(payload).encode()
+
+
 def build_postback_event(*, line_user_id: str, data: str, reply_token: str | None = None) -> bytes:
     payload = {
         "destination": "Udestination0000000000000000000",
