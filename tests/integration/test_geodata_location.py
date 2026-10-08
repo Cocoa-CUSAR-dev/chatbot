@@ -338,4 +338,4 @@ class TestLocationThatIsNotTheAnswerIsNeverStored:
             ),
         )
 
-        assert "ยังไม่ได้เชื่อมกับบัญชีในระบบ" in _sent(reply_message).text
+        assert "ยังไม่ได้เชื่อมกับระบบ" in _sent(reply_message).text

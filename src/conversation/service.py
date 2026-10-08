@@ -82,6 +82,12 @@ _SKIP_CHOICE = Choice(id=_SKIP_CHOICE_ID, label="⏭️ ข้าม")
 _PAUSE_CHOICE_ID = "__pause__"
 _PAUSE_CHOICE = Choice(id=_PAUSE_CHOICE_ID, label="⏸️ พักไว้ก่อน")
 
+# Public alias: the router needs the same literal to recognise a typed pause
+# at the confirmation step (docs-and-plan#189) and let it through to
+# handle_answer, which handles pausing from ANY step. Aliased rather than
+# re-typed so the emoji and spacing can never drift between the two.
+PAUSE_LABEL = _PAUSE_CHOICE.label
+
 # LINE's own hard cap on Quick Reply buttons per message -- some OPTION
 # questions already carry this many real choices, so prepending skip must
 # make room for it rather than pushing the last real choice off the list.
@@ -1423,6 +1429,36 @@ async def resume_conversation(
         choices=paginated.choices,
         input_type=current_question.input_type,
         validation_rule=current_question.validation_rule,
+    )
+
+
+async def confirmation_prompt(
+    session: AsyncSession, *, conversation_id: UUID, form: FormDetail
+) -> ConversationReply:
+    """Re-renders the confirmation summary for a conversation already sitting
+    at the confirmation step, without changing anything about it.
+
+    Exists for docs-and-plan#189: the summary's ยืนยัน/แก้ไข/ยกเลิก buttons are
+    postback-only, so a farmer who TYPES something there instead of tapping
+    used to fall through to handle_answer, which raises ConversationNotFound
+    ("no open question to answer") and surfaced as "ไม่พบบทสนทนานี้แล้ว" -- a
+    lie, the conversation is alive and simply waiting on a button. The router
+    now answers unrecognised text by re-sending this exact summary with the
+    buttons re-attached, so the step can't dead-end.
+
+    Deliberately read-only: no answer row, no state change, not even a
+    commit. Raises ConversationNotFound only when the row is genuinely gone.
+    """
+    conversation = await session.get(Conversation, conversation_id)
+    if conversation is None:
+        raise ConversationNotFound()
+
+    questions = questions_from_form(form)
+    answer_rows = await _answered_rows(session, conversation_id)
+    return ConversationReply(
+        conversation_id=conversation_id,
+        substate=ActiveSubstate.AWAITING_CONFIRMATION,
+        text=_format_confirmation_summary(questions, answer_rows),
     )
 
 
