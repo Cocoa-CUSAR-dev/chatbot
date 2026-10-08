@@ -12,6 +12,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.database import async_session_maker
 
 _CLEANUP_TABLES = (
+    "agriculture.plot",
+    "agriculture.farmer_farm",
+    "agriculture.farm",
     "notify.reminder_log",
     "notify.reminder_recipient",
     "notify.reminder_schedule",

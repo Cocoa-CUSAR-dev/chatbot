@@ -26,22 +26,29 @@ OPTION questions failed with `invalid input syntax for type uuid`).
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 
 from src.conversation import llm_parsing, reuse, text_parsing
-from src.conversation.constants import ActiveSubstate, AnswerSource, ConversationStatus
+from src.conversation.constants import (
+    PAUSE_LABEL,
+    ActiveSubstate,
+    AnswerSource,
+    ConversationStatus,
+)
 from src.conversation.exceptions import ConversationNotFound
 from src.conversation.models import Conversation, ConversationAnswer
 from src.conversation.state_machine import on_guided_answer
 from src.conversation.validation import validate_answer
+from src.database import async_session_maker
 from src.forms.schemas import FormDetail
-from src.line import parent_picker
+from src.line import parent_picker, plot_picker
 from src.tasks.client import submit_task
 from src.tasks.exceptions import HandlerNotSupported
 from src.tasks.schemas import TaskSubmission
@@ -80,7 +87,7 @@ _SKIP_CHOICE = Choice(id=_SKIP_CHOICE_ID, label="⏭️ ข้าม")
 # answer-storage logic runs, leaving current_question_id and every already-
 # given answer exactly as they are. Same sentinel-id pattern as skip.
 _PAUSE_CHOICE_ID = "__pause__"
-_PAUSE_CHOICE = Choice(id=_PAUSE_CHOICE_ID, label="⏸️ พักไว้ก่อน")
+_PAUSE_CHOICE = Choice(id=_PAUSE_CHOICE_ID, label=PAUSE_LABEL)
 
 # Public alias: the router needs the same literal to recognise a typed pause
 # at the confirmation step (docs-and-plan#189) and let it through to
@@ -161,6 +168,13 @@ class ConversationReply:
     # terminal thanks. Same "let the caller attach the right buttons"
     # pattern as submission_failed above.
     offer_another: bool = False
+    # True when confirm_conversation submitted NOTHING because the tap
+    # wasn't a real confirmation any more: a second tap after the first one
+    # already saved everything, or an old ยืนยัน button pressed while a
+    # question is open again (mid-edit, mid-selection). The caller renders
+    # it as an ordinary step -- no quick ack, no diary -- since nothing was
+    # saved by this request.
+    nothing_submitted: bool = False
     # Debug-only passthrough of the open question's own shape -- None
     # whenever this reply isn't "here's a fixed question to answer" (e.g.
     # confirmation/completed/cancelled replies have no single open question).
@@ -168,6 +182,24 @@ class ConversationReply:
     # show a developer what's actually being validated without guessing.
     input_type: str | None = None
     validation_rule: dict[str, Any] | None = None
+    # Multi-choice picker: an OPTION question on a multiple-submit form, asked
+    # as a Flex bubble the farmer can tick several answers on, each becoming
+    # its own saved row. When set, the caller renders the bubble instead of
+    # Quick Reply buttons, and `choices` stays None -- the picker's options
+    # are not always the question's own (plot_id uses the farmer's scoped
+    # plots, not Kotlin's global ref.plot_constant list).
+    multi_choice: bool = False
+    picker_options: list[Choice] | None = None
+    # Already-ticked options, so a bubble re-sent after a pause/resume or an
+    # edit shows what the farmer picked before rather than starting blank.
+    selected_ids: frozenset[str] = frozenset()
+    # The picker's skip button label, or None when the question is mandatory
+    # -- the same rule as the Quick Reply skip button. "ทั้งฟาร์ม" on the plot
+    # question (skipping it there means the whole farm), "⏭️ ข้าม" elsewhere.
+    skip_label: str | None = None
+    # True for the short "เลือกแล้ว: ..." acknowledgement after a tap, which
+    # is a text line with one "เสร็จ" button rather than a new bubble.
+    selection_ack: bool = False
 
 
 def _constrained_choices_for(q: dict[str, Any]) -> list[Choice] | None:
@@ -278,10 +310,31 @@ def _all_required_answered(questions: list[Question], answered: set[UUID]) -> bo
     return _next_unanswered_required(questions, answered) is None
 
 
-async def _answered_rows(session: AsyncSession, conversation_id: UUID) -> list[ConversationAnswer]:
-    result = await session.execute(
-        select(ConversationAnswer).where(ConversationAnswer.conversation_id == conversation_id)
+def _answered_question_ids(answer_rows: list[ConversationAnswer]) -> set[UUID]:
+    """Questions that actually have an answer.
+
+    A multi-choice selection in progress writes its row early (that is
+    where the running selection lives, so it survives a pause), but it is NOT
+    an answer yet -- counting it would let the farmer reach the confirmation
+    summary with a half-made selection, or skip the question entirely by
+    tapping one option and walking away.
+    """
+    return {row.question_id for row in answer_rows if not row.answer.get("selecting")}
+
+
+async def _answered_rows(
+    session: AsyncSession, conversation_id: UUID, *, refresh: bool = False
+) -> list[ConversationAnswer]:
+    """refresh=True re-reads rows this session may already hold (see
+    confirm_conversation: after waiting on a lock, a stale in-memory
+    `submitted` would re-send rows that another request already saved).
+    """
+    statement = select(ConversationAnswer).where(
+        ConversationAnswer.conversation_id == conversation_id
     )
+    if refresh:
+        statement = statement.execution_options(populate_existing=True)
+    result = await session.execute(statement)
     return list(result.scalars().all())
 
 
@@ -293,8 +346,10 @@ def _format_answered_lines(questions: list[Question], answers: list[Conversation
     label_by_id = {q.question_id: q.label for q in questions}
     sort_order_by_id = {q.question_id: q.sort_order for q in questions}
     # Skipped fields were saved as nothing -- leave them out of the review
-    # entirely rather than showing a confusing "skipped" line.
-    answered = [a for a in answers if not a.answer.get("skipped")]
+    # entirely rather than showing a confusing "skipped" line. An unfinished
+    # multi-choice selection is left out for the same reason: it has no answer
+    # text yet, only a running list of taps.
+    answered = [a for a in answers if not a.answer.get("skipped") and not a.answer.get("selecting")]
     ordered = sorted(answered, key=lambda a: sort_order_by_id.get(a.question_id, 0))
     # Always the human-readable text, even for resolved OPTION answers --
     # farmers review labels ("พ่นยา"), not the underlying UUID.
@@ -306,7 +361,24 @@ def _format_confirmation_summary(
     questions: list[Question], answers: list[ConversationAnswer]
 ) -> str:
     lines = _format_answered_lines(questions, answers)
-    return "สรุปคำตอบของคุณ:\n" + lines + "\n\nยืนยันการส่งข้อมูลหรือไม่?"
+    summary = "สรุปคำตอบของคุณ:\n" + lines
+
+    # One extra line for a multi-choice answer. Its own line already reads
+    # "แปลง A, แปลง C" (it is just answer["text"]), which does not tell the
+    # farmer that confirming is about to create several separate records --
+    # and that is the one consequence of this feature they should not
+    # discover afterwards.
+    multi_row = _multi_choice_row(answers)
+    if multi_row is not None:
+        labels = [str(label) for label in multi_row.answer.get("labels", [])]
+        question_label = next(
+            (q.label for q in questions if q.question_id == multi_row.question_id), ""
+        )
+        summary += (
+            f"\n\nจะบันทึกเป็น {len(labels)} รายการ (แยกตาม{question_label}): {', '.join(labels)}"
+        )
+
+    return summary + "\n\nยืนยันการส่งข้อมูลหรือไม่?"
 
 
 def _format_resume_recap(questions: list[Question], answers: list[ConversationAnswer]) -> str:
@@ -394,6 +466,509 @@ def _advance_to(conversation: Conversation, question_id: UUID | None) -> None:
     conversation.current_page = 0
 
 
+# The plot question is the one OPTION question whose options the picker does
+# NOT take from the question itself: Kotlin sends it every plot in the system
+# (ref.plot_constant), so it is re-scoped to the farmer's own plots. Both are
+# the handler's own column names (see Go's dissectAnswer), not display text.
+PLOT_FIELD_NAME = "plot_id"
+_FARM_FIELD_NAME = "farm_id"
+# Skipping the plot question has always meant "the whole farm" (the form says
+# "หากทำทั้งฟาร์มไม่ต้องระบุ"), so the picker says so in words; every other
+# optional question keeps the ordinary skip label.
+_WHOLE_FARM_LABEL = "ทั้งฟาร์ม"
+# A form with any of these is never asked through the picker -- see
+# is_multi_choice_question.
+_NUMBER_INPUT_TYPES = frozenset({"INT", "FLOAT"})
+
+
+def is_multi_choice_question(question: Question, form: FormDetail) -> bool:
+    """The cheap half of "should this question be asked as a multi-choice
+    picker" -- the half that needs no database.
+
+    Both conditions are necessary. OPTION, because ticking several answers
+    only makes sense where the answers are a fixed list (BOOLEAN is a single
+    yes/no by nature, and free text has nothing to tick). And
+    is_multiple_submit, because the fan-out writes one row per ticked answer:
+    on a form the researchers did NOT mark multiple-submit, that is precisely
+    the duplicate they said they didn't want. Every other question, and every
+    question on an ordinary form, keeps today's Quick Reply.
+
+    A form with a number field never gets the picker either. The fan-out
+    copies every other answer onto each row, which is right for a farm or an
+    activity type but wrong for a measurement: ticking grades A and B and
+    entering 50 kg once would write A=50 and B=50, doubling the harvest
+    (docs-and-plan#221). Those forms keep the one-row-at-a-time "add another"
+    loop, where each row gets its own number.
+
+    The remaining conditions need a query, so they live in
+    multi_choice_options_for below. Callers should use that one.
+    """
+    if not form.is_multiple_submit or question.input_type != "OPTION":
+        return False
+    return not any(q.input_type in _NUMBER_INPUT_TYPES for q in questions_from_form(form))
+
+
+async def multi_choice_options_for(
+    session: AsyncSession,
+    *,
+    conversation: Conversation,
+    question: Question,
+    form: FormDetail,
+) -> list[Choice] | None:
+    """The options to offer as a multi-choice picker for `question`, or None
+    to ask it the ordinary Quick Reply way.
+
+    One function so every place that can ask a question -- a fresh start, an
+    answer advancing to the next one, a resume, an edit -- agrees on whether
+    the farmer sees a bubble or buttons.
+
+    None when:
+    - the question isn't eligible at all (is_multi_choice_question), or
+    - ANOTHER question in this conversation already holds several answers.
+      One multi-answer question per submission is a deliberate rule: the
+      number of rows written is then simply the number ticked on that one
+      question. Allowing two would mean either a cross product (2 plots x 2
+      activities = 4 rows, easy to create by accident) or an ambiguity about
+      which question the rows are split by. So once one question fans out,
+      every other question is answered once, the ordinary way.
+    - there are fewer than 2 options: a picker for one option is strictly
+      worse than today's button, and an empty one would be a dead end.
+    """
+    if not is_multi_choice_question(question, form):
+        return None
+
+    answer_rows = await _answered_rows(session, conversation.conversation_id)
+    if any(
+        row.answer.get("multi") and row.question_id != question.question_id for row in answer_rows
+    ):
+        return None
+
+    options: list[Choice]
+    if question.field_name == PLOT_FIELD_NAME:
+        plots = await plot_picker.list_plots(
+            session,
+            conversation.user_id,
+            farm_id=_answered_farm_id(answer_rows, form=form),
+        )
+        options = [Choice(id=plot.id, label=plot.label) for plot in plots]
+    else:
+        # The full un-paginated list: the bubble/carousel replaces the 13-a-
+        # page Quick Reply pagination for these questions.
+        options = list(question.all_real_choices or [])
+
+    if len(options) < 2:
+        return None
+    return options
+
+
+def _answered_farm_id(answer_rows: list[ConversationAnswer], *, form: FormDetail) -> str | None:
+    """The farm the farmer already picked in THIS conversation, if the form
+    asks for one before the plot question -- plots from their other farms
+    would contradict an answer they just gave. None when the form has no farm
+    question (the "จดกิจกรรมในสวน" case), it isn't answered yet, or it was
+    answered with several farms (then no single farm narrows the plots).
+    """
+    farm_question_ids = {
+        q.question_id for q in questions_from_form(form) if q.field_name == _FARM_FIELD_NAME
+    }
+    if not farm_question_ids:
+        return None
+    for row in answer_rows:
+        if row.question_id in farm_question_ids and not row.answer.get("skipped"):
+            value = row.answer.get("value")
+            return str(value) if value else None
+    return None
+
+
+# What a farmer can type instead of tapping "✅ เสร็จ" on the bubble. Deliberately
+# short and exact: anything longer is far more likely to be an option's label
+# than a command.
+_DONE_WORDS = frozenset({"เสร็จ", "เสร็จแล้ว", "จบ", "done", "ok"})
+# Sentinel id, never a real choice id -- lets the typed-text path run the skip
+# button's label through the same match_choice call as the real options.
+_PICKER_SKIP_ID = "__picker_skip__"
+# Tapping a bubble that has already been answered. Bubbles stay tappable
+# forever (LINE can't retract or edit a sent message), so this is a normal
+# thing for a farmer to do, not an error -- it says so plainly and changes
+# nothing.
+_STALE_PICKER_TEXT = "คำถามนี้ผ่านไปแล้วครับ"
+
+
+def _skip_label_for(question: Question) -> str | None:
+    if question.is_mandatory:
+        return None
+    if question.field_name == PLOT_FIELD_NAME:
+        return _WHOLE_FARM_LABEL
+    return _SKIP_CHOICE.label
+
+
+def _multi_choice_reply(
+    conversation_id: UUID,
+    question: Question,
+    options: list[Choice],
+    *,
+    selected: frozenset[str] = frozenset(),
+    prefix: str = "",
+    error: str | None = None,
+) -> ConversationReply:
+    """The picker bubble as a ConversationReply. `choices` stays None on
+    purpose: for the plot question the picker's options are NOT the
+    question's own (those are Kotlin's global plot list), and rendering both
+    would offer two different lists in one message.
+    """
+    label = question.label
+    text = f"{error}\n\n{label}" if error else prefix + label
+    return ConversationReply(
+        conversation_id=conversation_id,
+        substate=ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION,
+        text=text,
+        multi_choice=True,
+        picker_options=options,
+        selected_ids=selected,
+        skip_label=_skip_label_for(question),
+        input_type=question.input_type,
+        validation_rule=question.validation_rule,
+    )
+
+
+async def _ask_question(
+    session: AsyncSession,
+    *,
+    conversation: Conversation,
+    question: Question,
+    form: FormDetail,
+    prefix: str = "",
+) -> ConversationReply:
+    """Ask `question`, as a multi-choice bubble when it is one and as today's
+    Quick Reply question otherwise.
+
+    Every path that can put a question in front of a farmer goes through here
+    (fresh start, autofill start, resume, edit, add-another, advancing after
+    an answer) so none of them can disagree about which rendering a question
+    gets -- a farmer who paused mid-selection and resumed into plain Quick
+    Reply buttons would lose the selection they could no longer see.
+    """
+    options = await multi_choice_options_for(
+        session, conversation=conversation, question=question, form=form
+    )
+    if options is None:
+        reply = _reply_for_question(conversation.conversation_id, question)
+        return replace(reply, text=prefix + reply.text) if prefix else reply
+    values, _ = await _current_selection(session, conversation)
+    return _multi_choice_reply(
+        conversation.conversation_id,
+        question,
+        options,
+        selected=frozenset(values),
+        prefix=prefix,
+    )
+
+
+async def _selection_row(
+    session: AsyncSession, conversation: Conversation
+) -> ConversationAnswer | None:
+    """The answer row for the question currently open, if there is one.
+
+    While a selection is being built this row exists and carries
+    {"selecting": true, ...} -- that is what makes a selection survive a
+    pause, a resume, or the farmer simply walking away mid-tap.
+    """
+    if conversation.current_question_id is None:
+        return None
+    rows = await _answered_rows(session, conversation.conversation_id)
+    return next((row for row in rows if row.question_id == conversation.current_question_id), None)
+
+
+async def _current_selection(
+    session: AsyncSession, conversation: Conversation
+) -> tuple[list[str], list[str]]:
+    """(values, labels) already chosen on the open question.
+
+    Reads all three shapes that row can be in: a selection in progress or a
+    finished multi answer ("values"/"labels"), or an ordinary single answer
+    ("value"/"text") -- the last one matters when "แก้ไข" re-opens a question
+    that was answered once, so the bubble starts with that answer ticked
+    rather than blank.
+    """
+    row = await _selection_row(session, conversation)
+    if row is None or row.answer.get("skipped"):
+        return [], []
+    if "values" in row.answer:
+        return (
+            [str(v) for v in row.answer.get("values", [])],
+            [str(label) for label in row.answer.get("labels", [])],
+        )
+    if row.answer.get("value"):
+        return [str(row.answer["value"])], [str(row.answer.get("text") or "")]
+    return [], []
+
+
+def _selection_text(labels: list[str]) -> str:
+    if not labels:
+        return "ยังไม่ได้เลือก"
+    return f"เลือกแล้ว: {', '.join(labels)} ({len(labels)} รายการ)"
+
+
+async def _store_selection(
+    session: AsyncSession,
+    *,
+    conversation: Conversation,
+    values: list[str],
+    labels: list[str],
+) -> None:
+    """Persists the in-progress selection on the open question's own answer
+    row, leaving current_question_id where it is -- the question is still
+    open, the farmer is still choosing.
+    """
+    answer = {"selecting": True, "values": values, "labels": labels}
+    row = await _selection_row(session, conversation)
+    if row is None:
+        session.add(
+            ConversationAnswer(
+                conversation_id=conversation.conversation_id,
+                question_id=conversation.current_question_id,
+                answer=answer,
+                source=AnswerSource.GUIDED_FLOW,
+            )
+        )
+    else:
+        # Reassign, never mutate in place -- the JSONB column isn't a
+        # MutableDict, so an in-place append would never be flushed (the same
+        # trap _store_answer_and_advance documents).
+        row.answer = answer
+    await session.commit()
+
+
+def _multi_choice_answer(values: list[str], labels: list[str]) -> dict[str, Any]:
+    """The finished answer for a picker selection.
+
+    One answer is stored EXACTLY like a normal OPTION answer -- {"text",
+    "value"} -- so everything downstream (the summary, the payload builder,
+    autofill, carry-forward) handles the common case without knowing the
+    picker exists. Only a genuine 2+ selection carries the keys that trigger
+    the fan-out.
+    """
+    if len(values) == 1:
+        return {"text": labels[0], "value": values[0]}
+    return {
+        "text": ", ".join(labels),
+        "values": values,
+        "labels": labels,
+        "multi": True,
+        # Which answers have actually reached Go. Appended to one at a time,
+        # so a retry after a partial failure never re-sends a row that
+        # already landed (see confirm_conversation).
+        "submitted": [],
+    }
+
+
+async def _locked_selection(
+    session: AsyncSession, *, conversation_id: UUID, form: FormDetail
+) -> tuple[Conversation, Question, list[Choice]] | None:
+    """Loads the conversation FOR UPDATE and checks that a picker button
+    tapped right now is still meaningful. None means "stale, change nothing".
+
+    The lock is what keeps two fast taps from both reading the same selection
+    and one of them overwriting the other; LINE delivers them as two
+    independent webhook requests. It waits rather than failing fast (unlike
+    handle_answer's NOWAIT, which deliberately drops a second message): both
+    taps are real selections and both should land, just one after the other.
+
+    Stale is the normal case, not an error: a Flex bubble can never be
+    retracted or edited, so yesterday's picker is still sitting in the chat
+    with live buttons.
+    """
+    conversation = (
+        await session.execute(
+            select(Conversation)
+            .where(Conversation.conversation_id == conversation_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if conversation is None:
+        raise ConversationNotFound()
+    if conversation.status != ConversationStatus.ACTIVE:
+        return None
+
+    question = next(
+        (q for q in questions_from_form(form) if q.question_id == conversation.current_question_id),
+        None,
+    )
+    if question is None:
+        return None
+    options = await multi_choice_options_for(
+        session, conversation=conversation, question=question, form=form
+    )
+    if options is None:
+        return None
+    return conversation, question, options
+
+
+def _stale_reply(conversation_id: UUID) -> ConversationReply:
+    return ConversationReply(
+        conversation_id=conversation_id,
+        substate=ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION,
+        text=_STALE_PICKER_TEXT,
+    )
+
+
+async def toggle_choice(
+    session: AsyncSession, *, conversation_id: UUID, choice_id: str, form: FormDetail
+) -> ConversationReply:
+    """Adds or removes one option from the running selection (the
+    "multi_toggle" postback). Replies with the running selection as a short
+    line, not a new bubble -- the bubble is still on screen and tappable.
+    """
+    locked = await _locked_selection(session, conversation_id=conversation_id, form=form)
+    if locked is None:
+        return _stale_reply(conversation_id)
+    conversation, _, options = locked
+
+    option = next((o for o in options if o.id == choice_id), None)
+    if option is None:
+        # Not one of the options on offer right now -- e.g. a plot that is no
+        # longer this farmer's, or a hand-crafted postback (postback data is
+        # attacker-controllable in principle). Refuse rather than store an id
+        # the fan-out would later send to Go.
+        return _stale_reply(conversation_id)
+
+    values, labels = await _current_selection(session, conversation)
+    if choice_id in values:
+        index = values.index(choice_id)
+        values.pop(index)
+        labels.pop(index)
+    else:
+        values.append(choice_id)
+        labels.append(option.label)
+
+    await _store_selection(session, conversation=conversation, values=values, labels=labels)
+    return ConversationReply(
+        conversation_id=conversation_id,
+        substate=ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION,
+        text=_selection_text(labels),
+        selection_ack=True,
+    )
+
+
+async def finish_selection(
+    session: AsyncSession, *, conversation_id: UUID, form: FormDetail
+) -> ConversationReply:
+    """Ends the selection (the "multi_done" postback / a typed "เสร็จ").
+
+    One option stores a normal single answer, so the rest of the system never
+    learns the picker was involved; 2+ store the multi answer the fan-out
+    reads. Either way the conversation advances exactly like any other
+    answered question, because both go through _store_answer_and_advance.
+    """
+    locked = await _locked_selection(session, conversation_id=conversation_id, form=form)
+    if locked is None:
+        return _stale_reply(conversation_id)
+    conversation, question, options = locked
+
+    values, labels = await _current_selection(session, conversation)
+    if not values:
+        hint = "กรุณาเลือกอย่างน้อย 1 รายการ"
+        skip_label = _skip_label_for(question)
+        if skip_label is not None:
+            hint += f' หรือกด "{skip_label}"'
+        return _multi_choice_reply(conversation_id, question, options, error=hint)
+
+    return await _store_answer_and_advance(
+        session,
+        conversation=conversation,
+        questions=questions_from_form(form),
+        form=form,
+        answer=_multi_choice_answer(values, labels),
+    )
+
+
+async def skip_selection(
+    session: AsyncSession, *, conversation_id: UUID, form: FormDetail
+) -> ConversationReply:
+    """The picker's skip button ("ทั้งฟาร์ม" on the plot question, "⏭️ ข้าม"
+    elsewhere) -- stored as {"skipped": true}, byte for byte what the skip
+    button on today's Quick Reply version of the question stores. Anything
+    ticked before is discarded.
+    """
+    locked = await _locked_selection(session, conversation_id=conversation_id, form=form)
+    if locked is None:
+        return _stale_reply(conversation_id)
+    conversation, question, options = locked
+
+    if question.is_mandatory:
+        # The bubble never offers the button for a mandatory question, but a
+        # stale bubble from before the form was edited still could.
+        return _multi_choice_reply(
+            conversation_id,
+            question,
+            options,
+            error="คำถามนี้จำเป็นต้องเลือกอย่างน้อย 1 รายการครับ",
+        )
+
+    return await _store_answer_and_advance(
+        session,
+        conversation=conversation,
+        questions=questions_from_form(form),
+        form=form,
+        answer={"skipped": True},
+    )
+
+
+async def _handle_typed_selection_text(
+    session: AsyncSession,
+    *,
+    conversation: Conversation,
+    question: Question,
+    options: list[Choice],
+    form: FormDetail,
+    raw_text: str,
+) -> ConversationReply:
+    """Typing while the picker is open.
+
+    A farmer who types instead of tapping must never hit a dead end
+    (docs-and-plan#189's rule): an option's label toggles it, "เสร็จ" ends the
+    selection, the skip label skips, and anything else re-sends the bubble
+    with a nudge rather than being stored -- storing it would put free text
+    where a choice id belongs.
+    """
+    text = raw_text.strip()
+    if text.casefold() in _DONE_WORDS:
+        return await finish_selection(
+            session, conversation_id=conversation.conversation_id, form=form
+        )
+
+    # match_choice, not a bare label comparison: it already forgives a
+    # trailing politeness particle ("แปลง A ครับ"), and reusing it keeps typed
+    # labels behaving like every other typed choice in this flow. The skip
+    # label rides along in the same list so it gets the same forgiveness.
+    candidates = list(options)
+    skip_label = _skip_label_for(question)
+    if skip_label is not None:
+        candidates.append(Choice(id=_PICKER_SKIP_ID, label=skip_label))
+
+    matched = text_parsing.match_choice(text, candidates)
+    if matched is not None and matched.id == _PICKER_SKIP_ID:
+        return await skip_selection(
+            session, conversation_id=conversation.conversation_id, form=form
+        )
+    if matched is not None:
+        return await toggle_choice(
+            session,
+            conversation_id=conversation.conversation_id,
+            choice_id=matched.id,
+            form=form,
+        )
+
+    values, _ = await _current_selection(session, conversation)
+    return _multi_choice_reply(
+        conversation.conversation_id,
+        question,
+        options,
+        selected=frozenset(values),
+        error="กรุณากดเลือกจากปุ่มด้านบนครับ",
+    )
+
+
 def _reply_for_question(
     conversation_id: UUID, question: Question, *, page: int = 0, error: str | None = None
 ) -> ConversationReply:
@@ -475,7 +1050,9 @@ async def start_conversation(
             text="ไม่มีคำถามที่จำเป็นต้องตอบ ยืนยันการส่งข้อมูลหรือไม่?",
         )
 
-    return _reply_for_question(conversation.conversation_id, first_question)
+    return await _ask_question(
+        session, conversation=conversation, question=first_question, form=form
+    )
 
 
 async def start_conversation_with_autofill(
@@ -597,7 +1174,94 @@ async def _handle_parent_answer(
             substate=ActiveSubstate.AWAITING_CONFIRMATION,
             text="ไม่มีคำถามที่จำเป็นต้องตอบ ยืนยันการส่งข้อมูลหรือไม่?",
         )
-    return _reply_for_question(conversation.conversation_id, first_question)
+    return await _ask_question(
+        session, conversation=conversation, question=first_question, form=form
+    )
+
+
+async def _store_answer_and_advance(
+    session: AsyncSession,
+    *,
+    conversation: Conversation,
+    questions: list[Question],
+    form: FormDetail,
+    answer: dict[str, Any],
+) -> ConversationReply:
+    """Stores `answer` against the conversation's currently-open question and
+    moves on -- to the next question, or to the confirmation summary once
+    everything required is in.
+
+    Extracted from handle_answer so the multi-choice picker's "เสร็จ" and skip
+    buttons can end a question exactly the way a typed or tapped answer does.
+    Those arrive as postbacks, not text, so without this they would each need
+    their own copy of the upsert, the state-machine call, the
+    confirmation-summary branch and the advance -- four things that have to
+    stay identical for the two paths to be indistinguishable downstream, and
+    that nobody would remember to keep in sync.
+    """
+    conversation_id = conversation.conversation_id
+
+    # Upsert, not a blind insert: US2-6's "แก้ไข" (edit-at-confirmation,
+    # begin_edit below) can re-open a question that's already been answered
+    # once, or skipped -- update that row in place rather than adding a
+    # second one for the same question_id, which _format_answered_lines and
+    # confirm_conversation's own dict-comprehension would otherwise both
+    # silently show/collapse in an order that isn't actually guaranteed (no
+    # ORDER BY on _answered_rows, and no unique constraint on
+    # (conversation_id, question_id) at the DB level). The normal
+    # forward-only flow never finds an existing row here -- current_question_id
+    # only ever advances to a not-yet-answered question -- so this is a
+    # no-op behavior change for every path except editing.
+    answer_rows = await _answered_rows(session, conversation_id)
+    existing_row = next(
+        (row for row in answer_rows if row.question_id == conversation.current_question_id),
+        None,
+    )
+    if existing_row is not None:
+        # Reassign, not mutate -- this column isn't wrapped in
+        # sqlalchemy.ext.mutable.MutableDict, so an in-place
+        # `existing_row.answer["text"] = ...` wouldn't be seen by the unit
+        # of work at commit time.
+        existing_row.answer = answer
+    else:
+        existing_row = ConversationAnswer(
+            conversation_id=conversation_id,
+            question_id=conversation.current_question_id,
+            answer=answer,
+            source=AnswerSource.GUIDED_FLOW,
+        )
+        session.add(existing_row)
+        answer_rows.append(existing_row)
+    await session.flush()
+
+    answered = _answered_question_ids(answer_rows)
+    transition = on_guided_answer(all_slots_filled=_all_required_answered(questions, answered))
+
+    if transition.next_state == ActiveSubstate.AWAITING_CONFIRMATION:
+        _advance_to(conversation, None)
+        await session.commit()
+        return ConversationReply(
+            conversation_id=conversation_id,
+            substate=ActiveSubstate.AWAITING_CONFIRMATION,
+            text=_format_confirmation_summary(questions, answer_rows),
+        )
+
+    next_question = _next_unanswered_required(questions, answered)
+    if next_question is None:
+        # on_guided_answer's contract (constants.py) says this can't happen --
+        # "slots remain" and "no unanswered required question found" are
+        # contradictory. Fail loudly rather than silently going quiet on the
+        # farmer.
+        raise RuntimeError(
+            f"on_guided_answer reported slots remaining for conversation_id={conversation_id} "
+            "but no unanswered mandatory question was found"
+        )
+
+    _advance_to(conversation, next_question.question_id)
+    await session.commit()
+    return await _ask_question(
+        session, conversation=conversation, question=next_question, form=form
+    )
 
 
 async def handle_answer(
@@ -679,6 +1343,25 @@ async def handle_answer(
     questions = questions_from_form(form)
     question_by_id = {q.question_id: q for q in questions}
     current_question = question_by_id.get(conversation.current_question_id)
+
+    # The multi-choice picker owns this question while it is open: its answer
+    # is built by tapping, so typed text is interpreted against the picker's
+    # own options here rather than falling through to the OPTION matching
+    # below -- which, for the plot question, would match against Kotlin's
+    # global ref.plot_constant list, i.e. plots that are not this farmer's.
+    if current_question is not None:
+        picker_options = await multi_choice_options_for(
+            session, conversation=conversation, question=current_question, form=form
+        )
+        if picker_options is not None:
+            return await _handle_typed_selection_text(
+                session,
+                conversation=conversation,
+                question=current_question,
+                options=picker_options,
+                form=form,
+                raw_text=raw_text,
+            )
 
     resolved_value: str | None = None
     is_skip = False
@@ -795,97 +1478,274 @@ async def handle_answer(
     if resolved_value is not None:
         answer["value"] = resolved_value
 
-    # Upsert, not a blind insert: US2-6's "แก้ไข" (edit-at-confirmation,
-    # begin_edit below) can re-open a question that's already been answered
-    # once, or skipped -- update that row in place rather than adding a
-    # second one for the same question_id, which _format_answered_lines and
-    # confirm_conversation's own dict-comprehension would otherwise both
-    # silently show/collapse in an order that isn't actually guaranteed (no
-    # ORDER BY on _answered_rows, and no unique constraint on
-    # (conversation_id, question_id) at the DB level). The normal
-    # forward-only flow never finds an existing row here -- current_question_id
-    # only ever advances to a not-yet-answered question -- so this is a
-    # no-op behavior change for every path except editing.
-    answer_rows = await _answered_rows(session, conversation_id)
-    existing_row = next(
-        (row for row in answer_rows if row.question_id == conversation.current_question_id),
-        None,
+    return await _store_answer_and_advance(
+        session, conversation=conversation, questions=questions, form=form, answer=answer
     )
-    if existing_row is not None:
-        # Reassign, not mutate -- this column isn't wrapped in
-        # sqlalchemy.ext.mutable.MutableDict, so an in-place
-        # `existing_row.answer["text"] = ...` wouldn't be seen by the unit
-        # of work at commit time.
-        existing_row.answer = answer
-    else:
-        existing_row = ConversationAnswer(
-            conversation_id=conversation_id,
-            question_id=conversation.current_question_id,
-            answer=answer,
-            source=AnswerSource.GUIDED_FLOW,
+
+
+def _nothing_submitted(conversation_id: UUID, text: str) -> ConversationReply:
+    """A plain-text reply for a confirm that wasn't one (see
+    ConversationReply.nothing_submitted). GUIDED_ASKING_FIXED_QUESTION with no
+    choices, so the router's _reply sends it as text with no confirm button
+    pointing at a conversation that's already finished.
+    """
+    return ConversationReply(
+        conversation_id=conversation_id,
+        substate=ActiveSubstate.GUIDED_ASKING_FIXED_QUESTION,
+        text=text,
+        nothing_submitted=True,
+    )
+
+
+def _already_submitted(answer_rows: list[ConversationAnswer]) -> list[str]:
+    """Which rows of a several-answer submission have already reached Go --
+    empty unless a confirm stopped partway.
+    """
+    row = _multi_choice_row(answer_rows)
+    if row is None:
+        return []
+    return [str(value) for value in row.answer.get("submitted", [])]
+
+
+def _multi_choice_row(answer_rows: list[ConversationAnswer]) -> ConversationAnswer | None:
+    """The answer that holds several choices, if this conversation has one --
+    there is at most one (see multi_choice_options_for).
+
+    A single-choice selection is stored as an ordinary {"text", "value"}
+    answer (see _multi_choice_answer), so it never reaches this and never
+    changes how the submission is built.
+    """
+    return next((row for row in answer_rows if row.answer.get("multi")), None)
+
+
+async def _submit_per_choice(
+    session: AsyncSession,
+    *,
+    conversation: Conversation,
+    row: ConversationAnswer,
+    field_name: str,
+    base_payload: dict[str, Any],
+) -> ConversationReply | None:
+    """Writes one row per ticked answer: the same answers N times, differing
+    only in `field_name`. Returns None when every row made it, or the reply
+    to send when it stopped partway.
+
+    The whole design rests on `submitted`: each choice is appended to it and
+    COMMITTED the moment Go accepts that row, so a retry re-sends only what is
+    genuinely missing. Without it, a farmer whose 3rd row failed would, on
+    tapping ยืนยัน again, write rows 1 and 2 a second time -- and Go cannot
+    protect them, because SubmitTaskForUser deliberately allows repeat
+    submissions (that is what makes multi-submit forms work at all) and
+    dissectAnswer has no idempotency guard. Duplicated farm records are worse
+    than a failed save: nobody notices them.
+
+    Sequential, not gathered: per-row commit ordering is the point, and a
+    handful of rows inside one webhook request is well within the reply
+    window. HandlerNotSupported is deliberately re-raised -- it is a
+    permanent "this form isn't built yet", it fails on the first row before
+    anything is written, and confirm_conversation's own branch already says
+    that honestly.
+    """
+    values = [str(value) for value in row.answer.get("values", [])]
+    labels = [str(label) for label in row.answer.get("labels", [])]
+    submitted = [str(value) for value in row.answer.get("submitted", [])]
+
+    for choice_id in values:
+        if choice_id in submitted:
+            # Already saved on an earlier attempt -- skipping it is what
+            # keeps a retry from duplicating rows.
+            continue
+        try:
+            await submit_task(
+                TaskSubmission(
+                    user_id=str(conversation.user_id),
+                    task_id=str(conversation.task_id),
+                    answer={**base_payload, field_name: choice_id},
+                )
+            )
+        except HandlerNotSupported:
+            # Permanent and identical for every row -- let
+            # confirm_conversation's own branch report it. Nothing has been
+            # written, because this fails on the first row.
+            raise
+        except Exception:
+            logger.exception(
+                "submit_task failed for conversation_id=%s on row %d of %d -- "
+                "%d row(s) already saved, conversation left awaiting confirmation so "
+                "tapping confirm again retries only the rest",
+                conversation.conversation_id,
+                values.index(choice_id) + 1,
+                len(values),
+                len(submitted),
+            )
+            if not submitted:
+                # Nothing landed at all -- this is an ordinary failed submit
+                # from the farmer's point of view, so give them the ordinary
+                # message rather than "saved 0 of 3".
+                return ConversationReply(
+                    conversation_id=conversation.conversation_id,
+                    substate=ActiveSubstate.AWAITING_CONFIRMATION,
+                    text="เกิดข้อผิดพลาด ไม่สามารถบันทึกข้อมูลได้ กรุณาลองใหม่อีกครั้ง",
+                    submission_failed=True,
+                )
+            saved_labels = [labels[values.index(saved)] for saved in submitted if saved in values]
+            return ConversationReply(
+                conversation_id=conversation.conversation_id,
+                substate=ActiveSubstate.AWAITING_CONFIRMATION,
+                text=(
+                    f"บันทึกแล้ว {len(submitted)} จาก {len(values)} รายการ "
+                    f"({', '.join(saved_labels)}) "
+                    "— กดยืนยันอีกครั้งเพื่อบันทึกรายการที่เหลือ"
+                ),
+                submission_failed=True,
+            )
+
+        submitted = [*submitted, choice_id]
+        # Saved per row, not once at the end: a crash or a Vercel timeout
+        # must never lose the record of what already reached Go.
+        #
+        # But NOT by committing `session`: confirm_conversation holds a
+        # FOR UPDATE lock on the conversation for this whole fan-out, and a
+        # COMMIT releases it. Committing here let a second ยืนยัน take the
+        # lock after the first plot, read submitted=[plot 1] with the status
+        # still ACTIVE, and send plots 2 and 3 alongside this request (caught
+        # by test_two_simultaneous_confirms_write_each_plot_once). So the
+        # record is written through its own short session instead -- a
+        # different table from the locked row, so it never waits on it --
+        # and the lock stays held until confirm_conversation's final commit.
+        await _record_submitted(row, submitted)
+
+    return None
+
+
+async def _record_submitted(row: ConversationAnswer, submitted: list[str]) -> None:
+    """Durably records which choices reached Go, in its own transaction.
+
+    The in-memory copy is updated with set_committed_value, which does NOT
+    mark the row dirty. If the calling session flushed its own UPDATE of
+    this row, its transaction would hold the row lock while this session
+    waited on it -- a deadlock Postgres can't detect, since both
+    connections are held by the same request.
+    """
+    answer = {**row.answer, "submitted": submitted}
+    async with async_session_maker() as side_session:
+        await side_session.execute(
+            update(ConversationAnswer)
+            .where(ConversationAnswer.conversation_answer_id == row.conversation_answer_id)
+            .values(answer=answer)
         )
-        session.add(existing_row)
-        answer_rows.append(existing_row)
-    await session.flush()
+        await side_session.commit()
+    set_committed_value(row, "answer", answer)
 
-    answered = {row.question_id for row in answer_rows}
-    transition = on_guided_answer(all_slots_filled=_all_required_answered(questions, answered))
 
-    if transition.next_state == ActiveSubstate.AWAITING_CONFIRMATION:
-        _advance_to(conversation, None)
-        await session.commit()
-        return ConversationReply(
-            conversation_id=conversation_id,
-            substate=ActiveSubstate.AWAITING_CONFIRMATION,
-            text=_format_confirmation_summary(questions, answer_rows),
-        )
-
-    next_question = _next_unanswered_required(questions, answered)
-    if next_question is None:
-        # on_guided_answer's contract (constants.py) says this can't happen --
-        # "slots remain" and "no unanswered required question found" are
-        # contradictory. Fail loudly rather than silently going quiet on the
-        # farmer.
-        raise RuntimeError(
-            f"on_guided_answer reported slots remaining for conversation_id={conversation_id} "
-            "but no unanswered mandatory question was found"
-        )
-
-    _advance_to(conversation, next_question.question_id)
-    await session.commit()
-    return _reply_for_question(conversation_id, next_question)
+_ALREADY_SAVED = "บันทึกข้อมูลชุดนี้ไปแล้วครับ"
+_ALREADY_CANCELLED = "รายการนี้ถูกยกเลิกไปแล้วครับ"
+_CONFIRM_NOT_READY = "ยังตอบไม่ครบครับ กรุณาตอบข้อนี้ให้เสร็จก่อนกดยืนยัน"
+_CONFIRM_WHILE_PAUSED = 'งานนี้พักไว้อยู่และยังตอบไม่ครบครับ พิมพ์ "เริ่ม" แล้วเลือกงานนี้เพื่อทำต่อ'
 
 
 async def confirm_conversation(
     session: AsyncSession, *, conversation_id: UUID, form: FormDetail
 ) -> ConversationReply:
-    conversation = await session.get(Conversation, conversation_id)
+    # Locked, and WAITING for the lock (not NOWAIT): a double tap on ยืนยัน,
+    # or LINE redelivering the postback, arrives as two independent webhook
+    # requests. Unlocked, both read `submitted` before either wrote it, both
+    # saw nothing sent, and both sent every row -- 3 plots became 6 rows
+    # (review on #76). With the lock the second request waits for the first
+    # to finish, then sees the conversation COMPLETED (or `submitted`
+    # already filled in) and sends nothing twice. Waiting rather than
+    # dropping it, so the second tap still gets an honest answer.
+    #
+    # populate_existing is load-bearing: the router has usually already
+    # loaded this row in the same session (session.get, to find the form)
+    # BEFORE the lock was taken. Without it SQLAlchemy hands back that
+    # already-loaded object with its pre-lock attributes, so the waiting
+    # request would still see status ACTIVE and submit everything again.
+    conversation = (
+        await session.execute(
+            select(Conversation)
+            .where(Conversation.conversation_id == conversation_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
     if conversation is None:
         raise ConversationNotFound()
 
+    if conversation.status == ConversationStatus.COMPLETED:
+        return _nothing_submitted(conversation_id, _ALREADY_SAVED)
+    if conversation.status == ConversationStatus.CANCELLED:
+        return _nothing_submitted(conversation_id, _ALREADY_CANCELLED)
+
+    # Only the confirmation step can be confirmed. A ยืนยัน button can never
+    # be retracted from the chat, so an old one stays tappable after the
+    # farmer has gone back into a question (แก้ไข, or a selection still being
+    # built). Submitting then would send whatever half-finished state that
+    # question is in -- e.g. a plot selection with nothing ticked yet goes
+    # out as plot_id missing, i.e. a whole-farm record nobody asked for
+    # (review on #76). Show them the step they're actually on instead.
+    picker_pending = (conversation.parent_answer or {}).get("pending_kind") is not None
+    if picker_pending or conversation.current_question_id is not None:
+        if conversation.status == ConversationStatus.PAUSED:
+            # Not via resume_conversation: that sets the conversation ACTIVE,
+            # and the farmer may have started another task since pausing this
+            # one -- two ACTIVE conversations, and the next typed answer lands
+            # on whichever the router finds first (docs-and-plan#222). Resuming
+            # stays an explicit choice, made from the task list.
+            return _nothing_submitted(conversation_id, _CONFIRM_WHILE_PAUSED)
+        current_step = await resume_conversation(session, conversation=conversation, form=form)
+        return replace(
+            current_step,
+            text=f"{_CONFIRM_NOT_READY}\n\n{current_step.text}",
+            nothing_submitted=True,
+        )
+
     field_name_by_question_id = {q.question_id: q.field_name for q in questions_from_form(form)}
-    answer_rows = await _answered_rows(session, conversation_id)
+    # A selection still being built ({"selecting": true}) is never part of a
+    # submission. The state check above already rules this out; this is the
+    # backstop, so no future path can ship an unfinished answer to Go.
+    answer_rows = [
+        row
+        for row in await _answered_rows(session, conversation_id, refresh=True)
+        if not row.answer.get("selecting")
+    ]
+    multi_row = _multi_choice_row(answer_rows)
     # Skipped fields are saved as nothing -- omitted from the payload
-    # entirely rather than sending an empty/null value for that column.
+    # entirely rather than sending an empty/null value for that column. The
+    # multi-choice row is omitted too and added back one choice at a time
+    # below; it is the single field that differs between the N rows written.
     answer_payload: dict[str, Any] = {
         field_name_by_question_id.get(row.question_id, str(row.question_id)): (
             row.answer.get("value") or row.answer.get("text")
         )
         for row in answer_rows
-        if not row.answer.get("skipped")
+        if not row.answer.get("skipped") and row is not multi_row
     }
     if conversation.parent_answer is not None and "field_name" in conversation.parent_answer:
         parent_field_name = conversation.parent_answer["field_name"]
         answer_payload[parent_field_name] = conversation.parent_answer["value"]
 
     try:
-        await submit_task(
-            TaskSubmission(
-                user_id=str(conversation.user_id),
-                task_id=str(conversation.task_id),
-                answer=answer_payload,
+        if multi_row is not None:
+            partial = await _submit_per_choice(
+                session,
+                conversation=conversation,
+                row=multi_row,
+                field_name=field_name_by_question_id.get(
+                    multi_row.question_id, str(multi_row.question_id)
+                ),
+                base_payload=answer_payload,
             )
-        )
+            if partial is not None:
+                return partial
+        else:
+            await submit_task(
+                TaskSubmission(
+                    user_id=str(conversation.user_id),
+                    task_id=str(conversation.task_id),
+                    answer=answer_payload,
+                )
+            )
     except HandlerNotSupported:
         # A permanent failure, not a transient one -- Go is correctly saying
         # "not built yet" (see docs/plans/chatbot-child-handler-design.md),
@@ -939,12 +1799,31 @@ async def confirm_conversation(
     conversation.status = ConversationStatus.COMPLETED
     await session.commit()
 
+    # A multi-choice confirm ends the submission outright -- no "➕ เพิ่มอีก
+    # รายการ". The farmer has just ticked every answer they had in one go;
+    # offering the one-row-at-a-time loop on top of that would put two ways of
+    # doing the same thing in front of them, and a second fan-out from the
+    # same carried-forward answers is exactly the duplicate this feature was
+    # careful not to create. Returned as the ordinary terminal reply, so the
+    # caller sends the quick ack and the diary just as for any single-submit
+    # form -- the task itself stays listed under "เริ่ม" until close_at, as
+    # every multi-submit task does, if they genuinely have more to record.
+    if multi_row is not None:
+        row_count = len(multi_row.answer.get("values", []))
+        return ConversationReply(
+            conversation_id=conversation_id,
+            substate=ActiveSubstate.AWAITING_CONFIRMATION,
+            text=f"บันทึกข้อมูลเรียบร้อยแล้ว {row_count} รายการ ขอบคุณครับ",
+        )
+
     # This conversation is done either way -- the row is saved. A
     # multiple-submit form just isn't finished with the TASK: the farmer is
     # expected to file several rows against it (grade A, then B, then C), so
     # offer another instead of closing the conversation out. The caller
     # attaches the buttons; router.py's "add_another" postback starts the
-    # next one with the parent selection carried forward.
+    # next one with the parent selection carried forward. Reached only when
+    # the picker was NOT used for several answers -- including a picker
+    # where the farmer ticked just one, which is stored as an ordinary answer.
     if form.is_multiple_submit:
         return ConversationReply(
             conversation_id=conversation_id,
@@ -958,6 +1837,18 @@ async def confirm_conversation(
         substate=ActiveSubstate.AWAITING_CONFIRMATION,
         text="บันทึกข้อมูลเรียบร้อยแล้ว ขอบคุณครับ",
     )
+
+
+def _carried_answer(answer: dict[str, Any]) -> dict[str, Any]:
+    """The copy of an answer that carries forward into the next submission.
+
+    Everything about WHAT the farmer answered is copied, including a
+    multi-choice selection. `submitted` is deliberately dropped: it records
+    which rows of the PREVIOUS submission already reached Go, and carrying
+    it would make the new conversation skip exactly those -- silently
+    writing fewer rows than the farmer picked.
+    """
+    return {key: value for key, value in answer.items() if key != "submitted"}
 
 
 async def start_next_submission(
@@ -1025,7 +1916,7 @@ async def start_next_submission(
             ConversationAnswer(
                 conversation_id=conversation.conversation_id,
                 question_id=row.question_id,
-                answer=row.answer,
+                answer=_carried_answer(row.answer),
                 source=row.source,
             )
         )
@@ -1038,7 +1929,9 @@ async def start_next_submission(
             substate=ActiveSubstate.AWAITING_CONFIRMATION,
             text="ไม่มีคำถามที่จำเป็นต้องตอบ ยืนยันการส่งข้อมูลหรือไม่?",
         )
-    return _reply_for_question(conversation.conversation_id, first_question)
+    return await _ask_question(
+        session, conversation=conversation, question=first_question, form=form
+    )
 
 
 async def cancel_conversation(session: AsyncSession, *, conversation_id: UUID) -> ConversationReply:
@@ -1167,6 +2060,23 @@ async def resume_conversation(
             f"Resumed conversation_id={conversation.conversation_id}'s current question "
             "is no longer part of the form"
         )
+    picker_options = await multi_choice_options_for(
+        session, conversation=conversation, question=current_question, form=form
+    )
+    if picker_options is not None:
+        # Resuming mid-selection: the bubble comes back with what the farmer
+        # had already ticked still ticked, because the selection lives in the
+        # answer row rather than in the (unretractable, uneditable) message
+        # they tapped before pausing.
+        values, _ = await _current_selection(session, conversation)
+        return _multi_choice_reply(
+            conversation.conversation_id,
+            current_question,
+            picker_options,
+            selected=frozenset(values),
+            prefix=recap,
+        )
+
     # Page-aware: a farmer paused mid-pagination resumes on the exact page
     # they left, not silently back at page 1 (conversation.current_page
     # persists across pause/resume same as everything else).
@@ -1229,6 +2139,30 @@ async def editable_questions(
     return [question_by_id[qid] for qid in ordered]
 
 
+async def edit_blocked_reason(session: AsyncSession, *, conversation_id: UUID) -> str | None:
+    """Why แก้ไข isn't allowed right now, or None if it is.
+
+    Blocked exactly when a several-answer confirm stopped partway: some rows
+    are already in Go, the rest aren't. Editing then can only go wrong
+    (review on #76):
+    - a fresh selection is stored as a new answer with an empty
+      `submitted`, so the next confirm re-sends the rows that already
+      landed -- duplicate farm records, which Go can't catch because
+      repeat submissions are allowed by design;
+    - and even without that, the chat cannot change rows Go already wrote,
+      so letting the farmer "edit" them would promise something untrue.
+    The farmer can still confirm (sends only what's missing) or cancel.
+    """
+    already = _already_submitted(await _answered_rows(session, conversation_id))
+    if not already:
+        return None
+    return (
+        f"บันทึกไปแล้ว {len(already)} รายการ จึงแก้ไขคำตอบไม่ได้ครับ "
+        "กดยืนยันเพื่อบันทึกรายการที่เหลือ หรือกดยกเลิก "
+        "(รายการที่บันทึกแล้วจะยังอยู่ในระบบ)"
+    )
+
+
 async def begin_edit(
     session: AsyncSession, *, conversation_id: UUID, question_id: UUID, form: FormDetail
 ) -> ConversationReply:
@@ -1246,6 +2180,18 @@ async def begin_edit(
         raise ConversationNotFound()
 
     questions = questions_from_form(form)
+    # Checked here as well as at the แก้ไข button (edit_blocked_reason): the
+    # question picker that leads here can't be retracted, so an old one may
+    # still be tapped after part of the submission went through.
+    blocked = await edit_blocked_reason(session, conversation_id=conversation_id)
+    if blocked is not None:
+        answer_rows = await _answered_rows(session, conversation_id)
+        return ConversationReply(
+            conversation_id=conversation_id,
+            substate=ActiveSubstate.AWAITING_CONFIRMATION,
+            text=f"{blocked}\n\n{_format_confirmation_summary(questions, answer_rows)}",
+        )
+
     question_by_id = {q.question_id: q for q in questions}
     question = question_by_id.get(question_id)
     if question is None:
@@ -1259,4 +2205,4 @@ async def begin_edit(
 
     conversation.current_question_id = question_id
     await session.commit()
-    return _reply_for_question(conversation_id, question)
+    return await _ask_question(session, conversation=conversation, question=question, form=form)

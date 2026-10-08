@@ -22,6 +22,7 @@ CREATE SCHEMA auth;
 CREATE SCHEMA form;
 CREATE SCHEMA chat;
 CREATE SCHEMA notify;
+CREATE SCHEMA agriculture;
 
 CREATE TABLE auth.user_account (
     user_id uuid DEFAULT gen_random_uuid() NOT NULL,
@@ -169,4 +170,30 @@ CREATE TABLE notify.reminder_log (
     CONSTRAINT pk_reminder_log PRIMARY KEY (log_id),
     CONSTRAINT fk_reminder_log_user FOREIGN KEY (user_id) REFERENCES auth.user_account (user_id),
     CONSTRAINT fk_reminder_log_task FOREIGN KEY (task_id) REFERENCES form.task (task_id)
+);
+
+-- agriculture.* -- read directly (never written) by src/line/plot_picker.py,
+-- the same documented ADR 0001 exception src/line/parent_picker.py takes.
+-- Only the three tables and the columns that picker's query actually names;
+-- the real tables (database repo V1__baseline.sql) have many more.
+CREATE TABLE agriculture.farm (
+    farm_id uuid DEFAULT gen_random_uuid() NOT NULL,
+    farm_name character varying,
+    CONSTRAINT pk_farm PRIMARY KEY (farm_id)
+);
+
+CREATE TABLE agriculture.farmer_farm (
+    farmer_farm_id uuid DEFAULT gen_random_uuid() NOT NULL,
+    farmer_id uuid NOT NULL,
+    farm_id uuid NOT NULL,
+    CONSTRAINT pk_farmer_farm PRIMARY KEY (farmer_farm_id),
+    CONSTRAINT fk_farmer_farm_farm FOREIGN KEY (farm_id) REFERENCES agriculture.farm (farm_id)
+);
+
+CREATE TABLE agriculture.plot (
+    plot_id uuid DEFAULT gen_random_uuid() NOT NULL,
+    farm_id uuid NOT NULL,
+    plot_name character varying,
+    CONSTRAINT pk_plot PRIMARY KEY (plot_id),
+    CONSTRAINT fk_plot_farm FOREIGN KEY (farm_id) REFERENCES agriculture.farm (farm_id)
 );
