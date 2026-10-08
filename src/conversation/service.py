@@ -476,6 +476,9 @@ _FARM_FIELD_NAME = "farm_id"
 # "หากทำทั้งฟาร์มไม่ต้องระบุ"), so the picker says so in words; every other
 # optional question keeps the ordinary skip label.
 _WHOLE_FARM_LABEL = "ทั้งฟาร์ม"
+# A form with any of these is never asked through the picker -- see
+# is_multi_choice_question.
+_NUMBER_INPUT_TYPES = frozenset({"INT", "FLOAT"})
 
 
 def is_multi_choice_question(question: Question, form: FormDetail) -> bool:
@@ -490,10 +493,19 @@ def is_multi_choice_question(question: Question, form: FormDetail) -> bool:
     the duplicate they said they didn't want. Every other question, and every
     question on an ordinary form, keeps today's Quick Reply.
 
+    A form with a number field never gets the picker either. The fan-out
+    copies every other answer onto each row, which is right for a farm or an
+    activity type but wrong for a measurement: ticking grades A and B and
+    entering 50 kg once would write A=50 and B=50, doubling the harvest
+    (docs-and-plan#221). Those forms keep the one-row-at-a-time "add another"
+    loop, where each row gets its own number.
+
     The remaining conditions need a query, so they live in
     multi_choice_options_for below. Callers should use that one.
     """
-    return form.is_multiple_submit and question.input_type == "OPTION"
+    if not form.is_multiple_submit or question.input_type != "OPTION":
+        return False
+    return not any(q.input_type in _NUMBER_INPUT_TYPES for q in questions_from_form(form))
 
 
 async def multi_choice_options_for(

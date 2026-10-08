@@ -107,6 +107,25 @@ class TestIsMultiChoiceQuestion:
         question = service.questions_from_form(form)[0]
         assert service.is_multi_choice_question(question, form) is False
 
+    @pytest.mark.parametrize("number_type", ["INT", "FLOAT"])
+    def test_not_on_a_form_with_a_number_field(self, number_type: str) -> None:
+        """docs-and-plan#221: the fan-out copies every other answer onto each
+        row, so one weight typed once would be saved against every ticked
+        grade. A form that asks for a number keeps one row at a time.
+        """
+        form = _form(field_names=["grade_id"], is_multiple_submit=True)
+        form.sections[0]["questions"].append(
+            {
+                "question_id": str(uuid.uuid4()),
+                "label": "น้ำหนัก (กก.)",
+                "field_name": "quantity_kg",
+                "input_type": number_type,
+                "is_mandatory": True,
+                "sort_order": 1,
+            }
+        )
+        assert service.is_multi_choice_question(_question(form, "grade_id"), form) is False
+
 
 class TestPlotAnswerShape:
     def test_one_plot_is_stored_as_an_ordinary_option_answer(self) -> None:
