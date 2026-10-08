@@ -16,7 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.conversation import intent, reuse, service, text_parsing
-from src.conversation.constants import ActiveSubstate, ConversationStatus
+from src.conversation.constants import PAUSE_LABEL, ActiveSubstate, ConversationStatus
 from src.conversation.exceptions import ConversationNotFound
 from src.conversation.intent import Intent
 from src.conversation.models import Conversation
@@ -36,6 +36,8 @@ from src.line.service import (
     reply_confirm_prompt,
     reply_edit_picker,
     reply_flex,
+    reply_multi_choice_picker,
+    reply_selection_ack,
     reply_task_choices,
     reply_text,
 )
@@ -107,6 +109,24 @@ async def _reply(reply_token: str, reply: service.ConversationReply) -> None:
     """
     if reply.substate == ActiveSubstate.AWAITING_CONFIRMATION:
         await reply_confirm_prompt(reply_token, reply.text, reply.conversation_id)
+        return
+
+    if reply.multi_choice and reply.picker_options is not None:
+        # The multi-choice picker (an OPTION question on a multiple-submit
+        # form): a Flex bubble whose buttons survive the "เลือกแล้ว: ..."
+        # replies the farmer gets while tapping, which Quick Reply would not.
+        await reply_multi_choice_picker(
+            reply_token,
+            reply.text,
+            reply.conversation_id,
+            [(option.id, option.label) for option in reply.picker_options],
+            selected_ids=reply.selected_ids,
+            skip_label=reply.skip_label,
+        )
+        return
+
+    if reply.selection_ack:
+        await reply_selection_ack(reply_token, reply.text, reply.conversation_id)
         return
 
     # GEODATA: LINE's own location picker leads, ahead of skip/pause, and
@@ -202,6 +222,12 @@ async def _confirm_and_reply(reply_token: str, line_user_id: str, conversation_i
         )
         user_id = str(conversation.user_id)
 
+    if reply.nothing_submitted:
+        # Not a real confirmation (a repeat tap, or an old button while a
+        # question is open again) -- nothing was saved by THIS request,
+        # so no quick ack and no diary; just show where things stand.
+        await _reply(reply_token, reply)
+        return
     if reply.submission_failed:
         # Re-attach the confirm button so tapping it again retries --
         # the conversation is still awaiting confirmation, not completed.
@@ -249,6 +275,15 @@ async def _edit_and_reply(reply_token: str, conversation_id: UUID) -> None:
         conversation = await session.get(Conversation, conversation_id)
         if conversation is None:
             await reply_text(reply_token, "ไม่พบบทสนทนานี้แล้ว")
+            return
+        # Once part of a several-answer submission is in Go, editing is
+        # off -- see service.edit_blocked_reason. The confirm buttons
+        # come back so the farmer can finish (or cancel) instead.
+        blocked = await service.edit_blocked_reason(
+            session, conversation_id=conversation.conversation_id
+        )
+        if blocked is not None:
+            await reply_confirm_prompt(reply_token, blocked, conversation.conversation_id)
             return
         form = await get_form(str(conversation.task_form_id))
         questions = await service.editable_questions(
@@ -563,7 +598,7 @@ async def _handle_message(event: MessageEvent) -> None:
             # docs-and-plan#189. The pause label is deliberately excluded:
             # handle_answer treats pausing as valid from ANY step, including
             # this one, and that must keep working.
-            if _awaiting_confirmation(conversation) and message.text.strip() != service.PAUSE_LABEL:
+            if _awaiting_confirmation(conversation) and message.text.strip() != PAUSE_LABEL:
                 await _handle_confirmation_step_text(
                     event,
                     conversation_id=conversation.conversation_id,
@@ -810,6 +845,38 @@ async def _handle_postback(event: PostbackEvent) -> None:
         await reply_text(event.reply_token, "บันทึกข้อมูลครบแล้ว ขอบคุณครับ")
         if conversation is not None:
             await _generate_and_push_diary(str(conversation.user_id), event.source.user_id)
+    elif action in ("multi_toggle", "multi_done", "multi_skip"):
+        # The multi-choice picker's own buttons. All three go through the same
+        # load-form-then-call-service shape as every other postback here; the
+        # staleness check (an old bubble is still tappable forever) lives in
+        # the service layer, next to the row lock it needs.
+        conversation_id = args[0]
+        async with async_session_maker() as session:
+            conversation = await session.get(Conversation, UUID(conversation_id))
+            if conversation is None:
+                await reply_text(event.reply_token, "ไม่พบบทสนทนานี้แล้ว")
+                return
+            form = await get_form(str(conversation.task_form_id))
+            try:
+                if action == "multi_toggle":
+                    reply = await service.toggle_choice(
+                        session,
+                        conversation_id=conversation.conversation_id,
+                        choice_id=args[1],
+                        form=form,
+                    )
+                elif action == "multi_done":
+                    reply = await service.finish_selection(
+                        session, conversation_id=conversation.conversation_id, form=form
+                    )
+                else:
+                    reply = await service.skip_selection(
+                        session, conversation_id=conversation.conversation_id, form=form
+                    )
+            except ConversationNotFound:
+                await reply_text(event.reply_token, "ไม่พบบทสนทนานี้แล้ว")
+                return
+        await _reply(event.reply_token, reply)
     elif action == "edit":
         (conversation_id,) = args
         await _edit_and_reply(event.reply_token, UUID(conversation_id))

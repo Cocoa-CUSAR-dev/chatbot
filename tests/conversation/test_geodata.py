@@ -111,12 +111,15 @@ class TestEditAndResumeReShowTheLocationPrompt:
         session.get = AsyncMock(return_value=conversation)
         session.commit = AsyncMock()
 
-        reply = await service.begin_edit(
-            session,
-            conversation_id=conversation.conversation_id,
-            question_id=question.question_id,
-            form=form,
-        )
+        # No answer rows: begin_edit checks them first, to refuse an edit
+        # after part of a several-answer submission was saved (chatbot#76).
+        with patch("src.conversation.service._answered_rows", new=AsyncMock(return_value=[])):
+            reply = await service.begin_edit(
+                session,
+                conversation_id=conversation.conversation_id,
+                question_id=question.question_id,
+                form=form,
+            )
 
         assert reply.input_type == "GEODATA"
         assert "กรุณากดปุ่ม 📍 ส่งตำแหน่ง ด้านล่างครับ" in reply.text
