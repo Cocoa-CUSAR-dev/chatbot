@@ -18,6 +18,7 @@ from src.notifications.router import router as notifications_router
 from src.reminders.router import router as reminders_router
 from src.reminders.scheduler import configure_jobs, scheduler
 from src.request_id import request_id_middleware
+from src.sentry_scrub import scrub_sso_token
 
 # X-2e: must run before the app is built, and before uvicorn serves its
 # first request, so every log line carries the request ID (see
@@ -34,6 +35,9 @@ sentry_sdk.init(
     dsn=settings.SENTRY_DSN,
     environment=settings.SENTRY_ENVIRONMENT,
     traces_sample_rate=settings.SENTRY_TRACES_SAMPLE_RATE,
+    # The diary card's deep link carries an SSO token, and Sentry attaches
+    # stack-frame locals to exceptions -- see src/sentry_scrub.py.
+    before_send=scrub_sso_token,
 )
 
 # Vercel sets this env var on every deployment automatically. A serverless
