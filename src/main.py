@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from src.config import settings
+from src.sentry_scrub import scrub_sso_token  # stdlib-only: safe to import before init
 
 # X-2d: error tracking, initialized right after `settings` -- before any
 # other first-party import -- so an import-time crash in one of those
@@ -24,6 +25,9 @@ sentry_sdk.init(
     dsn=settings.SENTRY_DSN,
     environment=settings.ENVIRONMENT.value,
     traces_sample_rate=settings.SENTRY_TRACES_SAMPLE_RATE,
+    # The diary card's deep link carries an SSO token, and Sentry attaches
+    # stack-frame locals to exceptions -- see src/sentry_scrub.py.
+    before_send=scrub_sso_token,
 )
 
 from src.exceptions import ServiceException

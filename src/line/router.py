@@ -80,7 +80,10 @@ async def _generate_and_push_diary(user_id: str, line_user_id: str) -> None:
     # link that lands on the login page instead of straight into /history.
     try:
         token = await mint_sso_token(user_id)
-        history_url = f"{line_settings.WEB_APP_URL}/sso?token={token}"
+        # F2 (docs-and-plan#125): token rides in the URL *fragment*, not a query
+        # param -- the fragment never reaches the server, so it can't land in
+        # access logs / Referer. web-app's /sso page reads it client-side.
+        history_url = f"{line_settings.WEB_APP_URL}/sso#token={token}"
     except Exception:
         logger.exception("SSO token mint failed for user_id=%s", user_id)
         history_url = f"{line_settings.WEB_APP_URL}/history"
