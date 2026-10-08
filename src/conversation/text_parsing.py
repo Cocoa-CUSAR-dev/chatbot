@@ -152,6 +152,29 @@ def parse_date(raw_text: str, *, is_datetime: bool = False) -> str | None:
     return result
 
 
+def strip_trailing_particles(raw_text: str) -> str:
+    """Repeatedly drops trailing Thai politeness particles ("ยืนยันครับ" ->
+    "ยืนยัน"), longest-first so "นะครับ" doesn't leave a dangling "ครับ".
+
+    Public because two callers need the exact same notion of "the same word,
+    politely" -- match_choice below, and the router's confirmation-step
+    word matching (docs-and-plan#189), which would otherwise have to copy
+    _TRAILING_PARTICLES and drift from it. Returns the stripped text, which
+    equals raw_text.strip() when there was nothing to strip; a text made up
+    entirely of particles strips down to "" and is the caller's to reject.
+    """
+    text = raw_text.strip()
+    changed = True
+    while changed:
+        changed = False
+        for particle in _TRAILING_PARTICLES:
+            if len(text) > len(particle) and text.endswith(particle):
+                text = text[: -len(particle)].strip()
+                changed = True
+                break
+    return text
+
+
 def match_choice(raw_text: str, choices: "list[Choice]") -> "Choice | None":
     """Resolves raw_text against a real OPTION/BOOLEAN question's choice
     list -- exact label match first (identical to this repo's behavior
@@ -168,18 +191,8 @@ def match_choice(raw_text: str, choices: "list[Choice]") -> "Choice | None":
     if exact is not None:
         return exact
 
-    text = raw_text.strip()
-    stripped_once = False
-    changed = True
-    while changed:
-        changed = False
-        for particle in _TRAILING_PARTICLES:
-            if len(text) > len(particle) and text.endswith(particle):
-                text = text[: -len(particle)].strip()
-                stripped_once = True
-                changed = True
-                break
-    if not stripped_once or not text:
+    text = strip_trailing_particles(raw_text)
+    if text == raw_text.strip() or not text:
         return None
     return next((c for c in choices if c.label == text), None)
 
