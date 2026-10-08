@@ -6,6 +6,8 @@
    next confirm re-sent the plots already saved.
 3. An old ยืนยัน tapped mid-selection submitted the half-built answer --
    plot_id missing, i.e. a whole-farm record nobody chose.
+4. The fix for (3) re-showed the open step through resume_conversation,
+   which set a PAUSED conversation ACTIVE again (docs-and-plan#222).
 
 Real Postgres on purpose: (1) is a race between two webhook requests and
 only a real row lock can serialise them, and all three are about state an
@@ -237,3 +239,29 @@ class TestStaleConfirmMidSelection:
         submit_task.assert_not_awaited()
         assert _sent(reply_message).alt_text  # the picker bubble is re-shown
         assert await _status(db_session, conversation_id) == "active"
+
+    async def test_an_old_confirm_button_leaves_a_paused_conversation_paused(
+        self, db_session: AsyncSession, client: AsyncClient
+    ) -> None:
+        """docs-and-plan#222: re-showing the open step used to go through
+        resume_conversation, which set a PAUSED conversation back to ACTIVE --
+        alongside whatever task the farmer had started since pausing it.
+        """
+        fixture = await _seed(db_session)
+        conversation_id = await _start_at_plot_question(db_session, fixture)
+        await db_session.execute(
+            text("UPDATE chat.conversation SET status = 'paused' WHERE conversation_id = :c"),
+            {"c": conversation_id},
+        )
+        await db_session.commit()
+        submit_task = AsyncMock()
+
+        with respx.mock, patch("src.conversation.service.submit_task", new=submit_task):
+            _mock_form(fixture)
+            reply_message = await _send_postback(
+                client, line_user_id=fixture.line_user_id, data=f"confirm:{conversation_id}"
+            )
+
+        submit_task.assert_not_awaited()
+        assert "พักไว้" in _sent(reply_message).text
+        assert await _status(db_session, conversation_id) == "paused"

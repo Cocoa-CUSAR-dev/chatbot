@@ -1641,6 +1641,7 @@ async def _record_submitted(row: ConversationAnswer, submitted: list[str]) -> No
 _ALREADY_SAVED = "บันทึกข้อมูลชุดนี้ไปแล้วครับ"
 _ALREADY_CANCELLED = "รายการนี้ถูกยกเลิกไปแล้วครับ"
 _CONFIRM_NOT_READY = "ยังตอบไม่ครบครับ กรุณาตอบข้อนี้ให้เสร็จก่อนกดยืนยัน"
+_CONFIRM_WHILE_PAUSED = 'งานนี้พักไว้อยู่และยังตอบไม่ครบครับ พิมพ์ "เริ่ม" แล้วเลือกงานนี้เพื่อทำต่อ'
 
 
 async def confirm_conversation(
@@ -1685,6 +1686,13 @@ async def confirm_conversation(
     # (review on #76). Show them the step they're actually on instead.
     picker_pending = (conversation.parent_answer or {}).get("pending_kind") is not None
     if picker_pending or conversation.current_question_id is not None:
+        if conversation.status == ConversationStatus.PAUSED:
+            # Not via resume_conversation: that sets the conversation ACTIVE,
+            # and the farmer may have started another task since pausing this
+            # one -- two ACTIVE conversations, and the next typed answer lands
+            # on whichever the router finds first (docs-and-plan#222). Resuming
+            # stays an explicit choice, made from the task list.
+            return _nothing_submitted(conversation_id, _CONFIRM_WHILE_PAUSED)
         current_step = await resume_conversation(session, conversation=conversation, form=form)
         return replace(
             current_step,
