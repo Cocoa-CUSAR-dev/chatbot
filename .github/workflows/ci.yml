@@ -73,7 +73,10 @@ jobs:
         run: |
           PGPASSWORD=test psql -h localhost -U test -d chatbot_test \
             -f tests/resources/schema.sql
-      - run: pytest tests/ -v
+      # docs-and-plan#247: coverage is reported on every run (with the DB
+      # tests included, which only run here), so gaps in the chatbot flows
+      # are visible in the job log rather than guessed at.
+      - run: pytest tests/ -v --cov --cov-report=term-missing:skip-covered
 
   build:
     runs-on: ubuntu-latest

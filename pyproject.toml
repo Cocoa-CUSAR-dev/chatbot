@@ -32,6 +32,7 @@ dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
     "respx>=0.21",
+    "pytest-cov>=5.0",
 ]
 
 [tool.setuptools.packages.find]
@@ -49,6 +50,24 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 python_version = "3.12"
 strict = true
 ignore_missing_imports = true
+
+[tool.coverage.run]
+source = ["src"]
+branch = true
+# SQLAlchemy's async engine runs every DB call through greenlet; without
+# this, coverage stops tracing a coroutine after it awaits the database and
+# reports lines that clearly ran (the webhook handlers) as missed.
+concurrency = ["greenlet", "thread"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+# docs-and-plan#247 took src/ from 91% to 96% with the DB tests included.
+# The floor sits just under that so a change that drops tests fails CI,
+# without a one-line refactor tripping it. Only meaningful where the DB
+# tests run (CI): a local run without RUN_DB_TESTS skips them and lands
+# far lower.
+fail_under = 94
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
